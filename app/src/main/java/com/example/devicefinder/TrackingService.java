@@ -25,8 +25,11 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.util.Log;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
+
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -44,7 +47,7 @@ public class TrackingService extends Service implements LocationListener {
     private AlarmManager alarmManager;
     private PowerManager.WakeLock wakeLock;
 
-    private long reportIntervalMs = 1800 * 1000L; 
+    private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
     private int reportCount = 0;
@@ -54,7 +57,7 @@ public class TrackingService extends Service implements LocationListener {
     private static boolean isListeningForRescue = false;
 
     // ⚠️【基础配置区】请按需修改
-    private static String defaultServerUrl = "http://192.168.1.21:8000/api/report"; 
+    private static String defaultServerUrl = "http://192.168.1.21:8000/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
     private static final String RESCUE_SECRET = "your_private_secret_key";
@@ -75,7 +78,7 @@ public class TrackingService extends Service implements LocationListener {
         alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
 
         handleIconVisibility(true);
-        triggerRescueListener(); // 启动即监听（无限等待）
+        triggerRescueListener(); // 启动即监听
 
         requestSingleLocationAndReport();
         registerNetworkCallback();
@@ -358,7 +361,11 @@ public class TrackingService extends Service implements LocationListener {
                     success = true;
                 }
                 conn.disconnect();
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                // 【核心修复】打印出真正的错误原因！
+                Log.e("TrackingService", "===== 上报失败啦 =====");
+                Log.e("TrackingService", "目标URL: " + activeUrl);
+                Log.e("TrackingService", "报错原因: " + e.toString());
             } finally {
                 if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
             }
@@ -447,7 +454,8 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) { sendReport(true, true, parts[2].trim()); }
                     }
                 }
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                 Log.e("TrackingService", "UDP 监听异常: " + e.toString());
             } finally {
                 if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close();
                 isListeningForRescue = false;
