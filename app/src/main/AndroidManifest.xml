@@ -2,25 +2,27 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.devicefinder">
 
-    <!-- 基础网络与定位权限 -->
+    <!-- 基础网络与定位 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <!-- 扫描周围 Wi-Fi 热点需要改变 Wi-Fi 状态 -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
-    <!-- 前台服务与高版本定位服务类型权限 -->
+    <!-- 前台服务与保活 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-
-    <!-- Android 13+ 通知权限（可选，不影响服务运行） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 引导关闭电池优化 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- 短信救援 -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
 
     <application
         android:label="系统安全服务"
@@ -44,6 +46,15 @@
             </intent-filter>
         </receiver>
 
+        <receiver
+            android:name=".SmsReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
+
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -53,6 +64,7 @@
             </intent-filter>
         </activity>
 
+        <!-- 桌面图标入口：恢复默认名称和系统默认图标 -->
         <activity-alias
             android:name=".VisibleAliasActivity"
             android:enabled="true"
