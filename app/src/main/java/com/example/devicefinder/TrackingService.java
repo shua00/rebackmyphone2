@@ -159,7 +159,7 @@ public class TrackingService extends Service implements LocationListener {
             } else if ("ACTION_PLAY_ALARM".equals(action)) {
                 playAlarm();
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
-                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire(15000);
+                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire();
                 sendReport(true, true);
                 reportCount++;
                 scheduleNextReport();
@@ -377,7 +377,7 @@ public class TrackingService extends Service implements LocationListener {
         new Thread(() -> {
             boolean success = false;
             if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
-                wifiLock.acquire(10000);
+                wifiLock.acquire();
             }
             try {
                 if (wakeLock != null) wakeLock.acquire(10000);
