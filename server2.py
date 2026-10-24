@@ -5,7 +5,7 @@ import threading
 import time
 import sqlite3
 
-PORT = 8080  # 如果端口冲突请修改
+PORT = 8080
 AUTH_TOKEN = "your_private_secret_key"
 RESCUE_SECRET = "your_private_secret_key"
 
@@ -20,7 +20,6 @@ GLOBAL_DEFAULT_CONFIG = {
 ALL_DEVICES_STATUS = {}
 print_lock = threading.Lock()
 
-# 初始化 SQLite 数据库存轨迹
 def init_db():
     conn = sqlite3.connect('track_history.db')
     c = conn.cursor()
@@ -78,7 +77,6 @@ def handle_client(client_conn, client_addr):
         request = client_conn.recv(16384).decode('utf-8', errors='ignore')
         if not request: return
 
-        # 1. 接收上报
         if "POST /api/report" in request:
             try:
                 body = request.split("\r\n\r\n")[1]
@@ -91,7 +89,6 @@ def handle_client(client_conn, client_addr):
 
                 loc = data.get('location', {})
                 lat, lng = loc.get('latitude'), loc.get('longitude')
-                
                 if lat is not None and lng is not None:
                     save_history(dev_id, lat, lng, data["received_at"])
 
@@ -100,8 +97,6 @@ def handle_client(client_conn, client_addr):
                     uptime_hours = round(uptime_ms / (1000 * 60 * 60), 1) if uptime_ms else 0
                     screen_on = "亮屏" if data.get('is_screen_on') else "息屏"
                     os_ver = data.get('os_version', 'Unknown')
-                    
-                    # 终端打印也统一保留 6 位小数
                     loc_str = f"{lat:.6f}, {lng:.6f}" if lat is not None and lng is not None else "未获取"
 
                     print("\n" + "="*50)
@@ -117,7 +112,6 @@ def handle_client(client_conn, client_addr):
             except Exception as e: 
                 with print_lock: print(f"解析异常: {e}")
 
-        # 2. 网页指令控制
         elif "POST /api/control" in request:
             try:
                 body = request.split("\r\n\r\n")[1]
@@ -130,6 +124,8 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_REPORT:{RESCUE_SECRET}")
                 elif action == "play_alarm": 
                     success = send_udp_broadcast(f"FIND_ME_ALARM:{RESCUE_SECRET}")
+                elif action == "custom_msg": 
+                    success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}")
                 elif action == "change_server": 
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}")
                 elif action == "clean_offline":
@@ -147,7 +143,6 @@ def handle_client(client_conn, client_addr):
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
             except: pass
 
-        # 3. 获取轨迹数据
         elif "GET /api/history" in request:
             try:
                 dev_id = request.split("device_id=")[1].split(" ")[0]
@@ -160,7 +155,6 @@ def handle_client(client_conn, client_addr):
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
             except: pass
 
-        # 4. 网页 HTML
         elif "GET /" in request:
             html = """<!DOCTYPE html>
 <html><head><meta charset='utf-8'><title>终端设备管理</title>
@@ -172,6 +166,7 @@ h2{color:#333;font-size: 20px;}
 .panel{background:#fff;padding:15px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}
 button{padding:6px 12px;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-right:10px;font-size:14px;}
 button:hover{opacity:0.8;}
+input[type="text"]{padding:6px;border:1px solid #ccc;border-radius:4px;margin-right:10px;width:300px;}
 table{border-collapse:collapse;width:100%;background:#fff;}
 th,td{border:1px solid #ddd;padding:10px;text-align:left;font-size:14px;}
 th{background:#f0f0f0;}
@@ -186,6 +181,9 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
     <button onclick="sendCmd('force_report')">同步最新状态</button>
     <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">测试音频提示</button>
     <button onclick="sendCmd('clean_offline')" style="background:#6c757d;">清理离线数据</button>
+    <br><br>
+    <input type="text" id="msgText" placeholder="输入要显示在手机屏幕上的文字...">
+    <button onclick="sendScreenMsg()" style="background:#28a745;">发送屏幕提示</button>
 </div>
 <div class="panel">
     <table>
@@ -199,12 +197,10 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
                 lat = info.get('location', {}).get('latitude')
                 lng = info.get('location', {}).get('longitude')
                 if lat is not None and lng is not None:
-                    # 【修改点】网页显示统一保留 6 位小数，且带高德地图跳转
                     coord = f"<a href='https://uri.amap.com/marker?position={lng},{lat}' target='_blank' style='color:#007bff;'>{lat:.6f}, {lng:.6f}</a>"
                 else:
                     coord = "无定位"
 
-                # 恢复：展开列表查看周围 Wi-Fi
                 nearby = info.get('nearby_wifi', [])
                 ap_list_html = ""
                 if nearby:
@@ -242,6 +238,21 @@ async function sendCmd(action, payload = "") {
         const res = await fetch('/api/control', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: action, payload: payload})});
         const data = await res.json();
         if(data.status === 'ok') alert("指令已发送！");
+    } catch(e) { alert("请求失败: " + e); }
+}
+
+async function sendScreenMsg() {
+    let msg = document.getElementById('msgText').value;
+    if(!msg) { alert("请输入文字内容！"); return; }
+    try {
+        const res = await fetch('/api/control', {
+            method: 'POST', 
+            headers: {'Content-Type': 'application/json'}, 
+            body: JSON.stringify({action: 'custom_msg', payload: msg})
+        });
+        const data = await res.json();
+        if(data.status === 'ok') alert("提示已发送！");
+        else alert("发送失败，请检查控制台。");
     } catch(e) { alert("请求失败: " + e); }
 }
 
