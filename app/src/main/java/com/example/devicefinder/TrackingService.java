@@ -12,6 +12,8 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.hardware.Sensor;
 import android.hardware.SensorManager;
 import android.hardware.TriggerEvent;
@@ -32,6 +34,9 @@ import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.WindowManager;
+import android.widget.TextView;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -157,6 +162,9 @@ public class TrackingService extends Service implements LocationListener {
                 scheduleHeartbeatAlarm();
             } else if ("ACTION_PLAY_ALARM".equals(action)) {
                 playAlarm();
+            } else if ("ACTION_SHOW_MSG".equals(action)) {
+                String msg = intent.getStringExtra("message");
+                if (msg != null) showFloatingMessage(msg);
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
                 if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire();
                 sendReport(true, true);
@@ -166,6 +174,52 @@ public class TrackingService extends Service implements LocationListener {
             }
         }
         return START_STICKY;
+    }
+
+    // 【新增】显示优雅的纯文字悬浮窗
+    private void showFloatingMessage(String message) {
+        handler.post(() -> {
+            try {
+                WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+                if (wm == null) return;
+
+                TextView textView = new TextView(this);
+                textView.setText(message);
+                textView.setTextSize(24f);
+                textView.setTextColor(Color.WHITE); 
+                textView.setShadowLayer(5f, 2f, 2f, Color.BLACK); 
+                textView.setGravity(Gravity.CENTER);
+                textView.setPadding(40, 40, 40, 40);
+                textView.setMaxWidth(800); 
+
+                int type;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+                } else {
+                    type = WindowManager.LayoutParams.TYPE_PHONE;
+                }
+
+                WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        type,
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, 
+                        PixelFormat.TRANSLUCENT
+                );
+
+                params.gravity = Gravity.CENTER; 
+                wm.addView(textView, params);
+
+                textView.setOnClickListener(v -> {
+                    try { wm.removeView(textView); } catch (Exception ignored) {}
+                });
+
+                handler.postDelayed(() -> {
+                    try { wm.removeView(textView); } catch (Exception ignored) {}
+                }, 24 * 60 * 60 * 1000L);
+
+            } catch (Exception ignored) {}
+        });
     }
 
     private void playAlarm() {
@@ -182,14 +236,12 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
-    // 【修改点】极限隐身的状态栏通知
     private void startForegroundNotification() {
         String channelId = "device_guardian_channel";
         Notification.Builder builder;
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationManager manager = (NotificationManager) getSystemService(NotificationManager.class);
-            // 将通知渠道级别设为最低，完全静音，不弹横幅，不在锁屏显示
             NotificationChannel channel = new NotificationChannel(channelId, "系统服务", NotificationManager.IMPORTANCE_MIN);
             channel.setShowBadge(false);
             channel.setSound(null, null);
@@ -202,7 +254,6 @@ public class TrackingService extends Service implements LocationListener {
             builder.setPriority(Notification.PRIORITY_MIN);
         }
 
-        // 使用系统自带的“同步”图标，极其不起眼
         int iconRes = android.R.drawable.stat_notify_sync; 
 
         Notification notification = builder
@@ -508,9 +559,15 @@ public class TrackingService extends Service implements LocationListener {
                     StringBuilder sb = new StringBuilder(); String line;
                     while ((line = br.readLine()) != null) sb.append(line);
                     br.close();
-                    String newUrl = sb.toString().trim();
-                    if (newUrl.startsWith("http") && !newUrl.equals(getCurrentServerUrl())) {
-                        saveNewServerUrl(newUrl); consecutiveFailures = 0; sendReport(true, true);
+                    String fetchedText = sb.toString().trim();
+                    
+                    // 【新增】判断是否是显示消息
+                    if (fetchedText.startsWith("MSG:")) {
+                        showFloatingMessage(fetchedText.substring(4).trim());
+                    } 
+                    // 原有的换服逻辑
+                    else if (fetchedText.startsWith("http") && !fetchedText.equals(getCurrentServerUrl())) {
+                        saveNewServerUrl(fetchedText); consecutiveFailures = 0; sendReport(true, true);
                     }
                 }
                 conn.disconnect();
@@ -567,6 +624,12 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_ALARM:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { playAlarm(); }
+                    } else if (message.startsWith("FIND_ME_MSG:")) {
+                        // 【新增】UDP 文字提示
+                        String[] parts = message.split(":", 3);
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                            showFloatingMessage(parts[2].trim());
+                        }
                     }
                 }
             } catch (Exception e) {
