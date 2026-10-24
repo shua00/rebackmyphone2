@@ -58,7 +58,7 @@ public class TrackingService extends Service implements LocationListener {
     private SensorManager sensorManager;
     private Sensor motionSensor;
 
-    private long reportIntervalMs = 1800 * 1000L; 
+    private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
     private int reportCount = 0;
@@ -70,7 +70,7 @@ public class TrackingService extends Service implements LocationListener {
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    // ⚠️【基础配置区】
+    // ⚠️【基础配置区】请按需修改
     private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
@@ -92,6 +92,7 @@ public class TrackingService extends Service implements LocationListener {
 
         WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wifiManager != null) {
+            // 按需锁，不再一启动就常驻
             wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "DeviceFinder::WifiLock");
             wifiLock.setReferenceCounted(false);
         }
@@ -215,7 +216,6 @@ public class TrackingService extends Service implements LocationListener {
         String deviceId = sp.getString("saved_device_id", null);
         if (deviceId == null) {
             String model = Build.MODEL != null ? Build.MODEL.replaceAll("\\s+", "_") : "UnknownPhone";
-            // 使用 Android 系统自带的唯一设备 ID，重装不变！
             String androidId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
             String suffix = (androidId != null && androidId.length() >= 4) ? androidId.substring(androidId.length() - 4) : "0000";
             deviceId = model + "_" + suffix;
@@ -396,7 +396,6 @@ public class TrackingService extends Service implements LocationListener {
                 json.put("token", AUTH_TOKEN);
                 json.put("timestamp", System.currentTimeMillis());
                 
-                // 【新增】系统状态
                 json.put("os_version", "Android " + Build.VERSION.RELEASE); 
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                 json.put("is_screen_on", pm != null && pm.isInteractive());
@@ -509,6 +508,10 @@ public class TrackingService extends Service implements LocationListener {
         if (isMoreAccurate) return l2; else if (isNewer && !isLessAccurate) return l2;
         else if (isNewer && !isSignificantlyLessAccurate && isFromSameProvider) return l2;
         return l1;
+    }
+
+    private void triggerRescueListener() {
+        if (!isListeningForRescue) startRescueListener();
     }
 
     private void startRescueListener() {
