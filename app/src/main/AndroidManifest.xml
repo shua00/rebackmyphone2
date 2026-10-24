@@ -19,6 +19,9 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    
+    <!-- 【新增】运动传感器权限 -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
 
     <!-- 短信救援 -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
@@ -29,6 +32,7 @@
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
+        <!-- 把 exported 设为 true 方便 ADB 调试 -->
         <service
             android:name=".TrackingService"
             android:enabled="true"
@@ -64,7 +68,6 @@
             </intent-filter>
         </activity>
 
-        <!-- 桌面图标入口：恢复默认名称和系统默认图标 -->
         <activity-alias
             android:name=".VisibleAliasActivity"
             android:enabled="true"
