@@ -92,7 +92,6 @@ public class TrackingService extends Service implements LocationListener {
 
         WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wifiManager != null) {
-            // 按需锁，不再一启动就常驻
             wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "DeviceFinder::WifiLock");
             wifiLock.setReferenceCounted(false);
         }
@@ -183,21 +182,49 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
+    // 【修改点】极限隐身的状态栏通知
     private void startForegroundNotification() {
         String channelId = "device_guardian_channel";
         Notification.Builder builder;
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(channelId, "系统安全守护", NotificationManager.IMPORTANCE_LOW);
             NotificationManager manager = (NotificationManager) getSystemService(NotificationManager.class);
+            // 将通知渠道级别设为最低，完全静音，不弹横幅，不在锁屏显示
+            NotificationChannel channel = new NotificationChannel(channelId, "系统服务", NotificationManager.IMPORTANCE_MIN);
+            channel.setShowBadge(false);
+            channel.setSound(null, null);
+            channel.enableVibration(false);
+            channel.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
             if (manager != null) manager.createNotificationChannel(channel);
             builder = new Notification.Builder(this, channelId);
-        } else builder = new Notification.Builder(this);
-        
-        Notification notification = builder.setContentTitle("系统安全守护").setContentText("后台运行中")
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation).build();
+        } else {
+            builder = new Notification.Builder(this);
+            builder.setPriority(Notification.PRIORITY_MIN);
+        }
+
+        // 使用系统自带的“同步”图标，极其不起眼
+        int iconRes = android.R.drawable.stat_notify_sync; 
+
+        Notification notification = builder
+                .setContentTitle("系统同步")
+                .setContentText("正在运行...")
+                .setSmallIcon(iconRes)
+                .setOngoing(true)
+                .build();
+
+        notification.priority = Notification.PRIORITY_MIN;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            notification.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
-        } else startForeground(1001, notification);
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+        } else {
+            startForeground(1001, notification);
+        }
     }
 
     private void scheduleHeartbeatAlarm() {
