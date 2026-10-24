@@ -3,8 +3,9 @@ import json
 import datetime
 import threading
 import time
+import sqlite3
 
-PORT = 8000  # 如果冲突请改成 8080
+PORT = 8080  # 如果冲突请修改
 AUTH_TOKEN = "your_private_secret_key"
 RESCUE_SECRET = "your_private_secret_key"
 
@@ -17,9 +18,28 @@ GLOBAL_DEFAULT_CONFIG = {
 }
 
 ALL_DEVICES_STATUS = {}
-
-# 全局打印锁
 print_lock = threading.Lock()
+
+# 初始化 SQLite 数据库存轨迹
+def init_db():
+    conn = sqlite3.connect('track_history.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS history
+                 (device_id TEXT, lat REAL, lng REAL, timestamp INTEGER)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def save_history(dev_id, lat, lng, ts):
+    if lat is None or lng is None: return
+    try:
+        conn = sqlite3.connect('track_history.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO history VALUES (?, ?, ?, ?)", (dev_id, lat, lng, ts))
+        conn.commit()
+        conn.close()
+    except: pass
 
 def format_loc_time(ts_ms):
     if not ts_ms: return "N/A"
@@ -44,15 +64,13 @@ def send_udp_broadcast(command_str):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        print(f"\n📡 [控制台] 正在发送广播: {command_str}")
+        with print_lock: print(f"\n📡 [控制台] 正在发送广播: {command_str}")
         for i in range(3):
             sock.sendto(command_str.encode('utf-8'), ('255.255.255.255', 8888))
             time.sleep(0.2) 
         sock.close()
         return True
-    except Exception as e:
-        print(f"❌ 广播发送失败: {e}")
-        return False
+    except: return False
 
 def handle_client(client_conn, client_addr):
     try:
@@ -60,6 +78,7 @@ def handle_client(client_conn, client_addr):
         request = client_conn.recv(16384).decode('utf-8', errors='ignore')
         if not request: return
 
+        # 1. 接收上报
         if "POST /api/report" in request:
             try:
                 body = request.split("\r\n\r\n")[1]
@@ -71,34 +90,30 @@ def handle_client(client_conn, client_addr):
                 ALL_DEVICES_STATUS[dev_id] = data
 
                 loc = data.get('location', {})
-                nearby = data.get('nearby_wifi', [])
-                
+                lat, lng = loc.get('latitude'), loc.get('longitude')
+                if lat is not None and lng is not None:
+                    save_history(dev_id, lat, lng, data["received_at"])
+
                 with print_lock:
+                    uptime_ms = data.get('uptime_ms', 0)
+                    uptime_hours = round(uptime_ms / (1000 * 60 * 60), 1) if uptime_ms else 0
+                    screen_on = "💡亮屏" if data.get('is_screen_on') else "🌑息屏"
+                    os_ver = data.get('os_version', 'Unknown')
+
                     print("\n" + "="*50)
                     print(f"📥 [收到上报] 设备: 【{dev_id}】")
+                    print(f"🤖 状态: {os_ver} | {screen_on} | 已开机 {uptime_hours} 小时")
                     print(f"📶 Wi-Fi: {data.get('network', {}).get('wifi_ssid')} (IP: {data.get('network', {}).get('local_ip')})")
-                    print(f"🔋 电量: {data.get('battery', {}).get('level')}% (充电中: {data.get('battery', {}).get('is_charging')})")
-                    print(f"📍 定位: {loc.get('latitude')}, {loc.get('longitude')} [{loc.get('provider')}, 精度 {loc.get('accuracy')}m]")
-                    print(f"🕒 定位时间: {format_loc_time(loc.get('time', 0))}")
-                    print(f"📥 上报时间: {format_loc_time(data.get('received_at', 0))}")
-                    print(f"📡 周围热点: {len(nearby)} 个")
-                    
-                    # 【新增】终端打印周围 Wi-Fi 列表
-                    for ap in nearby[:5]:
-                        print(f"   - {ap.get('ssid')} ({ap.get('rssi')} dBm)")
-                    if len(nearby) > 5:
-                        print(f"   ... 其余 {len(nearby) - 5} 个省略")
-                        
+                    print(f"🔋 电量: {data.get('battery', {}).get('level')}%")
+                    print(f"📍 定位: {lat}, {lng}")
                     print("="*50)
 
                 response_body = json.dumps({"status": "success", "config": GLOBAL_DEFAULT_CONFIG})
-                response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}"
-                client_conn.sendall(response.encode('utf-8'))
-            except Exception as e:
-                with print_lock:
-                    print(f"❌ 上报解析异常: {e}")
-                client_conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}".encode('utf-8'))
+            except Exception as e: 
+                with print_lock: print(f"❌ 解析异常: {e}")
 
+        # 2. 网页指令控制
         elif "POST /api/control" in request:
             try:
                 body = request.split("\r\n\r\n")[1]
@@ -107,111 +122,124 @@ def handle_client(client_conn, client_addr):
                 payload = cmd_data.get("payload", "")
                 
                 success = False
-                if action == "force_report":
+                if action == "force_report": 
                     success = send_udp_broadcast(f"FIND_ME_REPORT:{RESCUE_SECRET}")
-                elif action == "temp_report":
-                    success = send_udp_broadcast(f"FIND_ME_REPORT_TEMP:{RESCUE_SECRET}:{payload}")
-                elif action == "change_server":
+                elif action == "play_alarm": 
+                    success = send_udp_broadcast(f"FIND_ME_ALARM:{RESCUE_SECRET}")
+                elif action == "change_server": 
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}")
-                elif action == "change_config":
-                    success = send_udp_broadcast(f"FIND_ME_CONFIG:{RESCUE_SECRET}:{payload}")
+                elif action == "clean_offline":
+                    now_ts = int(datetime.datetime.now().timestamp() * 1000)
+                    to_delete = []
+                    for k, v in ALL_DEVICES_STATUS.items():
+                        if now_ts - v.get('received_at', 0) > 7200000:
+                            to_delete.append(k)
+                    for k in to_delete:
+                        del ALL_DEVICES_STATUS[k]
+                    with print_lock: print(f"\n🧹 已清理 {len(to_delete)} 台超时未上报的设备。")
+                    success = True
 
                 resp = json.dumps({"status": "ok" if success else "error"})
-                response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
-                client_conn.sendall(response.encode('utf-8'))
-            except Exception as e:
-                client_conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+            except: pass
 
+        # 3. 获取轨迹数据
+        elif "GET /api/history" in request:
+            try:
+                dev_id = request.split("device_id=")[1].split(" ")[0]
+                conn = sqlite3.connect('track_history.db')
+                c = conn.cursor()
+                c.execute("SELECT lat, lng, timestamp FROM history WHERE device_id=? ORDER BY timestamp DESC LIMIT 50", (dev_id,))
+                rows = c.fetchall()
+                conn.close()
+                resp = json.dumps(rows)
+                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+            except: pass
+
+        # 4. 网页 HTML
         elif "GET /" in request:
             html = """<!DOCTYPE html>
-<html><head><meta charset='utf-8'><title>设备监控中心</title>
+<html><head><meta charset='utf-8'><title>特工监控中心</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 body{font-family:sans-serif;margin:20px;background:#f4f6f9;}
-h2{margin-bottom:5px;}
 .panel{background:#fff;padding:15px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}
-input{padding:6px;border:1px solid #ccc;border-radius:4px;width:300px;margin-right:10px;}
-button{padding:6px 12px;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;}
-button:hover{background:#0056b3;}
-table{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 2px 4px rgba(0,0,0,0.1);}
+button{padding:6px 12px;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-right:10px;}
+button:hover{opacity:0.8;}
+table{border-collapse:collapse;width:100%;background:#fff;}
 th,td{border:1px solid #ddd;padding:10px;text-align:left;font-size:14px;}
 th{background:#f0f0f0;}
-/* 新增弹出列表的样式 */
-details { cursor: pointer; color: #007bff; }
-ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
+#map { height: 450px; width: 100%; border-radius: 8px; margin-top: 10px; }
 </style>
 </head>
 <body>
-<h2>🛡️ 备用机矩阵控制台</h2>
-
+<h2>🛡️ 特工监控中心</h2>
 <div class="panel">
-    <h3>⚡ 快捷操作 (UDP 广播)</h3>
-    <button onclick="sendCmd('force_report')">强制手机上报一次</button>
-    <br><br>
-    <input type="text" id="tempUrl" placeholder="输入临时上报 URL，如 http://192.168.1.50:8000/...">
-    <button onclick="sendCmd('temp_report', document.getElementById('tempUrl').value)">发往临时URL</button>
-    <br><br>
-    <input type="text" id="newServer" placeholder="输入新服务器地址进行热切换">
-    <button onclick="sendCmd('change_server', document.getElementById('newServer').value)">更换主服务器</button>
+    <button onclick="sendCmd('force_report')">强制上报</button>
+    <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">🔊 远程响铃</button>
+    <button onclick="sendCmd('clean_offline')" style="background:#6c757d;">🧹 清理离线设备</button>
 </div>
-
 <div class="panel">
-    <h3>📱 设备状态列表 <button onclick="location.reload()" style="float:right;background:#28a745;">手动刷新</button></h3>
     <table>
-        <tr><th>设备ID</th><th>电量</th><th>Wi-Fi</th><th>经纬度</th><th>定位时间</th><th>收到时间</th><th>周围热点</th></tr>
+        <tr><th>设备ID</th><th>系统 / 状态</th><th>电量</th><th>Wi-Fi</th><th>定位时间</th><th>收到时间</th><th>操作</th></tr>
 """
-
             for dev_id, info in ALL_DEVICES_STATUS.items():
-                nearby = info.get('nearby_wifi', [])
+                os_ver = info.get('os_version', 'Unknown').replace("Android ", "A")
+                screen_on = "💡亮屏" if info.get('is_screen_on') else "🌑息屏"
+                sys_status = f"{os_ver} <br><span style='font-size:12px;color:#888;'>{screen_on}</span>"
                 
-                # 【新增】生成展开列表 HTML
-                ap_list_html = ""
-                if nearby:
-                    ap_list_html = "<details><summary><b>" + str(len(nearby)) + " 个</b></summary><ul>"
-                    for ap in nearby:
-                        ap_list_html += f"<li>{ap.get('ssid')} ({ap.get('rssi')} dBm)</li>"
-                    ap_list_html += "</ul></details>"
-                else:
-                    ap_list_html = "0 个"
-
-                html += f"<tr><td><b>{dev_id}</b></td><td>{info.get('battery', {}).get('level', '?')}%</td>"
+                html += f"<tr><td><b>{dev_id}</b></td>"
+                html += f"<td>{sys_status}</td>"
+                html += f"<td>{info.get('battery', {}).get('level', '?')}%</td>"
                 html += f"<td>{info.get('network', {}).get('wifi_ssid', '?')}</td>"
-                html += f"<td>{info.get('location', {}).get('latitude')}, {info.get('location', {}).get('longitude')}</td>"
                 html += f"<td>{format_loc_time(info.get('location', {}).get('time', 0))}</td>"
                 html += f"<td>{format_loc_time(info.get('received_at', 0))}</td>"
-                # 替换为可展开的 HTML
-                html += f"<td>{ap_list_html}</td></tr>"
+                html += f"<td><button onclick=\"showTrack('{dev_id}')\">查看轨迹 & 定位</button></td></tr>"
                 
             if not ALL_DEVICES_STATUS:
                 html += "<tr><td colspan='7' align='center'>暂无设备上报</td></tr>"
 
             html += """</table></div>
+<div id="map"></div>
 <script>
+var map = L.map('map').setView([39.9, 116.4], 13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19}).addTo(map);
+var markersLayer = L.layerGroup().addTo(map);
+var polyline = null;
+
 async function sendCmd(action, payload = "") {
-    if(payload === "" && (action === 'temp_report' || action === 'change_server')) {
-        alert("请先填写输入框内容！"); return;
-    }
+    if(payload === "" && action === 'change_server') { alert("请输入新服务器地址！"); return; }
     try {
-        const res = await fetch('/api/control', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({action: action, payload: payload})
-        });
+        const res = await fetch('/api/control', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: action, payload: payload})});
         const data = await res.json();
-        if(data.status === 'ok') {
-            alert("指令发送成功！请观察手机响应。");
-        } else {
-            alert("发送失败，请检查服务器控制台。");
+        if(data.status === 'ok') alert("指令已发送！");
+    } catch(e) { alert("请求失败: " + e); }
+}
+
+async function showTrack(devId) {
+    const res = await fetch(`/api/history?device_id=${devId}`);
+    const data = await res.json();
+    markersLayer.clearLayers();
+    if (polyline) map.removeLayer(polyline);
+
+    if (data.length === 0) return alert("暂无该设备的轨迹数据");
+
+    var latlngs = [];
+    data.reverse().forEach((row, index) => {
+        let lat = row[0], lng = row[1];
+        latlngs.push([lat, lng]);
+        if (index === data.length - 1) {
+            L.marker([lat, lng]).addTo(markersLayer).bindPopup("最新位置").openPopup();
+            map.setView([lat, lng], 16);
         }
-    } catch(e) { alert("网络错误: " + e); }
+    });
+    polyline = L.polyline(latlngs, {color: 'blue', weight: 3}).addTo(map);
 }
 </script>
 </body></html>"""
-            response = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}"
-            client_conn.sendall(response.encode('utf-8'))
-            
-        else:
-            client_conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
-    except Exception:
+            client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}".encode('utf-8'))
+    except Exception as e:
         pass
     finally:
         try: client_conn.close()
@@ -226,8 +254,7 @@ def start_server():
     server.listen(20)
     with print_lock:
         print("="*50)
-        print(f"🚀 全功能控制中心已启动: http://{get_local_ip()}:{PORT}")
-        print("👉 请在浏览器打开该地址，体验可视化控制面板！")
+        print(f"🚀 终极控制中心已启动: http://{get_local_ip()}:{PORT}")
         print("="*50)
 
     while True:
@@ -235,7 +262,6 @@ def start_server():
             conn, addr = server.accept()
             threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
         except KeyboardInterrupt: break
-        except Exception: pass
 
 if __name__ == "__main__":
     start_server()
