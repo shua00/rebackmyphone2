@@ -2,9 +2,9 @@ package com.example.devicefinder;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlarmManager;
 import android.app.AlertDialog;
 import android.content.ComponentName;
-import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
@@ -43,6 +43,8 @@ public class MainActivity extends Activity {
             } else {
                 promptBatteryOptimizationAgain();
             }
+        } else {
+            checkAndRequestPermissions();
         }
     }
 
@@ -51,6 +53,25 @@ public class MainActivity extends Activity {
             proceedAfterPermissions();
             return;
         }
+
+        // 1. 检查精确闹钟权限 (Android 12+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            AlarmManager alarmManager = (AlarmManager) getSystemService(ALARM_SERVICE);
+            if (alarmManager != null && !alarmManager.canScheduleExactAlarms()) {
+                new AlertDialog.Builder(this)
+                        .setTitle("必须允许精确闹钟")
+                        .setMessage("为了让手机息屏后能准点上报定位，请在下一页面允许「闹钟和提醒」。")
+                        .setCancelable(false)
+                        .setPositiveButton("去设置", (dialog, which) -> {
+                            Intent intent = new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM);
+                            intent.setData(Uri.parse("package:" + getPackageName()));
+                            startActivity(intent);
+                        }).show();
+                return;
+            }
+        }
+
+        // 2. 检查常规运行时权限
         boolean needFgLoc = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needBgLoc = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needNotif = Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED;
