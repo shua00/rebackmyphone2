@@ -12,7 +12,6 @@ import android.telephony.SmsManager;
 import android.telephony.SmsMessage;
 
 public class SmsReceiver extends BroadcastReceiver {
-    // ⚠️ 必须与 TrackingService 中的 RESCUE_SECRET 一致
     private static final String RESCUE_SECRET = "your_private_secret_key";
 
     @Override
@@ -30,15 +29,12 @@ public class SmsReceiver extends BroadcastReceiver {
             }
             String message = fullMessage.toString().trim();
 
-            // 1. 指令：更改服务器 (FIND_ME:密码:新URL)
             if (message.startsWith("FIND_ME:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_UPDATE_SERVER", "server_url", parts[2].trim());
                 }
-            }
-            // 2. 指令：强制上报 + 可选回复 (GET_LOC:密码 或 GET_LOC:密码:reply)
-            else if (message.startsWith("GET_LOC:")) {
+            } else if (message.startsWith("GET_LOC:")) {
                 String[] parts = message.split(":");
                 if (parts.length >= 2 && RESCUE_SECRET.equals(parts[1]) && sender != null) {
                     startService(context, "ACTION_FORCE_REPORT", null, null);
@@ -46,12 +42,15 @@ public class SmsReceiver extends BroadcastReceiver {
                         replyLocationViaSms(context, sender);
                     }
                 }
-            }
-            // 3. 指令：修改配置中心 (SET_CONFIG:密码:新URL)
-            else if (message.startsWith("SET_CONFIG:")) {
+            } else if (message.startsWith("SET_CONFIG:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_UPDATE_CONFIG_URL", "config_url", parts[2].trim());
+                }
+            } else if (message.startsWith("GET_ALARM:")) {
+                String[] parts = message.split(":", 2);
+                if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                    startService(context, "ACTION_PLAY_ALARM", null, null);
                 }
             }
         } catch (Exception ignored) {}
