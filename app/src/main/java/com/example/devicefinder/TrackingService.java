@@ -12,6 +12,10 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.hardware.Sensor;
+import android.hardware.SensorManager;
+import android.hardware.TriggerEvent;
+import android.hardware.TriggerEventListener;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -19,6 +23,7 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -46,18 +51,27 @@ public class TrackingService extends Service implements LocationListener {
     private ConnectivityManager.NetworkCallback networkCallback;
     private AlarmManager alarmManager;
     private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
+    private PendingIntent alarmPendingIntent;
+    
+    private SensorManager sensorManager;
+    private Sensor motionSensor;
 
-    private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
+    private long reportIntervalMs = 1800 * 1000L; 
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
     private int reportCount = 0;
+    
+    // 动态开关
+    private boolean enableWifiLock = true;
+    private boolean enableMotionTrigger = true;
 
     private static long lastReportTime = 0;
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    // ⚠️【基础配置区】请按需修改
-    private static String defaultServerUrl = "http://192.168.1.21:8000/api/report";
+    // ⚠️【基础配置区】
+    private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
     private static final String RESCUE_SECRET = "your_private_secret_key";
@@ -75,16 +89,54 @@ public class TrackingService extends Service implements LocationListener {
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DeviceFinder::WakeLock");
             wakeLock.setReferenceCounted(false);
         }
+
+        WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wifiManager != null) {
+            // 不再一启动就 acquire()，而是按需
+            wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "DeviceFinder::WifiLock");
+            wifiLock.setReferenceCounted(false);
+        }
+
         alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        
+        Intent reportIntent = new Intent(this, TrackingService.class);
+        reportIntent.setAction("ACTION_ALARM_TRIGGER");
+        int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
+        alarmPendingIntent = PendingIntent.getService(this, 1001, reportIntent, flags);
+
+        // 初始化运动传感器
+        sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+        if (sensorManager != null) {
+            motionSensor = sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION);
+        }
 
         handleIconVisibility(true);
-        triggerRescueListener(); // 启动即监听
+        triggerRescueListener(); 
+        toggleMotionSensor(true); // 默认开启运动感知
 
         requestSingleLocationAndReport();
         registerNetworkCallback();
         startLocationUpdates();
         scheduleHeartbeatAlarm();
     }
+
+    private void toggleMotionSensor(boolean enable) {
+        if (sensorManager == null || motionSensor == null) return;
+        if (enable && enableMotionTrigger) {
+            sensorManager.requestTriggerSensor(motionListener, motionSensor);
+        } else {
+            sensorManager.cancelTriggerSensor(motionListener, motionSensor);
+        }
+    }
+
+    private final TriggerEventListener motionListener = new TriggerEventListener() {
+        @Override
+        public void onTrigger(TriggerEvent event) {
+            Log.d("TrackingService", "检测到手机移动，强制唤醒上报！");
+            sendReport(true, true);
+            toggleMotionSensor(true); // 重新注册传感器
+        }
+    };
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -105,13 +157,15 @@ public class TrackingService extends Service implements LocationListener {
                 triggerRescueListener();
                 fetchRemoteConfig();
                 scheduleHeartbeatAlarm();
+            } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
+                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire(15000);
+                sendReport(true, true);
+                reportCount++;
+                scheduleNextReport();
+                handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             }
         }
         return START_STICKY;
-    }
-
-    private void triggerRescueListener() {
-        if (!isListeningForRescue) startRescueListener();
     }
 
     private void startForegroundNotification() {
@@ -272,19 +326,25 @@ public class TrackingService extends Service implements LocationListener {
         }, 10000);
     }
 
-    private final Runnable reportRunnable = new Runnable() {
-        @Override
-        public void run() {
-            sendReport(false, false);
-            reportCount++;
-            scheduleNextReport();
-        }
-    };
-
     private void scheduleNextReport() {
-        handler.removeCallbacks(reportRunnable);
+        if (alarmManager == null || alarmPendingIntent == null) return;
+
         long delay = (reportCount == 1 || reportCount == 2) ? 3 * 60 * 1000L : reportIntervalMs;
-        handler.postDelayed(reportRunnable, delay);
+        long triggerAtMillis = System.currentTimeMillis() + delay;
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent);
+            } else {
+                alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent);
+            }
+        } catch (SecurityException e) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent);
+            } else {
+                alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent);
+            }
+        }
     }
 
     private void sendReport(final boolean withNearbyWifi, boolean force) {
@@ -300,6 +360,9 @@ public class TrackingService extends Service implements LocationListener {
 
         new Thread(() -> {
             boolean success = false;
+            if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
+                wifiLock.acquire(10000);
+            }
             try {
                 if (wakeLock != null) wakeLock.acquire(10000);
                 int[] battery = DeviceInfoUtils.getBatteryInfo(TrackingService.this);
@@ -349,7 +412,7 @@ public class TrackingService extends Service implements LocationListener {
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json");
-                conn.setConnectTimeout(6000); conn.setReadTimeout(6000); conn.setDoOutput(true);
+                conn.setConnectTimeout(10000); conn.setReadTimeout(10000); conn.setDoOutput(true);
                 OutputStream os = conn.getOutputStream();
                 os.write(json.toString().getBytes("UTF-8")); os.flush(); os.close();
                 if (conn.getResponseCode() == 200) {
@@ -362,12 +425,12 @@ public class TrackingService extends Service implements LocationListener {
                 }
                 conn.disconnect();
             } catch (Exception e) {
-                // 【核心修复】打印出真正的错误原因！
                 Log.e("TrackingService", "===== 上报失败啦 =====");
                 Log.e("TrackingService", "目标URL: " + activeUrl);
                 Log.e("TrackingService", "报错原因: " + e.toString());
             } finally {
                 if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); 
             }
             if (success) {
                 consecutiveFailures = 0;
@@ -469,6 +532,17 @@ public class TrackingService extends Service implements LocationListener {
         if (cfg == null) return;
         long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
         String newAccuracy = cfg.optString("accuracy_mode", "coarse");
+        
+        // 动态下发
+        boolean newEnableWifiLock = cfg.optBoolean("enable_wifi_lock", true);
+        boolean newEnableMotionTrigger = cfg.optBoolean("enable_motion_trigger", true);
+        
+        if (newEnableWifiLock != enableWifiLock || newEnableMotionTrigger != enableMotionTrigger) {
+            enableWifiLock = newEnableWifiLock;
+            enableMotionTrigger = newEnableMotionTrigger;
+            toggleMotionSensor(enableMotionTrigger);
+        }
+
         if (newInterval != reportIntervalMs || !newAccuracy.equals(accuracyMode)) {
             reportIntervalMs = newInterval; accuracyMode = newAccuracy;
             handler.post(() -> {
@@ -486,6 +560,8 @@ public class TrackingService extends Service implements LocationListener {
     @Override public void onLocationChanged(Location location) { if (location != null) lastLocation = location; }
     @Override public void onDestroy() {
         super.onDestroy();
+        if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        if (sensorManager != null && motionListener != null) sensorManager.cancelTriggerSensor(motionListener, motionSensor);
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
             if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) cm.unregisterNetworkCallback(networkCallback);
