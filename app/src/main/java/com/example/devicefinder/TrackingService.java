@@ -214,8 +214,10 @@ public class TrackingService extends Service implements LocationListener {
 
         notification.priority = Notification.PRIORITY_MIN;
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            notification.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                notification.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+            } catch (Exception ignored) {}
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
