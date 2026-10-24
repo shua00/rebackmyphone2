@@ -5,7 +5,7 @@ import sys
 RESCUE_SECRET = "your_private_secret_key"  # ⚠️ 必须与手机端一致
 
 # ⚠️ 你可以把常用的地址保存在这里，方便直接回车调用
-DEFAULT_SERVER_URL = "http://192.168.1.21:8000/api/report"
+DEFAULT_SERVER_URL = "http://dingwei.bai001.de5.net/api/report"
 DEFAULT_CONFIG_URL = "https://your-config-url.com/config.txt"
 
 def send_udp(command_str):
@@ -22,16 +22,18 @@ def send_udp(command_str):
 
 def main():
     while True:
-        print("="*40)
+        print("="*45)
         print("🛠️  局域网轻量级救援/调试终端")
-        print("="*40)
+        print("="*45)
         print("1. 强制向【当前主服务器】上报一次")
         print("2. 强制向【临时服务器】上报一次 (无痕调试)")
         print("3. 更换手机的主服务器地址")
         print("4. 更换手机的配置中心地址")
+        print("5. 🔊 强制手机播放警报音 (响铃)")
         print("0. 退出")
+        print("="*45)
         
-        choice = input("请输入选项 (0-4): ").strip()
+        choice = input("请输入选项 (0-5): ").strip()
         
         if choice == '1':
             send_udp(f"FIND_ME_REPORT:{RESCUE_SECRET}")
@@ -50,6 +52,10 @@ def main():
             new_config = input(f"请输入新的配置中心 URL (回车默认 {DEFAULT_CONFIG_URL}): ").strip()
             if not new_config: new_config = DEFAULT_CONFIG_URL
             send_udp(f"FIND_ME_CONFIG:{RESCUE_SECRET}:{new_config}")
+            
+        elif choice == '5':
+            print("\n⚠️ 警告: 手机将在局域网内以最大音量播放 30 秒警报！")
+            send_udp(f"FIND_ME_ALARM:{RESCUE_SECRET}")
             
         elif choice == '0':
             print("👋 退出。")
