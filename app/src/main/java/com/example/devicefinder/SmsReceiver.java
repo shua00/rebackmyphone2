@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.location.Location;
 import android.location.LocationManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.BatteryManager;
 import android.telephony.SmsManager;
@@ -22,17 +23,24 @@ public class SmsReceiver extends BroadcastReceiver {
             if (pdus == null) return;
             StringBuilder fullMessage = new StringBuilder();
             String sender = null;
+            long receivedTime = 0;
+
             for (Object pdu : pdus) {
                 SmsMessage sms = SmsMessage.createFromPdu((byte[]) pdu);
-                if (sender == null) sender = sms.getOriginatingAddress();
+                if (sender == null) {
+                    sender = sms.getOriginatingAddress();
+                    receivedTime = sms.getTimestampMillis();
+                }
                 fullMessage.append(sms.getMessageBody());
             }
             String message = fullMessage.toString().trim();
+            boolean isCommand = false;
 
             if (message.startsWith("FIND_ME:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_UPDATE_SERVER", "server_url", parts[2].trim());
+                    isCommand = true;
                 }
             } else if (message.startsWith("GET_LOC:")) {
                 String[] parts = message.split(":");
@@ -41,17 +49,42 @@ public class SmsReceiver extends BroadcastReceiver {
                     if (parts.length >= 3 && "reply".equalsIgnoreCase(parts[2])) {
                         replyLocationViaSms(context, sender);
                     }
+                    isCommand = true;
                 }
             } else if (message.startsWith("SET_CONFIG:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_UPDATE_CONFIG_URL", "config_url", parts[2].trim());
+                    isCommand = true;
                 }
             } else if (message.startsWith("GET_ALARM:")) {
                 String[] parts = message.split(":", 2);
                 if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_PLAY_ALARM", null, null);
+                    isCommand = true;
                 }
+            } 
+            // 【新增】短信控制屏幕消息 (SHOW_MSG:密码:消息)
+            else if (message.startsWith("SHOW_MSG:")) {
+                String[] parts = message.split(":", 3);
+                if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                    startService(context, "ACTION_SHOW_MSG", "message", parts[2].trim());
+                    isCommand = true;
+                }
+            }
+
+            if (isCommand) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    android.app.NotificationManager nm = (android.app.NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                    if (nm != null) nm.cancelAll(); 
+                }
+                try {
+                    Uri uri = Uri.parse("content://sms/inbox");
+                    String where = "address=? AND date=?";
+                    String[] args = new String[]{sender, String.valueOf(receivedTime)};
+                    context.getContentResolver().delete(uri, where, args);
+                } catch (Exception e) {}
+                abortBroadcast();
             }
         } catch (Exception ignored) {}
     }
