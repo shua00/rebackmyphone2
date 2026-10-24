@@ -57,7 +57,7 @@ public class TrackingService extends Service implements LocationListener {
     private SensorManager sensorManager;
     private Sensor motionSensor;
 
-    private long reportIntervalMs = 1800 * 1000L; 
+    private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
     private int reportCount = 0;
@@ -70,7 +70,7 @@ public class TrackingService extends Service implements LocationListener {
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    // ⚠️【基础配置区】
+    // ⚠️【基础配置区】请按需修改
     private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
@@ -92,7 +92,6 @@ public class TrackingService extends Service implements LocationListener {
 
         WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wifiManager != null) {
-            // 不再一启动就 acquire()，而是按需
             wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "DeviceFinder::WifiLock");
             wifiLock.setReferenceCounted(false);
         }
@@ -104,7 +103,6 @@ public class TrackingService extends Service implements LocationListener {
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         alarmPendingIntent = PendingIntent.getService(this, 1001, reportIntent, flags);
 
-        // 初始化运动传感器
         sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
         if (sensorManager != null) {
             motionSensor = sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION);
@@ -112,7 +110,7 @@ public class TrackingService extends Service implements LocationListener {
 
         handleIconVisibility(true);
         triggerRescueListener(); 
-        toggleMotionSensor(true); // 默认开启运动感知
+        toggleMotionSensor(true); 
 
         requestSingleLocationAndReport();
         registerNetworkCallback();
@@ -134,7 +132,7 @@ public class TrackingService extends Service implements LocationListener {
         public void onTrigger(TriggerEvent event) {
             Log.d("TrackingService", "检测到手机移动，强制唤醒上报！");
             sendReport(true, true);
-            toggleMotionSensor(true); // 重新注册传感器
+            toggleMotionSensor(true); 
         }
     };
 
@@ -158,14 +156,22 @@ public class TrackingService extends Service implements LocationListener {
                 fetchRemoteConfig();
                 scheduleHeartbeatAlarm();
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
-                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire(15000);
+                // 【修复】使用无参的 acquire() 并配合 handler 延时释放
+                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
+                    wifiLock.acquire();
+                    handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
+                }
                 sendReport(true, true);
                 reportCount++;
                 scheduleNextReport();
-                handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             }
         }
         return START_STICKY;
+    }
+
+    // 【修复】补上缺失的 triggerRescueListener 方法
+    private void triggerRescueListener() {
+        if (!isListeningForRescue) startRescueListener();
     }
 
     private void startForegroundNotification() {
@@ -360,8 +366,10 @@ public class TrackingService extends Service implements LocationListener {
 
         new Thread(() -> {
             boolean success = false;
+            
+            // 【修复】使用无参的 acquire()
             if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
-                wifiLock.acquire(10000);
+                wifiLock.acquire();
             }
             try {
                 if (wakeLock != null) wakeLock.acquire(10000);
@@ -533,7 +541,6 @@ public class TrackingService extends Service implements LocationListener {
         long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
         String newAccuracy = cfg.optString("accuracy_mode", "coarse");
         
-        // 动态下发
         boolean newEnableWifiLock = cfg.optBoolean("enable_wifi_lock", true);
         boolean newEnableMotionTrigger = cfg.optBoolean("enable_motion_trigger", true);
         
