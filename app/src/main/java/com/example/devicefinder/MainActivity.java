@@ -20,7 +20,12 @@ import android.widget.Toast;
 public class MainActivity extends Activity {
     private static final int REQ_PERMISSIONS = 100;
     private boolean serviceStarted = false;
+
+    // 步骤状态标志位
+    private boolean waitingForBgLocSetting = false;
     private boolean waitingForBatterySetting = false;
+    private boolean waitingForDeviceAdmin = false;
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     @Override
@@ -36,18 +41,46 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+
+        // 1. 从“设备管理器”页面返回
+        if (waitingForDeviceAdmin) {
+            waitingForDeviceAdmin = false;
+            android.app.admin.DevicePolicyManager dpm = (android.app.admin.DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+            ComponentName adminComponent = new ComponentName(this, MyDeviceAdminReceiver.class);
+            if (dpm != null && dpm.isAdminActive(adminComponent)) {
+                Toast.makeText(this, "✅ 防卸载装甲已激活", Toast.LENGTH_SHORT).show();
+                startTrackingServiceAndFinish();
+            } else {
+                Toast.makeText(this, "⚠️ 未激活防卸载，应用将直接启动", Toast.LENGTH_LONG).show();
+                startTrackingServiceAndFinish();
+            }
+            return;
+        }
+
+        // 2. 从“电池优化”页面返回
         if (waitingForBatterySetting) {
             waitingForBatterySetting = false;
             if (isBatteryOptimizationIgnored()) {
                 Toast.makeText(this, "✅ 电池优化已关闭", Toast.LENGTH_SHORT).show();
-                startTrackingServiceAndFinish();
+                checkDeviceAdmin(); // 电池搞定了，去查防卸载
             } else {
                 promptBatteryOptimizationAgain();
             }
-        } else {
-            checkAndRequestPermissions();
+            return;
         }
+
+        // 3. 从“应用详情页(后台定位)”返回
+        if (waitingForBgLocSetting) {
+            waitingForBgLocSetting = false;
+            proceedAfterBackgroundLocation();
+            return;
+        }
+
+        // 4. 正常启动流程
+        checkAndRequestPermissions();
     }
+
+    // ==================== 步骤一：系统权限申请 ====================
 
     private void checkAndRequestPermissions() {
         if (Build.VERSION.SDK_INT < 23) {
@@ -55,7 +88,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 1. 检查精确闹钟权限 (Android 12+)
+        // 检查精确闹钟权限 (Android 12+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             AlarmManager alarmManager = (AlarmManager) getSystemService(ALARM_SERVICE);
             if (alarmManager != null && !alarmManager.canScheduleExactAlarms()) {
@@ -72,7 +105,7 @@ public class MainActivity extends Activity {
             }
         }
 
-        // 2. 检查常规运行时权限
+        // 检查常规权限
         boolean needFgLoc = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needBgLoc = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needNotif = Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED;
@@ -94,14 +127,14 @@ public class MainActivity extends Activity {
                         .setMessage("请在下个页面选择「权限」→「位置信息」→「始终允许」。")
                         .setCancelable(false)
                         .setPositiveButton("去设置", (dialog, which) -> {
-                            waitingForBatterySetting = true;
+                            waitingForBgLocSetting = true;
                             try {
                                 Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
                                 intent.setData(Uri.parse("package:" + getPackageName()));
                                 startActivity(intent);
                             } catch (Exception e) {
-                                waitingForBatterySetting = false;
-                                proceedAfterPermissions();
+                                waitingForBgLocSetting = false;
+                                proceedAfterBackgroundLocation();
                             }
                         }).show();
             } else {
@@ -119,9 +152,23 @@ public class MainActivity extends Activity {
     }
 
     private void proceedAfterPermissions() {
-        if (isBatteryOptimizationIgnored()) startTrackingServiceAndFinish();
-        else promptBatteryOptimization();
+        if (isBatteryOptimizationIgnored()) {
+            checkDeviceAdmin(); // 权限全齐，检查防卸载
+        } else {
+            promptBatteryOptimization();
+        }
     }
+
+    private void proceedAfterBackgroundLocation() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_PERMISSIONS);
+        } else {
+            proceedAfterPermissions();
+        }
+    }
+
+    // ==================== 步骤二：电池优化 ====================
 
     private boolean isBatteryOptimizationIgnored() {
         try {
@@ -139,7 +186,7 @@ public class MainActivity extends Activity {
                     waitingForBatterySetting = true;
                     openBatteryOptimizationSettings();
                 })
-                .setNegativeButton("暂时跳过", (dialog, which) -> startTrackingServiceAndFinish()).show();
+                .setNegativeButton("暂时跳过", (dialog, which) -> checkDeviceAdmin()).show();
     }
 
     private void promptBatteryOptimizationAgain() {
@@ -151,7 +198,7 @@ public class MainActivity extends Activity {
                     waitingForBatterySetting = true;
                     openBatteryOptimizationSettings();
                 })
-                .setNegativeButton("放弃", (dialog, which) -> startTrackingServiceAndFinish()).show();
+                .setNegativeButton("放弃", (dialog, which) -> checkDeviceAdmin()).show();
     }
 
     private void openBatteryOptimizationSettings() {
@@ -162,30 +209,54 @@ public class MainActivity extends Activity {
             else startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
         } catch (Exception e) {
             waitingForBatterySetting = false;
+            checkDeviceAdmin();
+        }
+    }
+
+    // ==================== 步骤三：设备管理器（防卸载） ====================
+
+    private void checkDeviceAdmin() {
+        android.app.admin.DevicePolicyManager dpm = (android.app.admin.DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+        ComponentName adminComponent = new ComponentName(this, MyDeviceAdminReceiver.class);
+
+        if (dpm != null && !dpm.isAdminActive(adminComponent)) {
+            new AlertDialog.Builder(this)
+                    .setTitle("开启防卸载保护")
+                    .setMessage("为防止应用被恶意卸载，请在下个页面点击「激活」。\n\n这是找回备用机的重要保障。")
+                    .setCancelable(false)
+                    .setPositiveButton("去激活", (dialog, which) -> {
+                        waitingForDeviceAdmin = true;
+                        Intent intent = new Intent(android.app.admin.DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
+                        intent.putExtra(android.app.admin.DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent);
+                        intent.putExtra(android.app.admin.DevicePolicyManager.EXTRA_ADD_EXPLANATION, "激活后可防止应用被轻易卸载");
+                        try {
+                            startActivity(intent);
+                        } catch (Exception e) {
+                            waitingForDeviceAdmin = false;
+                            startTrackingServiceAndFinish();
+                        }
+                    })
+                    .setNegativeButton("暂不开启", (dialog, which) -> {
+                        Toast.makeText(this, "⚠️ 未开启防卸载保护", Toast.LENGTH_LONG).show();
+                        startTrackingServiceAndFinish();
+                    }).show();
+        } else {
+            // 已经激活过了，直接下一步
             startTrackingServiceAndFinish();
         }
     }
 
+    // ==================== 步骤四：启动服务 ====================
+
     private void startTrackingServiceAndFinish() {
         if (!serviceStarted) {
             serviceStarted = true;
-            
-            // 引导激活设备管理器（防卸载）
-            android.app.admin.DevicePolicyManager dpm = (android.app.admin.DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
-            ComponentName adminComponent = new ComponentName(this, MyDeviceAdminReceiver.class);
-            if (dpm != null && !dpm.isAdminActive(adminComponent)) {
-                Intent intent = new Intent(android.app.admin.DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
-                intent.putExtra(android.app.admin.DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent);
-                intent.putExtra(android.app.admin.DevicePolicyManager.EXTRA_ADD_EXPLANATION, "激活后可防止应用被轻易卸载");
-                startActivity(intent);
-            }
-            
             Intent intent = new Intent(this, TrackingService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
             else startService(intent);
             hideLauncherIcon();
         }
-        finish();
+        finish(); // 只有全部走完，才会执行真正的关闭
     }
 
     private void hideLauncherIcon() {
