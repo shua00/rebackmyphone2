@@ -3,8 +3,6 @@ import time
 import sys
 
 RESCUE_SECRET = "your_private_secret_key"  # ⚠️ 必须与手机端一致
-
-# ⚠️ 你可以把常用的地址保存在这里，方便直接回车调用
 DEFAULT_SERVER_URL = "http://dingwei.bai001.de5.net/api/report"
 DEFAULT_CONFIG_URL = "https://your-config-url.com/config.txt"
 
@@ -13,7 +11,7 @@ def send_udp(command_str):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     
     print(f"\n📡 广播指令: {command_str}")
-    for i in range(3):  # 发 3 次，防丢包
+    for i in range(3):
         sock.sendto(command_str.encode('utf-8'), ('255.255.255.255', 8888))
         print(f"   [{i+1}/3] 发送中...")
         time.sleep(1)
@@ -30,10 +28,11 @@ def main():
         print("3. 更换手机的主服务器地址")
         print("4. 更换手机的配置中心地址")
         print("5. 🔊 强制手机播放警报音 (响铃)")
+        print("6. 💬 在手机屏幕显示悬浮文字")
         print("0. 退出")
         print("="*45)
         
-        choice = input("请输入选项 (0-5): ").strip()
+        choice = input("请输入选项 (0-6): ").strip()
         
         if choice == '1':
             send_udp(f"FIND_ME_REPORT:{RESCUE_SECRET}")
@@ -56,6 +55,11 @@ def main():
         elif choice == '5':
             print("\n⚠️ 警告: 手机将在局域网内以最大音量播放 30 秒警报！")
             send_udp(f"FIND_ME_ALARM:{RESCUE_SECRET}")
+            
+        elif choice == '6':
+            msg_text = input("请输入要显示在手机屏幕上的文字: ").strip()
+            if msg_text:
+                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:{msg_text}")
             
         elif choice == '0':
             print("👋 退出。")
