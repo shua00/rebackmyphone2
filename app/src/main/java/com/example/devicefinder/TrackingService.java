@@ -30,6 +30,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.provider.Settings;
 import android.util.Log;
 
 import org.json.JSONArray;
@@ -57,12 +58,11 @@ public class TrackingService extends Service implements LocationListener {
     private SensorManager sensorManager;
     private Sensor motionSensor;
 
-    private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
+    private long reportIntervalMs = 1800 * 1000L; 
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
     private int reportCount = 0;
     
-    // 动态开关
     private boolean enableWifiLock = true;
     private boolean enableMotionTrigger = true;
 
@@ -70,7 +70,7 @@ public class TrackingService extends Service implements LocationListener {
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    // ⚠️【基础配置区】请按需修改
+    // ⚠️【基础配置区】
     private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
@@ -155,23 +155,31 @@ public class TrackingService extends Service implements LocationListener {
                 triggerRescueListener();
                 fetchRemoteConfig();
                 scheduleHeartbeatAlarm();
+            } else if ("ACTION_PLAY_ALARM".equals(action)) {
+                playAlarm();
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
-                // 【修复】使用无参的 acquire() 并配合 handler 延时释放
-                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
-                    wifiLock.acquire();
-                    handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
-                }
+                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire(15000);
                 sendReport(true, true);
                 reportCount++;
                 scheduleNextReport();
+                handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             }
         }
         return START_STICKY;
     }
 
-    // 【修复】补上缺失的 triggerRescueListener 方法
-    private void triggerRescueListener() {
-        if (!isListeningForRescue) startRescueListener();
+    private void playAlarm() {
+        try {
+            android.media.Ringtone ringtone = android.media.RingtoneManager.getRingtone(getApplicationContext(), android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_ALARM));
+            if (ringtone != null) {
+                android.media.AudioManager audioManager = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                if (audioManager != null) {
+                    audioManager.setStreamVolume(android.media.AudioManager.STREAM_ALARM, audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_ALARM), 0);
+                }
+                ringtone.play();
+                handler.postDelayed(() -> { if (ringtone.isPlaying()) ringtone.stop(); }, 30000);
+            }
+        } catch (Exception ignored) {}
     }
 
     private void startForegroundNotification() {
@@ -207,8 +215,10 @@ public class TrackingService extends Service implements LocationListener {
         String deviceId = sp.getString("saved_device_id", null);
         if (deviceId == null) {
             String model = Build.MODEL != null ? Build.MODEL.replaceAll("\\s+", "_") : "UnknownPhone";
-            int randomNum = (int)((Math.random() * 9000) + 1000);
-            deviceId = model + "_" + randomNum;
+            // 使用 Android 系统自带的唯一设备 ID，重装不变！
+            String androidId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+            String suffix = (androidId != null && androidId.length() >= 4) ? androidId.substring(androidId.length() - 4) : "0000";
+            deviceId = model + "_" + suffix;
             sp.edit().putString("saved_device_id", deviceId).apply();
         }
         return deviceId;
@@ -366,10 +376,8 @@ public class TrackingService extends Service implements LocationListener {
 
         new Thread(() -> {
             boolean success = false;
-            
-            // 【修复】使用无参的 acquire()
             if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
-                wifiLock.acquire();
+                wifiLock.acquire(10000);
             }
             try {
                 if (wakeLock != null) wakeLock.acquire(10000);
@@ -387,6 +395,13 @@ public class TrackingService extends Service implements LocationListener {
                 json.put("device_id", getUniqueDeviceId());
                 json.put("token", AUTH_TOKEN);
                 json.put("timestamp", System.currentTimeMillis());
+                
+                // 【新增】系统状态
+                json.put("os_version", "Android " + Build.VERSION.RELEASE); 
+                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                json.put("is_screen_on", pm != null && pm.isInteractive());
+                json.put("uptime_ms", android.os.SystemClock.elapsedRealtime());
+
                 JSONObject battObj = new JSONObject();
                 battObj.put("level", battery[0]);
                 battObj.put("is_charging", battery[1] == 1);
@@ -523,6 +538,9 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_REPORT_TEMP:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) { sendReport(true, true, parts[2].trim()); }
+                    } else if (message.startsWith("FIND_ME_ALARM:")) {
+                        String[] parts = message.split(":", 2);
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { playAlarm(); }
                     }
                 }
             } catch (Exception e) {
