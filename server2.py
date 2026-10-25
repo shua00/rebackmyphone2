@@ -82,7 +82,6 @@ def handle_client(client_conn, client_addr):
         request = client_conn.recv(16384).decode('utf-8', errors='ignore')
         if not request: return
 
-        # 处理浏览器的跨域预检请求 (OPTIONS)
         if request.startswith("OPTIONS"):
             client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\n\r\n")
             return
@@ -167,10 +166,11 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clear_history": 
                     success = send_udp_broadcast(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", target_ip)
+                elif action == "toggle_chat":
+                    success = send_udp_broadcast(f"FIND_ME_CHAT_TOGGLE:{RESCUE_SECRET}", target_ip)
                 elif action == "clean_offline":
                     now_ts = int(datetime.datetime.now().timestamp() * 1000)
                     to_delete = []
-                    # 【修复】使用 list() 拷贝防止并发修改字典报错
                     for k, v in list(ALL_DEVICES_STATUS.items()):
                         if now_ts - v.get('received_at', 0) > 3600000: 
                             to_delete.append(k)
@@ -183,7 +183,6 @@ def handle_client(client_conn, client_addr):
                 resp = json.dumps({"status": "ok" if success else "error"})
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
             except Exception as e: 
-                # 【修复】捕获异常并返回 500，不再静默 pass 导致前端报 HTML 解析错误
                 with print_lock: print(f"控制指令处理异常: {e}")
                 try:
                     resp = json.dumps({"status": "error", "msg": str(e)})
@@ -221,54 +220,66 @@ def handle_client(client_conn, client_addr):
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-body{font-family:sans-serif;margin:20px;background:#f4f6f9;}
-h2{color:#333;font-size: 20px;}
-.panel{background:#fff;padding:15px;border-radius:8px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}
-button{padding:6px 12px;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-right:10px;font-size:14px;}
-button:hover{opacity:0.8;}
-input[type="text"]{padding:6px;border:1px solid #ccc;border-radius:4px;margin-right:10px;width:300px;}
-table{border-collapse:collapse;width:100%;background:#fff;}
-th,td{border:1px solid #ddd;padding:10px;text-align:left;font-size:14px;}
-th{background:#f0f0f0;}
-details { cursor: pointer; color: #007bff; }
-ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
-#map { height: 450px; width: 100%; border-radius: 8px; margin-top: 10px; }
-#msgModal { display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }
-#msgContent { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #fff; padding: 20px; border-radius: 10px; width: 80%; max-width: 600px; max-height: 80%; overflow-y: auto; box-shadow: 0 4px 10px rgba(0,0,0,0.2); }
-.close-btn { float: right; cursor: pointer; font-weight: bold; color: red; font-size: 20px; }
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:20px;background:#f4f5f7;color:#333;}
+h2{font-size: 20px;font-weight: 600;margin-bottom: 20px;}
+.panel{background:#fff;padding:16px;border-radius:8px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1);border: 1px solid #e5e7eb;}
+button{padding:6px 14px;background:#fff;color:#374151;border:1px solid #d1d5db;border-radius:6px;cursor:pointer;margin-right:10px;font-size:14px;transition:all 0.2s;}
+button:hover{background:#f3f4f6;border-color:#9ca3af;}
+.btn-primary{background:#1f2937;color:#fff;border-color:#1f2937;}
+.btn-primary:hover{background:#111827;}
+.btn-danger{color:#ef4444;border-color:#fca5a5;}
+.btn-danger:hover{background:#fef2f2;border-color:#ef4444;}
+button.btn-sm{padding:4px 8px;font-size:12px;margin-bottom:6px;width:100%;border-radius:4px;}
+input[type="text"]{padding:6px 12px;border:1px solid #d1d5db;border-radius:6px;margin-right:10px;width:300px;font-size:14px;}
+input[type="text"]:focus{outline:none;border-color:#1f2937;box-shadow:0 0 0 2px rgba(31,41,55,0.1);}
+table{border-collapse:collapse;width:100%;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1);border: 1px solid #e5e7eb;}
+th,td{border-bottom:1px solid #e5e7eb;padding:12px 16px;text-align:left;font-size:14px;}
+th{background:#f9fafb;font-weight:600;color:#4b5563;}
+tr:last-child td{border-bottom:none;}
+tr:hover{background:#f9fafb;}
+details { cursor: pointer; color: #3b82f6; }
+ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
+#mapContainer { display: none; margin-top: 20px;}
+#map { height: 500px; width: 100%; border-radius: 8px; box-shadow:0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e5e7eb;}
+#msgModal { display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.4); backdrop-filter: blur(2px); }
+#msgContent { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #fff; padding: 24px; border-radius: 12px; width: 80%; max-width: 600px; max-height: 80%; overflow-y: auto; box-shadow: 0 10px 25px rgba(0,0,0,0.1); }
+.close-btn { float: right; cursor: pointer; font-weight: bold; color: #9ca3af; font-size: 20px; transition: color 0.2s;}
+.close-btn:hover { color: #ef4444; }
 </style>
 </head>
 <body>
 <h2>📱 终端设备状态同步中心</h2>
 <div class="panel">
-    <button onclick="sendCmd('force_report')">全局同步状态</button>
-    <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">全局测试音频</button>
-    <button onclick="sendCmd('clean_offline')" style="background:#6c757d;">清理离线设备</button>
-    <button onclick="showServerMessages()" style="background:#6f42c1;">查看云端留言</button>
-    <button onclick="sendCmd('clear_history')" style="background:#ffc107;color:black;">清空手机历史</button>
+    <button class="btn-primary" onclick="sendCmd('force_report')">全局同步状态</button>
+    <button class="btn-danger" onclick="sendCmd('play_alarm')">全局测试音频</button>
+    <button onclick="sendCmd('toggle_chat')">切换聊天入口</button>
+    <button onclick="sendCmd('clean_offline')">清理离线设备</button>
+    <button onclick="showServerMessages()">查看云端留言</button>
+    <button onclick="sendCmd('clear_history')">清空手机历史</button>
+    <button id="toggleMapBtn" onclick="toggleMap()" style="float:right; font-weight:600;">🗺️ 展开地图</button>
     <br><br>
     <input type="text" id="msgText" placeholder="输入要群发到所有手机屏幕上的文字...">
-    <button onclick="sendScreenMsg('255.255.255.255')" style="background:#28a745;">发送群发提示</button>
+    <button class="btn-primary" onclick="sendScreenMsg('255.255.255.255')">发送群发提示</button>
 </div>
-<div class="panel">
+<div class="panel" style="padding:0; border:none; box-shadow:none; background:transparent;">
     <table>
         <tr><th>设备ID</th><th>系统 / 状态</th><th>电量</th><th>Wi-Fi / IP</th><th>经纬度</th><th>定位时间</th><th>收到时间</th><th>周围热点</th><th>操作</th></tr>
 """
             for dev_id, info in list(ALL_DEVICES_STATUS.items()):
                 os_ver = info.get('os_version', 'Unknown').replace("Android ", "A")
                 screen_on = "亮屏" if info.get('is_screen_on') else "息屏"
-                sys_status = f"{os_ver} <br><span style='font-size:12px;color:#888;'>{screen_on}</span>"
+                sys_status = f"{os_ver} <br><span style='font-size:12px;color:#6b7280;'>{screen_on}</span>"
                 
                 lat = info.get('location', {}).get('latitude')
                 lng = info.get('location', {}).get('longitude')
                 if lat is not None and lng is not None:
-                    coord = f"<a href='https://uri.amap.com/marker?position={lng},{lat}' target='_blank' style='color:#007bff;'>{lat:.6f}, {lng:.6f}</a>"
+                    coord = f"<a href='https://uri.amap.com/marker?position={lng},{lat}' target='_blank' style='color:#3b82f6;text-decoration:none;'>{lat:.6f}, {lng:.6f}</a>"
                 else:
                     coord = "无定位"
 
                 ssid = info.get('network', {}).get('wifi_ssid', '?')
                 local_ip = info.get('network', {}).get('local_ip', '0.0.0.0')
-                wifi_info = f"{ssid}<br><span style='font-size:12px;color:#888;'>{local_ip}</span>"
+                wifi_info = f"{ssid}<br><span style='font-size:12px;color:#6b7280;'>{local_ip}</span>"
 
                 nearby = info.get('nearby_wifi', [])
                 ap_list_html = ""
@@ -278,7 +289,7 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
                         ap_list_html += f"<li>{ap.get('ssid')} ({ap.get('rssi')} dBm)</li>"
                     ap_list_html += "</ul></details>"
                 else:
-                    ap_list_html = "0 个"
+                    ap_list_html = "<span style='color:#9ca3af;'>0 个</span>"
 
                 html += f"<tr><td><b>{dev_id}</b></td>"
                 html += f"<td>{sys_status}</td>"
@@ -290,29 +301,83 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
                 html += f"<td>{ap_list_html}</td>"
                 
                 html += f"<td style='min-width:100px;'>"
-                html += f"<button onclick=\"sendCmd('force_report', '', '{local_ip}')\" style=\"background:#007bff;margin-bottom:4px;font-size:12px;width:100%;\">单独同步</button>"
-                html += f"<button onclick=\"sendScreenMsg('{local_ip}')\" style=\"background:#28a745;margin-bottom:4px;font-size:12px;width:100%;\">单独提示</button>"
-                html += f"<button onclick=\"sendCmd('play_alarm', '', '{local_ip}')\" style=\"background:#dc3545;margin-bottom:4px;font-size:12px;width:100%;\">单独响铃</button>"
-                html += f"<button onclick=\"showTrack('{dev_id}')\" style=\"background:#17a2b8;font-size:12px;width:100%;\">历史轨迹</button>"
+                html += f"<button class='btn-sm' onclick=\"sendCmd('force_report', '', '{local_ip}')\">单独同步</button>"
+                html += f"<button class='btn-sm' onclick=\"sendScreenMsg('{local_ip}')\">单独提示</button>"
+                html += f"<button class='btn-sm btn-danger' onclick=\"sendCmd('play_alarm', '', '{local_ip}')\">单独响铃</button>"
+                html += f"<button class='btn-sm' onclick=\"sendCmd('toggle_chat', '', '{local_ip}')\">开关聊天</button>"
+                html += f"<button class='btn-sm' onclick=\"showTrack('{dev_id}')\">历史轨迹</button>"
                 html += f"</td></tr>"
                 
             if not ALL_DEVICES_STATUS:
-                html += "<tr><td colspan='9' align='center'>暂无设备上报</td></tr>"
+                html += "<tr><td colspan='9' align='center' style='padding:30px;color:#6b7280;'>暂无设备上报</td></tr>"
 
             html += """</table></div>
-<div id="map"></div>
+<div id="mapContainer">
+    <div id="map"></div>
+</div>
 <div id="msgModal">
     <div id="msgContent">
-        <span class="close-btn" onclick="document.getElementById('msgModal').style.display='none'">✖ 关闭</span>
-        <h3>📜 云端留言备份</h3>
+        <span class="close-btn" onclick="document.getElementById('msgModal').style.display='none'">✖</span>
+        <h3 style="margin-top:0;">📜 云端留言备份</h3>
         <div id="msgList" style="margin-top: 15px; line-height: 1.6; font-size: 15px;"></div>
     </div>
 </div>
 <script>
-var map = L.map('map').setView([39.9, 116.4], 13);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19}).addTo(map);
-var markersLayer = L.layerGroup().addTo(map);
+var map = null;
+var markersLayer = null;
 var polyline = null;
+var isMapVisible = false;
+
+function toggleMap() {
+    var container = document.getElementById('mapContainer');
+    var btn = document.getElementById('toggleMapBtn');
+    
+    if (isMapVisible) {
+        container.style.display = 'none';
+        btn.innerHTML = '🗺️ 展开地图';
+    } else {
+        container.style.display = 'block';
+        btn.innerHTML = '⬆️ 收起地图';
+        
+        // 如果地图还没初始化，现在初始化
+        if (!map) {
+            map = L.map('map').setView([39.9, 116.4], 13);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19}).addTo(map);
+            markersLayer = L.layerGroup().addTo(map);
+        }
+        // 解决隐藏容器展开后地图显示不全（灰块）的问题
+        setTimeout(function() { map.invalidateSize(); }, 200);
+    }
+    isMapVisible = !isMapVisible;
+}
+
+// 修改轨迹显示逻辑，自动拉起地图
+async function showTrack(devId) {
+    if (!isMapVisible) toggleMap(); // 没展开就先展开
+
+    const res = await fetch(`/api/history?device_id=${devId}`);
+    const data = await res.json();
+    
+    if (data.length === 0) return alert("暂无该设备的轨迹数据");
+    
+    // 延迟一下，确保地图已经渲染
+    setTimeout(() => {
+        markersLayer.clearLayers();
+        if (polyline) map.removeLayer(polyline);
+        
+        var latlngs = [];
+        data.reverse().forEach((row, index) => {
+            let lat = row[0], lng = row[1];
+            latlngs.push([lat, lng]);
+            if (index === data.length - 1) {
+                L.marker([lat, lng]).addTo(markersLayer).bindPopup("最新位置").openPopup();
+                map.setView([lat, lng], 16);
+            }
+        });
+        polyline = L.polyline(latlngs, {color: '#1f2937', weight: 4}).addTo(map);
+        map.invalidateSize();
+    }, 250);
+}
 
 async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
     try {
@@ -337,24 +402,6 @@ async function sendScreenMsg(target_ip) {
     await sendCmd('custom_msg', msg, target_ip);
 }
 
-async function showTrack(devId) {
-    const res = await fetch(`/api/history?device_id=${devId}`);
-    const data = await res.json();
-    markersLayer.clearLayers();
-    if (polyline) map.removeLayer(polyline);
-    if (data.length === 0) return alert("暂无该设备的轨迹数据");
-    var latlngs = [];
-    data.reverse().forEach((row, index) => {
-        let lat = row[0], lng = row[1];
-        latlngs.push([lat, lng]);
-        if (index === data.length - 1) {
-            L.marker([lat, lng]).addTo(markersLayer).bindPopup("最新位置").openPopup();
-            map.setView([lat, lng], 16);
-        }
-    });
-    polyline = L.polyline(latlngs, {color: 'blue', weight: 3}).addTo(map);
-}
-
 async function showServerMessages() {
     try {
         const res = await fetch('/api/messages');
@@ -362,13 +409,13 @@ async function showServerMessages() {
         const listDiv = document.getElementById('msgList');
         
         if(data.length === 0) {
-            listDiv.innerHTML = "<p>服务器还没有记录哦~</p>";
+            listDiv.innerHTML = "<p style='color:#6b7280;'>服务器还没有记录哦~</p>";
         } else {
             let html = "";
             data.forEach(item => {
-                html += `<div style="border-bottom:1px solid #eee; padding:10px 0;">
-                            <div style="color:#888; font-size:12px;">[${item[1]}] - ${item[0]}</div>
-                            <div style="font-size:16px; color:#333;">${item[2]}</div>
+                html += `<div style="border-bottom:1px solid #f3f4f6; padding:12px 0;">
+                            <div style="color:#9ca3af; font-size:12px; margin-bottom:4px;">[${item[1]}] - ${item[0]}</div>
+                            <div style="font-size:15px; color:#1f2937;">${item[2]}</div>
                          </div>`;
             });
             listDiv.innerHTML = html;
