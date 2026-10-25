@@ -261,6 +261,7 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     // 【核心更新】居左对齐、点击任意处关闭的留言板
+        // 【无痕居左版留言板 - 高度自适应】
     private void showMessageHistory() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("msg_history", "还没有留言哦~");
@@ -269,6 +270,7 @@ public class TrackingService extends Service implements LocationListener {
             try {
                 WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
                 
+                // 外层容器
                 android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
                 layout.setOrientation(android.widget.LinearLayout.VERTICAL);
                 
@@ -278,12 +280,13 @@ public class TrackingService extends Service implements LocationListener {
                 layout.setBackground(shape);
                 layout.setPadding(60, 60, 60, 60);
 
+                // 标题
                 TextView titleView = new TextView(this);
                 titleView.setText("📜 家庭留言板");
                 titleView.setTextSize(22f);
                 titleView.setTextColor(Color.parseColor("#333333"));
                 titleView.setTypeface(null, android.graphics.Typeface.BOLD);
-                titleView.setGravity(Gravity.START); // 标题居左
+                titleView.setGravity(Gravity.START); 
                 
                 android.widget.LinearLayout.LayoutParams titleParams = new android.widget.LinearLayout.LayoutParams(
                         android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -291,18 +294,22 @@ public class TrackingService extends Service implements LocationListener {
                 titleView.setLayoutParams(titleParams);
                 layout.addView(titleView);
 
+                // 留言列表区域
                 ScrollView scrollView = new ScrollView(this);
-                android.widget.LinearLayout.LayoutParams scrollParams = new android.widget.LinearLayout.LayoutParams(
-                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
-                scrollView.setLayoutParams(scrollParams);
-
                 TextView textView = new TextView(this);
                 textView.setText(history);
                 textView.setTextSize(18f);
                 textView.setTextColor(Color.parseColor("#555555"));
                 textView.setLineSpacing(20f, 1f);
-                textView.setGravity(Gravity.START); // 内容居左
+                textView.setGravity(Gravity.START); 
                 scrollView.addView(textView);
+                
+                // 设置最大高度，防止内容太多撑爆屏幕，内容少时自适应
+                android.widget.LinearLayout.LayoutParams scrollParams = new android.widget.LinearLayout.LayoutParams(
+                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+                scrollParams.height = 600; // 高度上限为600，超过则滚动
+                scrollView.setLayoutParams(scrollParams);
+                
                 layout.addView(scrollView);
 
                 int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? 
@@ -310,19 +317,20 @@ public class TrackingService extends Service implements LocationListener {
 
                 WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                         WindowManager.LayoutParams.WRAP_CONTENT,
-                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        WindowManager.LayoutParams.WRAP_CONTENT, // 高度自适应内容
                         type,
                         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                         PixelFormat.TRANSLUCENT
                 );
 
-                params.gravity = Gravity.CENTER; 
-                params.height = 1000; 
-                params.width = 800;
+                // 【关键修改】靠屏幕左侧居中
+                params.gravity = Gravity.CENTER_VERTICAL | Gravity.START; 
+                params.x = 60; // 距离屏幕左侧 60 像素
+                params.width = 800; // 宽度固定
 
                 wm.addView(layout, params);
 
-                // 穿透内部点击，只响应外层
+                // 无痕关闭
                 textView.setClickable(false);
                 textView.setFocusable(false);
                 scrollView.setClickable(false);
@@ -336,8 +344,9 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     // 【核心更新】居左对齐、无痕消息
+        // 【无痕居左版悬浮窗】
     private void showFloatingMessage(String message) {
-        saveMessageToHistory(message);
+        saveMessageToHistory(message); 
         syncMessageToServer(message);
 
         handler.post(() -> {
@@ -347,7 +356,7 @@ public class TrackingService extends Service implements LocationListener {
 
                 android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
                 layout.setOrientation(android.widget.LinearLayout.VERTICAL);
-                layout.setGravity(Gravity.START); 
+                layout.setGravity(Gravity.START);
 
                 TextView textView = new TextView(this);
                 textView.setText(message);
@@ -356,7 +365,7 @@ public class TrackingService extends Service implements LocationListener {
                 textView.setTextColor(Color.WHITE);
                 textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000")); 
                 textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); 
-                textView.setPadding(60, 20, 60, 20); 
+                textView.setPadding(0, 20, 0, 20); // 左右 padding 去掉，靠重力控制
                 textView.setMaxWidth(800); 
                 textView.setLineSpacing(15f, 1f);
 
@@ -373,8 +382,10 @@ public class TrackingService extends Service implements LocationListener {
                         PixelFormat.TRANSLUCENT
                 );
 
-                params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL; 
-                params.y = 450; 
+                // 【关键修改】顶部靠左对齐
+                params.gravity = Gravity.TOP | Gravity.START; 
+                params.x = 80; // 距离屏幕左侧边缘 80 像素
+                params.y = 450; // 距离屏幕顶部 450 像素
 
                 wm.addView(layout, params);
 
