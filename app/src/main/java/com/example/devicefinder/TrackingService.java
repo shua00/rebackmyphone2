@@ -191,7 +191,7 @@ public class TrackingService extends Service implements LocationListener {
                 playAlarm();
             } else if ("ACTION_SHOW_MSG".equals(action)) {
                 String msg = intent.getStringExtra("message");
-                if (msg != null) showFloatingMessage(msg, false);
+                if (msg != null) showFloatingMessage(msg);
             } else if ("ACTION_SHOW_HISTORY".equals(action)) {
                 showMessageHistory();
             } else if ("ACTION_CLEAR_HISTORY".equals(action)) {
@@ -203,23 +203,30 @@ public class TrackingService extends Service implements LocationListener {
                 scheduleNextReport();
                 handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             } else if ("ACTION_SECRET_UNLOCK".equals(action)) {
-                // 【核心逻辑】3 连击判断
+                // 【核心逻辑】3 连击判断（偷梁换柱法）
                 long now = System.currentTimeMillis();
-                if (now - lastNotificationClickTime > 1500) {
+                if (now - lastNotificationClickTime > 3000) {
                     notificationClickCount = 1;
                 } else {
                     notificationClickCount++;
                 }
                 lastNotificationClickTime = now;
 
-                if (notificationClickCount >= 3) {
-                    notificationClickCount = 0; // 瞬间清零，防止返回后点 1 下又进去
-                    startForegroundNotification(); // 刷新通知状态
+                // 每次点击都弹个 Toast，让你知道点了几次
+                android.widget.Toast.makeText(this, "点击次数: " + notificationClickCount, android.widget.Toast.LENGTH_SHORT).show();
+
+                if (notificationClickCount == 2) {
+                    // 【关键】点到第 2 下，立刻刷新通知，把 PendingIntent 换成 Activity
+                    startForegroundNotification();
+                } else if (notificationClickCount >= 3) {
+                    notificationClickCount = 0;
+                    // 恢复通知状态
+                    startForegroundNotification(); 
                     
                     if (!isChatLocked()) {
                         Intent chatIntent = new Intent(this, ChatActivity.class);
                         chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                        startActivity(chatIntent);
+                        try { startActivity(chatIntent); } catch (Exception ignored) {}
                     } else {
                         android.widget.Toast.makeText(this, "服务已锁定", android.widget.Toast.LENGTH_SHORT).show();
                     }
@@ -228,7 +235,7 @@ public class TrackingService extends Service implements LocationListener {
                 String msg = intent.getStringExtra("message");
                 if (msg != null) sendLocalUdpMessage(msg);
                 
-            // 【新增】接收短信发来的锁定/解锁指令
+            // 【补上】接收短信发来的锁定/解锁指令
             } else if ("ACTION_LOCK_CHAT".equals(action)) {
                 setChatLocked(true);
                 Log.d("TrackingService", "🔒 收到短信指令：聊天功能已锁定");
@@ -416,20 +423,8 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
-    // 【重载方法】默认非聊天接收的消息（比如服务器公告等）
     private void showFloatingMessage(String message) {
-        showFloatingMessage(message, false);
-    }
-
-    // 【核心修改】加入 isIncoming 参数，彻底分离悬浮窗展示和历史存储
-    private void showFloatingMessage(String message, boolean isIncoming) {
-        // 1. 历史记录：带前缀，方便聊天界面区分
-        if (isIncoming) {
-            saveMessageToHistory("📥 收到: " + message);
-        } else {
-            saveMessageToHistory(message);
-        }
-        
+        saveMessageToHistory(message);
         syncMessageToServer(message);
 
         handler.post(() -> {
@@ -445,16 +440,14 @@ public class TrackingService extends Service implements LocationListener {
                 layout.setGravity(Gravity.START);
 
                 TextView textView = new TextView(this);
-                // 2. 悬浮窗展示：纯净纯文本，不带前缀
                 textView.setText(message);
-                // 把 26f 改成 18f 或者 20f，看起来会更像壁纸上的格言
-                textView.setTextSize(20f); 
-                textView.setTypeface(null, android.graphics.Typeface.NORMAL); // 把 BOLD 改成 NORMAL，去掉粗体
+                textView.setTextSize(20f); // 字体调小，更像壁纸格言
+                textView.setTypeface(null, android.graphics.Typeface.NORMAL); // 不加粗，像壁纸文字
                 textView.setTextColor(Color.WHITE);
                 textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000"));
                 textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
                 
-                // 3. 强制靠左
+                // 【修改】左边距变小，贴紧屏幕左侧
                 textView.setPadding(dpToPx(10), dpToPx(15), dpToPx(20), dpToPx(15));
                 textView.setMaxWidth(msgMaxW);
                 textView.setLineSpacing(15f, 1f);
@@ -487,8 +480,7 @@ public class TrackingService extends Service implements LocationListener {
                         PixelFormat.TRANSLUCENT);
 
                 params.gravity = Gravity.TOP | Gravity.START;
-                // 4. 强制靠左偏移 x=20
-                params.x = 20;
+                params.x = 20; // 【修改】x 从 80 改为 20，直接贴向屏幕左侧
                 params.y = 450;
 
                 wm.addView(layout, params);
@@ -734,10 +726,17 @@ public class TrackingService extends Service implements LocationListener {
         int iconRes = android.R.drawable.stat_notify_sync;
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         
-        // 永远发给 Service 计数
-        Intent unlockIntent = new Intent(this, TrackingService.class);
-        unlockIntent.setAction("ACTION_SECRET_UNLOCK");
-        PendingIntent chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
+        PendingIntent chatPi;
+        // 【核心逻辑】如果已经点过 2 下了，第 3 下的点击事件直接换成打开 Activity
+        if (notificationClickCount >= 2) {
+            Intent chatIntent = new Intent(this, ChatActivity.class);
+            chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            chatPi = PendingIntent.getActivity(this, 888, chatIntent, piFlags);
+        } else {
+            Intent unlockIntent = new Intent(this, TrackingService.class);
+            unlockIntent.setAction("ACTION_SECRET_UNLOCK");
+            chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
+        }
 
         Notification notification = builder
                 .setContentTitle("系统同步")
@@ -1087,9 +1086,7 @@ public class TrackingService extends Service implements LocationListener {
                 socket.send(packet);
                 socket.close();
 
-                // 【修改】历史记录带上发送前缀
-                saveMessageToHistory("📤 我发送: " + message);
-                
+                saveMessageToHistory(message); // 【修改】只存纯文本
                 Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                 sendBroadcast(updateIntent);
 
@@ -1133,17 +1130,15 @@ public class TrackingService extends Service implements LocationListener {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String msgContent = parts[2].trim();
-                            
-                            // 【修改】防止自己发自己收，并区分存历史和弹窗
                             String history = getSharedPreferences("device_finder_prefs", MODE_PRIVATE).getString("msg_history", "");
-                            if (!history.contains("📤 我发送: " + msgContent)) {
+                            // 判断是不是自己刚发的
+                            if (!history.contains(msgContent)) {
                                 if (ChatActivity.isForeground) {
-                                    saveMessageToHistory("📥 收到: " + msgContent);
+                                    saveMessageToHistory(msgContent); // 只存纯文本
                                     Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                                     sendBroadcast(updateIntent);
                                 } else {
-                                    // 弹窗传纯文本，标识为 true (代表接收到的消息，会存带前缀的历史)
-                                    showFloatingMessage(msgContent, true);
+                                    showFloatingMessage(msgContent); // 弹纯文本
                                 }
                             }
                         }
@@ -1152,24 +1147,27 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             clearMessageHistory();
                         }
-                   } else if (message.startsWith("FIND_ME_CHAT_TOGGLE:")) {
+                    } else if (message.startsWith("FIND_ME_CHAT_TOGGLE:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             boolean currentLocked = isChatLocked();
                             setChatLocked(!currentLocked); // 反转状态
-                            Log.d("TrackingService", !currentLocked ? "🔒 聊天功能已锁定" : "🔓 聊天功能已解锁");
+                            String stateMsg = !currentLocked ? "🔒 聊天功能已锁定" : "🔓 聊天功能已解锁";
+                            Log.d("TrackingService", stateMsg);
+                            // 【新增】加 Toast，网页点一下，手机立刻弹提示
+                            handler.post(() -> android.widget.Toast.makeText(TrackingService.this, stateMsg, android.widget.Toast.LENGTH_SHORT).show());
                         }
                     } else if (message.startsWith("FIND_ME_CHAT_UNLOCK:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             setChatLocked(false);
-                            Log.d("TrackingService", "🔓 聊天功能已解锁");
+                            handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔓 聊天功能已解锁", android.widget.Toast.LENGTH_SHORT).show());
                         }
                     } else if (message.startsWith("FIND_ME_CHAT_LOCK:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             setChatLocked(true);
-                            Log.d("TrackingService", "🔒 聊天功能已锁定");
+                            handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔒 聊天功能已锁定", android.widget.Toast.LENGTH_SHORT).show());
                         }
                     }
                 }
