@@ -5,7 +5,7 @@ import threading
 import time
 import sqlite3
 
-PORT = 8080
+PORT = 8080  # 如果冲突请修改
 AUTH_TOKEN = "your_private_secret_key"
 RESCUE_SECRET = "your_private_secret_key"
 
@@ -59,17 +59,20 @@ def get_local_ip():
         ip = s.getsockname()[0]; s.close(); return ip
     except: return "127.0.0.1"
 
-def send_udp_broadcast(command_str):
+# 【核心修改】支持指定 IP 发送
+def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        with print_lock: print(f"\n📡 [控制台] 正在发送广播: {command_str}")
+        with print_lock: print(f"\n📡 [控制台] 正在发送指令至 {target_ip}: {command_str}")
         for i in range(3):
-            sock.sendto(command_str.encode('utf-8'), ('255.255.255.255', 8888))
+            sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
             time.sleep(0.2) 
         sock.close()
         return True
-    except: return False
+    except Exception as e: 
+        with print_lock: print(f"发送失败: {e}")
+        return False
 
 def handle_client(client_conn, client_addr):
     try:
@@ -118,16 +121,17 @@ def handle_client(client_conn, client_addr):
                 cmd_data = json.loads(body)
                 action = cmd_data.get("action")
                 payload = cmd_data.get("payload", "")
+                target_ip = cmd_data.get("target_ip", "255.255.255.255") # 接收目标IP
                 
                 success = False
                 if action == "force_report": 
-                    success = send_udp_broadcast(f"FIND_ME_REPORT:{RESCUE_SECRET}")
+                    success = send_udp_broadcast(f"FIND_ME_REPORT:{RESCUE_SECRET}", target_ip)
                 elif action == "play_alarm": 
-                    success = send_udp_broadcast(f"FIND_ME_ALARM:{RESCUE_SECRET}")
+                    success = send_udp_broadcast(f"FIND_ME_ALARM:{RESCUE_SECRET}", target_ip)
                 elif action == "custom_msg": 
-                    success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}")
+                    success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "change_server": 
-                    success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}")
+                    success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clean_offline":
                     now_ts = int(datetime.datetime.now().timestamp() * 1000)
                     to_delete = []
@@ -178,16 +182,16 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
 <body>
 <h2>📱 终端设备状态同步中心</h2>
 <div class="panel">
-    <button onclick="sendCmd('force_report')">同步最新状态</button>
-    <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">测试音频提示</button>
+    <button onclick="sendCmd('force_report')">全局同步状态</button>
+    <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">全局测试音频提示</button>
     <button onclick="sendCmd('clean_offline')" style="background:#6c757d;">清理离线数据</button>
     <br><br>
-    <input type="text" id="msgText" placeholder="输入要显示在手机屏幕上的文字...">
-    <button onclick="sendScreenMsg()" style="background:#28a745;">发送屏幕提示</button>
+    <input type="text" id="msgText" placeholder="输入要群发到所有手机屏幕上的文字...">
+    <button onclick="sendScreenMsg('255.255.255.255')" style="background:#28a745;">发送群发提示</button>
 </div>
 <div class="panel">
     <table>
-        <tr><th>设备ID</th><th>系统 / 状态</th><th>电量</th><th>Wi-Fi</th><th>经纬度</th><th>定位时间</th><th>收到时间</th><th>周围热点</th><th>操作</th></tr>
+        <tr><th>设备ID</th><th>系统 / 状态</th><th>电量</th><th>Wi-Fi / IP</th><th>经纬度</th><th>定位时间</th><th>收到时间</th><th>周围热点</th><th>操作</th></tr>
 """
             for dev_id, info in ALL_DEVICES_STATUS.items():
                 os_ver = info.get('os_version', 'Unknown').replace("Android ", "A")
@@ -200,6 +204,11 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
                     coord = f"<a href='https://uri.amap.com/marker?position={lng},{lat}' target='_blank' style='color:#007bff;'>{lat:.6f}, {lng:.6f}</a>"
                 else:
                     coord = "无定位"
+
+                # 提取 Wi-Fi 名称和 IP
+                ssid = info.get('network', {}).get('wifi_ssid', '?')
+                local_ip = info.get('network', {}).get('local_ip', '0.0.0.0')
+                wifi_info = f"{ssid}<br><span style='font-size:12px;color:#888;'>{local_ip}</span>"
 
                 nearby = info.get('nearby_wifi', [])
                 ap_list_html = ""
@@ -214,12 +223,19 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
                 html += f"<tr><td><b>{dev_id}</b></td>"
                 html += f"<td>{sys_status}</td>"
                 html += f"<td>{info.get('battery', {}).get('level', '?')}%</td>"
-                html += f"<td>{info.get('network', {}).get('wifi_ssid', '?')}</td>"
+                html += f"<td>{wifi_info}</td>"
                 html += f"<td>{coord}</td>"
                 html += f"<td>{format_loc_time(info.get('location', {}).get('time', 0))}</td>"
                 html += f"<td>{format_loc_time(info.get('received_at', 0))}</td>"
                 html += f"<td>{ap_list_html}</td>"
-                html += f"<td><button onclick=\"showTrack('{dev_id}')\" style=\"background:#17a2b8;\">历史轨迹</button></td></tr>"
+                
+                # 【新增】精确打击按钮，直接将 local_ip 传进去
+                html += f"<td style='min-width:100px;'>"
+                html += f"<button onclick=\"sendCmd('force_report', '', '{local_ip}')\" style=\"background:#007bff;margin-bottom:4px;font-size:12px;width:100%;\">单独同步</button>"
+                html += f"<button onclick=\"sendScreenMsg('{local_ip}')\" style=\"background:#28a745;margin-bottom:4px;font-size:12px;width:100%;\">单独提示</button>"
+                html += f"<button onclick=\"sendCmd('play_alarm', '', '{local_ip}')\" style=\"background:#dc3545;margin-bottom:4px;font-size:12px;width:100%;\">单独响铃</button>"
+                html += f"<button onclick=\"showTrack('{dev_id}')\" style=\"background:#17a2b8;font-size:12px;width:100%;\">历史轨迹</button>"
+                html += f"</td></tr>"
                 
             if not ALL_DEVICES_STATUS:
                 html += "<tr><td colspan='9' align='center'>暂无设备上报</td></tr>"
@@ -232,28 +248,24 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19})
 var markersLayer = L.layerGroup().addTo(map);
 var polyline = null;
 
-async function sendCmd(action, payload = "") {
-    if(payload === "" && action === 'change_server') { alert("请输入新服务器地址！"); return; }
-    try {
-        const res = await fetch('/api/control', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: action, payload: payload})});
-        const data = await res.json();
-        if(data.status === 'ok') alert("指令已发送！");
-    } catch(e) { alert("请求失败: " + e); }
-}
-
-async function sendScreenMsg() {
-    let msg = document.getElementById('msgText').value;
-    if(!msg) { alert("请输入文字内容！"); return; }
+async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
     try {
         const res = await fetch('/api/control', {
             method: 'POST', 
             headers: {'Content-Type': 'application/json'}, 
-            body: JSON.stringify({action: 'custom_msg', payload: msg})
+            body: JSON.stringify({action: action, payload: payload, target_ip: target_ip})
         });
         const data = await res.json();
-        if(data.status === 'ok') alert("提示已发送！");
-        else alert("发送失败，请检查控制台。");
+        if(data.status === 'ok') {
+            if(target_ip !== "255.255.255.255") alert("已向设备 " + target_ip + " 发送指令！");
+        }
     } catch(e) { alert("请求失败: " + e); }
+}
+
+async function sendScreenMsg(target_ip) {
+    let msg = document.getElementById('msgText').value;
+    if(!msg) { alert("请先在输入框输入文字！"); return; }
+    await sendCmd('custom_msg', msg, target_ip);
 }
 
 async function showTrack(devId) {
@@ -278,7 +290,7 @@ async function showTrack(devId) {
 </script>
 </body></html>"""
             client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}".encode('utf-8'))
-    except Exception as e:
+    except Exception:
         pass
     finally:
         try: client_conn.close()
