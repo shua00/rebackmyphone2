@@ -36,6 +36,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.WindowManager;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -165,6 +166,10 @@ public class TrackingService extends Service implements LocationListener {
             } else if ("ACTION_SHOW_MSG".equals(action)) {
                 String msg = intent.getStringExtra("message");
                 if (msg != null) showFloatingMessage(msg);
+            } else if ("ACTION_SHOW_HISTORY".equals(action)) {
+                showMessageHistory();
+            } else if ("ACTION_CLEAR_HISTORY".equals(action)) {
+                clearMessageHistory();
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
                 if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire();
                 sendReport(true, true);
@@ -176,8 +181,136 @@ public class TrackingService extends Service implements LocationListener {
         return START_STICKY;
     }
 
-    // 【新增】显示优雅的纯文字悬浮窗
+    // ==================== 【留言板系统】 ====================
+
+    private void saveMessageToHistory(String message) {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        String history = sp.getString("msg_history", "");
+        
+        String timeStr = new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()).format(new java.util.Date());
+        String newRecord = timeStr + " | " + message;
+        
+        String updatedHistory = newRecord + "\n" + history;
+        String[] lines = updatedHistory.split("\n");
+        if (lines.length > 50) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 50; i++) sb.append(lines[i]).append("\n");
+            updatedHistory = sb.toString();
+        }
+        sp.edit().putString("msg_history", updatedHistory).apply();
+    }
+
+    // 【新增】悄悄把留言同步到服务器
+    private void syncMessageToServer(String message) {
+        new Thread(() -> {
+            try {
+                String timeStr = new java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(new java.util.Date());
+                JSONObject json = new JSONObject();
+                json.put("token", AUTH_TOKEN);
+                json.put("device_id", getUniqueDeviceId());
+                json.put("message", message);
+                json.put("time_str", timeStr);
+                json.put("timestamp", System.currentTimeMillis());
+
+                URL url = new URL(getCurrentServerUrl().replace("/api/report", "/api/message"));
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setConnectTimeout(5000); 
+                conn.setDoOutput(true);
+                
+                OutputStream os = conn.getOutputStream();
+                os.write(json.toString().getBytes("UTF-8")); 
+                os.flush(); 
+                os.close();
+                conn.getResponseCode(); 
+                conn.disconnect();
+            } catch (Exception ignored) {}
+        }).start();
+    }
+
+    private void clearMessageHistory() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        sp.edit().putString("msg_history", "").apply();
+        
+        handler.post(() -> {
+            try {
+                WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+                TextView textView = new TextView(this);
+                textView.setText("🧹 历史留言已清空");
+                textView.setTextSize(20f);
+                textView.setTextColor(Color.WHITE);
+                textView.setBackgroundColor(Color.parseColor("#CC000000")); 
+                textView.setPadding(40, 40, 40, 40);
+                
+                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? 
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
+
+                WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, type,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, 
+                        PixelFormat.TRANSLUCENT
+                );
+                params.gravity = Gravity.CENTER;
+                wm.addView(textView, params);
+                
+                handler.postDelayed(() -> {
+                    try { wm.removeView(textView); } catch (Exception ignored) {}
+                }, 3000);
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private void showMessageHistory() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        String history = sp.getString("msg_history", "还没有留言哦~");
+
+        handler.post(() -> {
+            try {
+                WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+                
+                ScrollView scrollView = new ScrollView(this);
+                android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
+                shape.setColor(Color.parseColor("#F2FFFFFF")); 
+                shape.setCornerRadius(40);
+                scrollView.setBackground(shape);
+                scrollView.setPadding(50, 50, 50, 50);
+
+                TextView textView = new TextView(this);
+                textView.setText("📜 家庭留言板\n\n" + history);
+                textView.setTextSize(18f);
+                textView.setTextColor(Color.parseColor("#333333"));
+                textView.setLineSpacing(20f, 1f);
+
+                scrollView.addView(textView);
+
+                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? 
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
+
+                WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, type,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, 
+                        PixelFormat.TRANSLUCENT
+                );
+
+                params.gravity = Gravity.CENTER; 
+                params.height = 1000; 
+                params.width = 800;
+
+                wm.addView(scrollView, params);
+
+                scrollView.setOnClickListener(v -> {
+                    try { wm.removeView(scrollView); } catch (Exception ignored) {}
+                });
+                
+            } catch (Exception ignored) {}
+        });
+    }
+
     private void showFloatingMessage(String message) {
+        saveMessageToHistory(message); // 本地保存
+        syncMessageToServer(message);  // 【新增】云端备份
+
         handler.post(() -> {
             try {
                 WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
@@ -185,33 +318,39 @@ public class TrackingService extends Service implements LocationListener {
 
                 TextView textView = new TextView(this);
                 textView.setText(message);
-                textView.setTextSize(24f);
-                textView.setTextColor(Color.WHITE); 
-                textView.setShadowLayer(5f, 2f, 2f, Color.BLACK); 
+                textView.setTextSize(26f);
+                textView.setTypeface(null, android.graphics.Typeface.BOLD);
+                textView.setTextColor(Color.WHITE);
+                textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000")); 
                 textView.setGravity(Gravity.CENTER);
-                textView.setPadding(40, 40, 40, 40);
+                textView.setPadding(50, 50, 50, 50);
                 textView.setMaxWidth(800); 
+                textView.setLineSpacing(15f, 1f);
 
-                int type;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
-                } else {
-                    type = WindowManager.LayoutParams.TYPE_PHONE;
-                }
+                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? 
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
 
                 WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                        WindowManager.LayoutParams.WRAP_CONTENT,
-                        WindowManager.LayoutParams.WRAP_CONTENT,
-                        type,
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, 
+                        WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, type,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, 
                         PixelFormat.TRANSLUCENT
                 );
 
-                params.gravity = Gravity.CENTER; 
+                params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                params.y = 450; 
+
                 wm.addView(textView, params);
 
+                // 短按：消除文字
                 textView.setOnClickListener(v -> {
                     try { wm.removeView(textView); } catch (Exception ignored) {}
+                });
+
+                // 长按：消除文字，并呼出历史留言板
+                textView.setOnLongClickListener(v -> {
+                    try { wm.removeView(textView); } catch (Exception ignored) {} 
+                    showMessageHistory(); 
+                    return true;
                 });
 
                 handler.postDelayed(() -> {
@@ -221,6 +360,8 @@ public class TrackingService extends Service implements LocationListener {
             } catch (Exception ignored) {}
         });
     }
+
+    // ==================== 【原有功能】 ====================
 
     private void playAlarm() {
         try {
@@ -561,12 +702,9 @@ public class TrackingService extends Service implements LocationListener {
                     br.close();
                     String fetchedText = sb.toString().trim();
                     
-                    // 【新增】判断是否是显示消息
                     if (fetchedText.startsWith("MSG:")) {
                         showFloatingMessage(fetchedText.substring(4).trim());
-                    } 
-                    // 原有的换服逻辑
-                    else if (fetchedText.startsWith("http") && !fetchedText.equals(getCurrentServerUrl())) {
+                    } else if (fetchedText.startsWith("http") && !fetchedText.equals(getCurrentServerUrl())) {
                         saveNewServerUrl(fetchedText); consecutiveFailures = 0; sendReport(true, true);
                     }
                 }
@@ -625,10 +763,16 @@ public class TrackingService extends Service implements LocationListener {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { playAlarm(); }
                     } else if (message.startsWith("FIND_ME_MSG:")) {
-                        // 【新增】UDP 文字提示
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             showFloatingMessage(parts[2].trim());
+                        }
+                    } 
+                    // 【新增】UDP 清空历史留言指令
+                    else if (message.startsWith("FIND_ME_CLEAR_HISTORY:")) {
+                        String[] parts = message.split(":", 2);
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            clearMessageHistory();
                         }
                     }
                 }
