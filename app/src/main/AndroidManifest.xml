@@ -59,6 +59,16 @@
             </intent-filter>
         </receiver>
 
+        <!-- 专供 Android 7.0 以下版本使用的网络恢复监听 -->
+        <receiver
+            android:name=".LegacyNetworkReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
+            </intent-filter>
+        </receiver>
+
         <!-- 设备管理器（防卸载） -->
         <receiver
             android:name=".MyDeviceAdminReceiver"
