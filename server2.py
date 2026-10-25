@@ -5,7 +5,7 @@ import threading
 import time
 import sqlite3
 
-PORT = 8080  # 如果冲突请修改
+PORT = 8080
 AUTH_TOKEN = "your_private_secret_key"
 RESCUE_SECRET = "your_private_secret_key"
 
@@ -25,7 +25,6 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS history
                  (device_id TEXT, lat REAL, lng REAL, timestamp INTEGER)''')
-    # 【新增】留言记录表
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (device_id TEXT, msg_time TEXT, message TEXT, timestamp INTEGER)''')
     conn.commit()
@@ -67,12 +66,10 @@ def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         with print_lock: print(f"\n📡 [控制台] 正在发送指令至 {target_ip}: {command_str}")
-        
         send_times = 3 if target_ip == "255.255.255.255" else 1
         for i in range(send_times):
             sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
             if send_times > 1: time.sleep(0.2) 
-                
         sock.close()
         return True
     except Exception as e: 
@@ -120,7 +117,6 @@ def handle_client(client_conn, client_addr):
             except Exception as e: 
                 with print_lock: print(f"解析异常: {e}")
                 
-        # 【新增】接收留言备份
         elif "POST /api/message" in request:
             try:
                 body = request.split("\r\n\r\n")[1]
@@ -164,7 +160,7 @@ def handle_client(client_conn, client_addr):
                 elif action == "change_server": 
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clear_history": 
-                    success = send_udp_broadcast(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", target_ip) # 清空手机本地记录
+                    success = send_udp_broadcast(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", target_ip)
                 elif action == "clean_offline":
                     now_ts = int(datetime.datetime.now().timestamp() * 1000)
                     to_delete = []
@@ -192,7 +188,6 @@ def handle_client(client_conn, client_addr):
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
             except: pass
 
-        # 【新增】获取云端留言备份
         elif "GET /api/messages" in request:
             try:
                 conn = sqlite3.connect('track_history.db')
@@ -222,6 +217,9 @@ th{background:#f0f0f0;}
 details { cursor: pointer; color: #007bff; }
 ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
 #map { height: 450px; width: 100%; border-radius: 8px; margin-top: 10px; }
+#msgModal { display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }
+#msgContent { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #fff; padding: 20px; border-radius: 10px; width: 80%; max-width: 600px; max-height: 80%; overflow-y: auto; box-shadow: 0 4px 10px rgba(0,0,0,0.2); }
+.close-btn { float: right; cursor: pointer; font-weight: bold; color: red; font-size: 20px; }
 </style>
 </head>
 <body>
@@ -287,6 +285,13 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
 
             html += """</table></div>
 <div id="map"></div>
+<div id="msgModal">
+    <div id="msgContent">
+        <span class="close-btn" onclick="document.getElementById('msgModal').style.display='none'">✖ 关闭</span>
+        <h3>📜 云端留言备份</h3>
+        <div id="msgList" style="margin-top: 15px; line-height: 1.6; font-size: 15px;"></div>
+    </div>
+</div>
 <script>
 var map = L.map('map').setView([39.9, 116.4], 13);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19}).addTo(map);
@@ -302,7 +307,7 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
         });
         const data = await res.json();
         if(data.status === 'ok') {
-            if(target_ip !== "255.255.255.255") alert("已向设备 " + target_ip + " 发送指令！");
+            if(target_ip !== "255.255.255.255") console.log("已向设备 " + target_ip + " 发送指令！");
         }
     } catch(e) { alert("请求失败: " + e); }
 }
@@ -335,14 +340,22 @@ async function showServerMessages() {
     try {
         const res = await fetch('/api/messages');
         const data = await res.json();
-        if(data.length === 0) return alert("服务器还没有记录哦~");
+        const listDiv = document.getElementById('msgList');
         
-        let msgStr = "📜 云端留言备份 (最近50条):\n\n";
-        data.forEach(item => {
-            msgStr += `[${item[1]}] (${item[0]})\n${item[2]}\n\n`;
-        });
-        alert(msgStr);
-    } catch(e) { alert("拉取失败: " + e); }
+        if(data.length === 0) {
+            listDiv.innerHTML = "<p>服务器还没有记录哦~</p>";
+        } else {
+            let html = "";
+            data.forEach(item => {
+                html += `<div style="border-bottom:1px solid #eee; padding:10px 0;">
+                            <div style="color:#888; font-size:12px;">[${item[1]}] - ${item[0]}</div>
+                            <div style="font-size:16px; color:#333;">${item[2]}</div>
+                         </div>`;
+            });
+            listDiv.innerHTML = html;
+        }
+        document.getElementById('msgModal').style.display = 'block';
+    } catch(e) { alert("拉取云端数据失败: " + e); }
 }
 </script>
 </body></html>"""
