@@ -65,9 +65,14 @@ def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         with print_lock: print(f"\n📡 [控制台] 正在发送指令至 {target_ip}: {command_str}")
-        for i in range(3):
+        
+        # 【优化】单播只发1次，广播发3次防丢包
+        send_times = 3 if target_ip == "255.255.255.255" else 1
+        for i in range(send_times):
             sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
-            time.sleep(0.2) 
+            if send_times > 1:
+                time.sleep(0.2) 
+                
         sock.close()
         return True
     except Exception as e: 
