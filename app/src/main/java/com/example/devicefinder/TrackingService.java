@@ -191,7 +191,7 @@ public class TrackingService extends Service implements LocationListener {
                 playAlarm();
             } else if ("ACTION_SHOW_MSG".equals(action)) {
                 String msg = intent.getStringExtra("message");
-                if (msg != null) showFloatingMessage(msg);
+                if (msg != null) showFloatingMessage(msg, false);
             } else if ("ACTION_SHOW_HISTORY".equals(action)) {
                 showMessageHistory();
             } else if ("ACTION_CLEAR_HISTORY".equals(action)) {
@@ -228,7 +228,7 @@ public class TrackingService extends Service implements LocationListener {
                 String msg = intent.getStringExtra("message");
                 if (msg != null) sendLocalUdpMessage(msg);
                 
-             // 【补上这两段】接收短信发来的锁定/解锁指令
+            // 【新增】接收短信发来的锁定/解锁指令
             } else if ("ACTION_LOCK_CHAT".equals(action)) {
                 setChatLocked(true);
                 Log.d("TrackingService", "🔒 收到短信指令：聊天功能已锁定");
@@ -416,8 +416,20 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
+    // 【重载方法】默认非聊天接收的消息（比如服务器公告等）
     private void showFloatingMessage(String message) {
-        saveMessageToHistory(message);
+        showFloatingMessage(message, false);
+    }
+
+    // 【核心修改】加入 isIncoming 参数，彻底分离悬浮窗展示和历史存储
+    private void showFloatingMessage(String message, boolean isIncoming) {
+        // 1. 历史记录：带前缀，方便聊天界面区分
+        if (isIncoming) {
+            saveMessageToHistory("📥 收到: " + message);
+        } else {
+            saveMessageToHistory(message);
+        }
+        
         syncMessageToServer(message);
 
         handler.post(() -> {
@@ -433,6 +445,7 @@ public class TrackingService extends Service implements LocationListener {
                 layout.setGravity(Gravity.START);
 
                 TextView textView = new TextView(this);
+                // 2. 悬浮窗展示：纯净纯文本，不带前缀
                 textView.setText(message);
                 textView.setTextSize(26f);
                 textView.setTypeface(null, android.graphics.Typeface.BOLD);
@@ -440,7 +453,8 @@ public class TrackingService extends Service implements LocationListener {
                 textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000"));
                 textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
                 
-                textView.setPadding(dpToPx(20), dpToPx(15), dpToPx(20), dpToPx(15));
+                // 3. 强制靠左
+                textView.setPadding(dpToPx(10), dpToPx(15), dpToPx(20), dpToPx(15));
                 textView.setMaxWidth(msgMaxW);
                 textView.setLineSpacing(15f, 1f);
                 
@@ -472,7 +486,8 @@ public class TrackingService extends Service implements LocationListener {
                         PixelFormat.TRANSLUCENT);
 
                 params.gravity = Gravity.TOP | Gravity.START;
-                params.x = 80;
+                // 4. 强制靠左偏移 x=20
+                params.x = 20;
                 params.y = 450;
 
                 wm.addView(layout, params);
@@ -1071,7 +1086,9 @@ public class TrackingService extends Service implements LocationListener {
                 socket.send(packet);
                 socket.close();
 
+                // 【修改】历史记录带上发送前缀
                 saveMessageToHistory("📤 我发送: " + message);
+                
                 Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                 sendBroadcast(updateIntent);
 
@@ -1115,6 +1132,8 @@ public class TrackingService extends Service implements LocationListener {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String msgContent = parts[2].trim();
+                            
+                            // 【修改】防止自己发自己收，并区分存历史和弹窗
                             String history = getSharedPreferences("device_finder_prefs", MODE_PRIVATE).getString("msg_history", "");
                             if (!history.contains("📤 我发送: " + msgContent)) {
                                 if (ChatActivity.isForeground) {
@@ -1122,7 +1141,8 @@ public class TrackingService extends Service implements LocationListener {
                                     Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                                     sendBroadcast(updateIntent);
                                 } else {
-                                    showFloatingMessage("📥 收到: " + msgContent);
+                                    // 弹窗传纯文本，标识为 true (代表接收到的消息，会存带前缀的历史)
+                                    showFloatingMessage(msgContent, true);
                                 }
                             }
                         }
