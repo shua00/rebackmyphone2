@@ -90,7 +90,10 @@
                 <action android:name="android.provider.Telephony.SMS_RECEIVED" />
             </intent-filter>
         </receiver>
-
+        <!-- 局域网聊天界面 -->
+        <activity
+            android:name=".ChatActivity"
+            android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true">
