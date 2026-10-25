@@ -482,7 +482,7 @@ public class TrackingService extends Service implements LocationListener {
     /**
      * 悬浮窗手势：长按拖动 + 松手记忆 + 短按关闭 + 双击回调
      */
-    private void attachDragAndRemember(WindowManager wm, android.view.View view,
+        private void attachDragAndRemember(WindowManager wm, android.view.View view,
                                        WindowManager.LayoutParams lp, String prefKey,
                                        Runnable onSingleTap, Runnable onDoubleTap) {
         final android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
@@ -493,23 +493,47 @@ public class TrackingService extends Service implements LocationListener {
         final float[] downRaw = new float[2];
         final int[] startPos = new int[2];
         final boolean[] dragging = {false};
+        
+        // 【新增】用于延迟执行单击，并防止双击冲突
+        final Runnable[] pendingSingleTap = new Runnable[1];
+        final Handler gestureHandler = new Handler(Looper.getMainLooper());
 
         android.view.GestureDetector gd = new android.view.GestureDetector(this,
                 new android.view.GestureDetector.SimpleOnGestureListener() {
                     @Override
                     public void onLongPress(android.view.MotionEvent e) {
                         dragging[0] = true;
+                        // 长按拖动时，取消之前的单击延时任务
+                        if (pendingSingleTap[0] != null) {
+                            gestureHandler.removeCallbacks(pendingSingleTap[0]);
+                        }
                     }
 
                     @Override
                     public boolean onSingleTapUp(android.view.MotionEvent e) {
-                        if (!dragging[0] && onSingleTap != null) onSingleTap.run();
+                        if (!dragging[0] && onSingleTap != null) {
+                            // 【修改】不立即执行，延迟 300ms 等待是否有第二次点击
+                            if (pendingSingleTap[0] != null) {
+                                gestureHandler.removeCallbacks(pendingSingleTap[0]);
+                            }
+                            pendingSingleTap[0] = () -> {
+                                if (onSingleTap != null) onSingleTap.run();
+                            };
+                            gestureHandler.postDelayed(pendingSingleTap[0], 300);
+                        }
                         return true;
                     }
 
                     @Override
                     public boolean onDoubleTap(android.view.MotionEvent e) {
-                        if (onDoubleTap != null) onDoubleTap.run();
+                        // 【修改】如果是双击，立刻取消挂起的“单击关闭”任务
+                        if (pendingSingleTap[0] != null) {
+                            gestureHandler.removeCallbacks(pendingSingleTap[0]);
+                            pendingSingleTap[0] = null;
+                        }
+                        if (onDoubleTap != null) {
+                            onDoubleTap.run();
+                        }
                         return true;
                     }
                 });
