@@ -64,6 +64,8 @@ public class ChatActivity extends Activity {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("msg_history", "暂无消息...");
         chatText.setText(history);
+         // 👇 【必须加上这一行】开启长按选择复制
+        chatText.setTextIsSelectable(true);
         // 滚动到底部
         scrollView.post(() -> scrollView.fullScroll(ScrollView.FOCUS_DOWN));
     }
