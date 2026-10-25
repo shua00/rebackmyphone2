@@ -25,6 +25,9 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS history
                  (device_id TEXT, lat REAL, lng REAL, timestamp INTEGER)''')
+    # 【新增】留言记录表
+    c.execute('''CREATE TABLE IF NOT EXISTS messages
+                 (device_id TEXT, msg_time TEXT, message TEXT, timestamp INTEGER)''')
     conn.commit()
     conn.close()
 
@@ -59,19 +62,16 @@ def get_local_ip():
         ip = s.getsockname()[0]; s.close(); return ip
     except: return "127.0.0.1"
 
-# 【核心修改】支持指定 IP 发送
 def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         with print_lock: print(f"\n📡 [控制台] 正在发送指令至 {target_ip}: {command_str}")
         
-        # 【优化】单播只发1次，广播发3次防丢包
         send_times = 3 if target_ip == "255.255.255.255" else 1
         for i in range(send_times):
             sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
-            if send_times > 1:
-                time.sleep(0.2) 
+            if send_times > 1: time.sleep(0.2) 
                 
         sock.close()
         return True
@@ -119,6 +119,32 @@ def handle_client(client_conn, client_addr):
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}".encode('utf-8'))
             except Exception as e: 
                 with print_lock: print(f"解析异常: {e}")
+                
+        # 【新增】接收留言备份
+        elif "POST /api/message" in request:
+            try:
+                body = request.split("\r\n\r\n")[1]
+                data = json.loads(body)
+                if data.get("token") != AUTH_TOKEN:
+                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n"); return
+                
+                dev_id = data.get("device_id", "unknown")
+                msg_time = data.get("time_str", "")
+                msg = data.get("message", "")
+                ts = data.get("timestamp", 0)
+                
+                conn = sqlite3.connect('track_history.db')
+                c = conn.cursor()
+                c.execute("INSERT INTO messages VALUES (?, ?, ?, ?)", (dev_id, msg_time, msg, ts))
+                conn.commit()
+                conn.close()
+
+                with print_lock:
+                    print(f"\n💬 [收到留言备份] 设备: {dev_id} | 时间: {msg_time}")
+                    print(f"内容: {msg}")
+
+                client_conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+            except: pass
 
         elif "POST /api/control" in request:
             try:
@@ -126,7 +152,7 @@ def handle_client(client_conn, client_addr):
                 cmd_data = json.loads(body)
                 action = cmd_data.get("action")
                 payload = cmd_data.get("payload", "")
-                target_ip = cmd_data.get("target_ip", "255.255.255.255") # 接收目标IP
+                target_ip = cmd_data.get("target_ip", "255.255.255.255")
                 
                 success = False
                 if action == "force_report": 
@@ -137,6 +163,8 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "change_server": 
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
+                elif action == "clear_history": 
+                    success = send_udp_broadcast(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", target_ip) # 清空手机本地记录
                 elif action == "clean_offline":
                     now_ts = int(datetime.datetime.now().timestamp() * 1000)
                     to_delete = []
@@ -158,6 +186,18 @@ def handle_client(client_conn, client_addr):
                 conn = sqlite3.connect('track_history.db')
                 c = conn.cursor()
                 c.execute("SELECT lat, lng, timestamp FROM history WHERE device_id=? ORDER BY timestamp DESC LIMIT 50", (dev_id,))
+                rows = c.fetchall()
+                conn.close()
+                resp = json.dumps(rows)
+                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+            except: pass
+
+        # 【新增】获取云端留言备份
+        elif "GET /api/messages" in request:
+            try:
+                conn = sqlite3.connect('track_history.db')
+                c = conn.cursor()
+                c.execute("SELECT device_id, msg_time, message FROM messages ORDER BY timestamp DESC LIMIT 50")
                 rows = c.fetchall()
                 conn.close()
                 resp = json.dumps(rows)
@@ -188,8 +228,10 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
 <h2>📱 终端设备状态同步中心</h2>
 <div class="panel">
     <button onclick="sendCmd('force_report')">全局同步状态</button>
-    <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">全局测试音频提示</button>
-    <button onclick="sendCmd('clean_offline')" style="background:#6c757d;">清理离线数据</button>
+    <button onclick="sendCmd('play_alarm')" style="background:#dc3545;">全局测试音频</button>
+    <button onclick="sendCmd('clean_offline')" style="background:#6c757d;">清理离线设备</button>
+    <button onclick="showServerMessages()" style="background:#6f42c1;">查看云端留言</button>
+    <button onclick="sendCmd('clear_history')" style="background:#ffc107;color:black;">清空手机历史</button>
     <br><br>
     <input type="text" id="msgText" placeholder="输入要群发到所有手机屏幕上的文字...">
     <button onclick="sendScreenMsg('255.255.255.255')" style="background:#28a745;">发送群发提示</button>
@@ -210,7 +252,6 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
                 else:
                     coord = "无定位"
 
-                # 提取 Wi-Fi 名称和 IP
                 ssid = info.get('network', {}).get('wifi_ssid', '?')
                 local_ip = info.get('network', {}).get('local_ip', '0.0.0.0')
                 wifi_info = f"{ssid}<br><span style='font-size:12px;color:#888;'>{local_ip}</span>"
@@ -234,7 +275,6 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
                 html += f"<td>{format_loc_time(info.get('received_at', 0))}</td>"
                 html += f"<td>{ap_list_html}</td>"
                 
-                # 【新增】精确打击按钮，直接将 local_ip 传进去
                 html += f"<td style='min-width:100px;'>"
                 html += f"<button onclick=\"sendCmd('force_report', '', '{local_ip}')\" style=\"background:#007bff;margin-bottom:4px;font-size:12px;width:100%;\">单独同步</button>"
                 html += f"<button onclick=\"sendScreenMsg('{local_ip}')\" style=\"background:#28a745;margin-bottom:4px;font-size:12px;width:100%;\">单独提示</button>"
@@ -278,9 +318,7 @@ async function showTrack(devId) {
     const data = await res.json();
     markersLayer.clearLayers();
     if (polyline) map.removeLayer(polyline);
-
     if (data.length === 0) return alert("暂无该设备的轨迹数据");
-
     var latlngs = [];
     data.reverse().forEach((row, index) => {
         let lat = row[0], lng = row[1];
@@ -291,6 +329,20 @@ async function showTrack(devId) {
         }
     });
     polyline = L.polyline(latlngs, {color: 'blue', weight: 3}).addTo(map);
+}
+
+async function showServerMessages() {
+    try {
+        const res = await fetch('/api/messages');
+        const data = await res.json();
+        if(data.length === 0) return alert("服务器还没有记录哦~");
+        
+        let msgStr = "📜 云端留言备份 (最近50条):\n\n";
+        data.forEach(item => {
+            msgStr += `[${item[1]}] (${item[0]})\n${item[2]}\n\n`;
+        });
+        alert(msgStr);
+    } catch(e) { alert("拉取失败: " + e); }
 }
 </script>
 </body></html>"""
