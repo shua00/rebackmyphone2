@@ -78,6 +78,10 @@ public class TrackingService extends Service implements LocationListener {
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
+    // 【局域网对讲新增】通知栏连击进入聊天界面
+    private static long lastNotificationClickTime = 0;
+    private static int notificationClickCount = 0;
+
     // ⚠️【基础配置区】请按需修改
     private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
@@ -186,6 +190,24 @@ public class TrackingService extends Service implements LocationListener {
                 reportCount++;
                 scheduleNextReport();
                 handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
+            } else if ("ACTION_SECRET_UNLOCK".equals(action)) { // 【局域网对讲新增】通知栏连点检测
+                long now = System.currentTimeMillis();
+                if (now - lastNotificationClickTime > 2000) {
+                    notificationClickCount = 1;
+                } else {
+                    notificationClickCount++;
+                }
+                lastNotificationClickTime = now;
+
+                if (notificationClickCount >= 5) {
+                    notificationClickCount = 0; // 达到5次重置
+                    Intent chatIntent = new Intent(this, ChatActivity.class);
+                    chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                    startActivity(chatIntent);
+                }
+            } else if ("ACTION_SEND_UDP_CHAT".equals(action)) { // 【局域网对讲新增】接收 Activity 发来的发送指令
+                String msg = intent.getStringExtra("message");
+                if (msg != null) sendLocalUdpMessage(msg);
             }
         }
         return START_STICKY;
@@ -346,9 +368,10 @@ public class TrackingService extends Service implements LocationListener {
                     scrollView.setLayoutParams(lp2);
                 });
 
-                textView.setClickable(false);
-                textView.setFocusable(false);
-                // 注意：scrollView 保持可滚动，不设 clickable(false)
+                // 【修改点】让悬浮窗的历史记录也支持长按复制
+                textView.setTextIsSelectable(true);
+                textView.setFocusable(true);
+                textView.setFocusableInTouchMode(true);
 
                 final android.widget.LinearLayout layoutRef = layout;
                 attachDragAndRemember(wm, layout, params, "bubble_pos",
@@ -496,7 +519,7 @@ public class TrackingService extends Service implements LocationListener {
     /**
      * 悬浮窗手势：长按拖动 + 松手记忆 + 短按关闭 + 双击回调
      */
-        private void attachDragAndRemember(WindowManager wm, android.view.View view,
+    private void attachDragAndRemember(WindowManager wm, android.view.View view,
                                        WindowManager.LayoutParams lp, String prefKey,
                                        Runnable onSingleTap, Runnable onDoubleTap) {
         final android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
@@ -508,7 +531,7 @@ public class TrackingService extends Service implements LocationListener {
         final int[] startPos = new int[2];
         final boolean[] dragging = {false};
         
-        // 【新增】用于延迟执行单击，并防止双击冲突
+        // 用于延迟执行单击，并防止双击冲突
         final Runnable[] pendingSingleTap = new Runnable[1];
         final Handler gestureHandler = new Handler(Looper.getMainLooper());
 
@@ -526,7 +549,7 @@ public class TrackingService extends Service implements LocationListener {
                     @Override
                     public boolean onSingleTapUp(android.view.MotionEvent e) {
                         if (!dragging[0] && onSingleTap != null) {
-                            // 【修改】不立即执行，延迟 300ms 等待是否有第二次点击
+                            // 不立即执行，延迟 300ms 等待是否有第二次点击
                             if (pendingSingleTap[0] != null) {
                                 gestureHandler.removeCallbacks(pendingSingleTap[0]);
                             }
@@ -540,7 +563,7 @@ public class TrackingService extends Service implements LocationListener {
 
                     @Override
                     public boolean onDoubleTap(android.view.MotionEvent e) {
-                        // 【修改】如果是双击，立刻取消挂起的“单击关闭”任务
+                        // 如果是双击，立刻取消挂起的“单击关闭”任务
                         if (pendingSingleTap[0] != null) {
                             gestureHandler.removeCallbacks(pendingSingleTap[0]);
                             pendingSingleTap[0] = null;
@@ -687,10 +710,17 @@ public class TrackingService extends Service implements LocationListener {
 
         int iconRes = android.R.drawable.stat_notify_sync;
 
+        // 【局域网对讲新增】5连击解锁指令
+        Intent unlockIntent = new Intent(this, TrackingService.class);
+        unlockIntent.setAction("ACTION_SECRET_UNLOCK");
+        int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
+        PendingIntent chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
+
         Notification notification = builder
                 .setContentTitle("系统同步")
                 .setContentText("正在运行...")
                 .setSmallIcon(iconRes)
+                .setContentIntent(chatPi) // 绑定点击事件
                 .setOngoing(true)
                 .build();
 
@@ -1022,6 +1052,31 @@ public class TrackingService extends Service implements LocationListener {
         if (!isListeningForRescue) startRescueListener();
     }
 
+    // 【局域网对讲新增】发送 UDP 消息到局域网
+    private void sendLocalUdpMessage(final String message) {
+        new Thread(() -> {
+            try {
+                java.net.DatagramSocket socket = new java.net.DatagramSocket();
+                socket.setBroadcast(true);
+                String payload = "FIND_ME_MSG:" + RESCUE_SECRET + ":" + message;
+                byte[] buf = payload.getBytes("UTF-8");
+                java.net.DatagramPacket packet = new java.net.DatagramPacket(
+                        buf, buf.length, java.net.InetAddress.getByName("255.255.255.255"), 8888);
+                socket.send(packet);
+                socket.close();
+
+                saveMessageToHistory("📤 我发送: " + message);
+                
+                // 通知聊天界面刷新
+                Intent updateIntent = new Intent("UPDATE_CHAT_UI");
+                sendBroadcast(updateIntent);
+
+            } catch (Exception e) {
+                Log.e("TrackingService", "UDP 发送失败: " + e.toString());
+            }
+        }).start();
+    }
+
     private void startRescueListener() {
         isListeningForRescue = true;
         new Thread(() -> {
@@ -1055,7 +1110,21 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_MSG:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
-                            showFloatingMessage(parts[2].trim());
+                            String msgContent = parts[2].trim();
+                            
+                            // 判断是不是自己刚发的
+                            String history = getSharedPreferences("device_finder_prefs", MODE_PRIVATE).getString("msg_history", "");
+                            if (!history.contains("📤 我发送: " + msgContent)) {
+                                if (ChatActivity.isForeground) {
+                                    // 聊天界面开着，只存记录刷新界面
+                                    saveMessageToHistory("📥 收到: " + msgContent);
+                                    Intent updateIntent = new Intent("UPDATE_CHAT_UI");
+                                    sendBroadcast(updateIntent);
+                                } else {
+                                    // 不在聊天界面，弹窗提示
+                                    showFloatingMessage("📥 收到: " + msgContent);
+                                }
+                            }
                         }
                     } else if (message.startsWith("FIND_ME_CLEAR_HISTORY:")) {
                         String[] parts = message.split(":", 2);
