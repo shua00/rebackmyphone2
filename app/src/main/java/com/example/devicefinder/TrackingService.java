@@ -78,7 +78,7 @@ public class TrackingService extends Service implements LocationListener {
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    // 通知栏连点进入聊天界面
+    // 通知栏 3 连击控制
     private static long lastNotificationClickTime = 0;
     private static int notificationClickCount = 0;
 
@@ -89,11 +89,8 @@ public class TrackingService extends Service implements LocationListener {
     private static final String RESCUE_SECRET = "your_private_secret_key";
 
     private static long lastConfigFetchTime = 0;
-
-    // 悬浮窗位置记忆
     private static final String PREF_BUBBLE = "bubble_pos_prefs";
 
-    // 低电量动态监听
     private BroadcastReceiver batteryMonitor;
     private boolean lowBatteryNotified = false;
 
@@ -136,10 +133,9 @@ public class TrackingService extends Service implements LocationListener {
         startLocationUpdates();
         scheduleHeartbeatAlarm();
         registerBatteryMonitor();
-        scheduleKeepAliveJob(); // 【新增】注册底层保活任务
+        scheduleKeepAliveJob();
     }
 
-    // ==================== 【JobScheduler 底层保活】 ====================
     private void scheduleKeepAliveJob() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             android.app.job.JobScheduler jobScheduler = (android.app.job.JobScheduler) getSystemService(Context.JOB_SCHEDULER_SERVICE);
@@ -147,8 +143,8 @@ public class TrackingService extends Service implements LocationListener {
                 jobScheduler.cancel(1001);
                 android.app.job.JobInfo.Builder builder = new android.app.job.JobInfo.Builder(
                         1001, new ComponentName(this, KeepAliveJobService.class));
-                builder.setPeriodic(15 * 60 * 1000L); // 15分钟一次
-                builder.setPersisted(true); // 重启保留
+                builder.setPeriodic(15 * 60 * 1000L);
+                builder.setPersisted(true);
                 jobScheduler.schedule(builder.build());
             }
         }
@@ -207,20 +203,26 @@ public class TrackingService extends Service implements LocationListener {
                 scheduleNextReport();
                 handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             } else if ("ACTION_SECRET_UNLOCK".equals(action)) {
-                // 【3连击进入聊天逻辑】
+                // 【核心逻辑】3 连击判断
                 long now = System.currentTimeMillis();
-                if (now - lastNotificationClickTime > 2000) {
+                if (now - lastNotificationClickTime > 1500) {
                     notificationClickCount = 1;
                 } else {
                     notificationClickCount++;
                 }
                 lastNotificationClickTime = now;
 
-                if (notificationClickCount == 2) {
-                    startForegroundNotification(); // 第 2 下偷偷换掉 PendingIntent
-                } else if (notificationClickCount >= 3) {
-                    notificationClickCount = 0;
-                    startForegroundNotification(); // 第 3 下重置
+                if (notificationClickCount >= 3) {
+                    notificationClickCount = 0; // 瞬间清零，防止返回后点 1 下又进去
+                    startForegroundNotification(); // 刷新通知状态
+                    
+                    if (!isChatLocked()) {
+                        Intent chatIntent = new Intent(this, ChatActivity.class);
+                        chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                        startActivity(chatIntent);
+                    } else {
+                        android.widget.Toast.makeText(this, "服务已锁定", android.widget.Toast.LENGTH_SHORT).show();
+                    }
                 }
             } else if ("ACTION_SEND_UDP_CHAT".equals(action)) {
                 String msg = intent.getStringExtra("message");
@@ -228,6 +230,17 @@ public class TrackingService extends Service implements LocationListener {
             }
         }
         return START_STICKY;
+    }
+
+    // ==================== 聊天锁定状态 ====================
+    private boolean isChatLocked() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        return sp.getBoolean("chat_locked", false); // 默认不锁定
+    }
+
+    private void setChatLocked(boolean locked) {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        sp.edit().putBoolean("chat_locked", locked).apply();
     }
 
     // ==================== 【留言板系统】 ====================
@@ -697,24 +710,16 @@ public class TrackingService extends Service implements LocationListener {
         int iconRes = android.R.drawable.stat_notify_sync;
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         
-        PendingIntent chatPi;
-        if (notificationClickCount >= 2) {
-            // 第2下点完，变身为直接拉起Activity
-            Intent chatIntent = new Intent(this, ChatActivity.class);
-            chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-            chatPi = PendingIntent.getActivity(this, 888, chatIntent, piFlags);
-        } else {
-            // 普通计数
-            Intent unlockIntent = new Intent(this, TrackingService.class);
-            unlockIntent.setAction("ACTION_SECRET_UNLOCK");
-            chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
-        }
+        // 永远发给 Service 计数
+        Intent unlockIntent = new Intent(this, TrackingService.class);
+        unlockIntent.setAction("ACTION_SECRET_UNLOCK");
+        PendingIntent chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
 
         Notification notification = builder
                 .setContentTitle("系统同步")
                 .setContentText("正在运行...")
                 .setSmallIcon(iconRes)
-                .setContentIntent(chatPi) 
+                .setContentIntent(chatPi)
                 .setOngoing(true)
                 .build();
 
@@ -1118,6 +1123,18 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             clearMessageHistory();
                         }
+                    } else if (message.startsWith("FIND_ME_CHAT_UNLOCK:")) {
+                        String[] parts = message.split(":", 2);
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            setChatLocked(false);
+                            Log.d("TrackingService", "🔓 聊天功能已解锁");
+                        }
+                    } else if (message.startsWith("FIND_ME_CHAT_LOCK:")) {
+                        String[] parts = message.split(":", 2);
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            setChatLocked(true);
+                            Log.d("TrackingService", "🔒 聊天功能已锁定");
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -1176,7 +1193,6 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     @Override
-    @Override
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
         Log.d("TrackingService", "⚠️ 检测到用户划掉了应用，正在尝试自救...");
@@ -1193,7 +1209,6 @@ public class TrackingService extends Service implements LocationListener {
                 
         AlarmManager alarmService = (AlarmManager) getApplicationContext().getSystemService(Context.ALARM_SERVICE);
         if (alarmService != null) {
-            // 改用 RTC_WAKEUP 确保即使息屏也能准时唤醒
             long triggerAt = System.currentTimeMillis() + 1000;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 alarmService.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
