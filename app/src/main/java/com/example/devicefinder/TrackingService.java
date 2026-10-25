@@ -1188,6 +1188,31 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        super.onTaskRemoved(rootIntent);
+        Log.d("TrackingService", "⚠️ 检测到用户划掉了应用，正在尝试自救...");
+        
+        // 使用 AlarmManager 1 秒后重新拉起服务（绕过系统的后台启动拦截）
+        Intent restartServiceIntent = new Intent(getApplicationContext(), TrackingService.class);
+        restartServiceIntent.setPackage(getPackageName());
+        
+        int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M 
+                ? PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_IMMUTABLE 
+                : PendingIntent.FLAG_ONE_SHOT;
+                
+        PendingIntent restartServicePendingIntent = PendingIntent.getService(
+                getApplicationContext(), 1, restartServiceIntent, flags);
+                
+        AlarmManager alarmService = (AlarmManager) getApplicationContext().getSystemService(Context.ALARM_SERVICE);
+        if (alarmService != null) {
+            // 1秒后触发，使用 ELAPSED_REALTIME 保证在低电量或者待机时也能生效
+            alarmService.set(AlarmManager.ELAPSED_REALTIME, 
+                    android.os.SystemClock.elapsedRealtime() + 1000, 
+                    restartServicePendingIntent);
+        }
+    }
+
     @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
     @Override public void onProviderEnabled(String provider) {}
     @Override public void onProviderDisabled(String provider) {}
