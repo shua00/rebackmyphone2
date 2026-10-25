@@ -360,7 +360,6 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     // 【悬浮消息】宽度 = min(文字自然宽, 85% 屏宽)；短消息贴合文字，长消息折行不穿越
-    // 【悬浮消息】宽度 = min(文字自然宽, 85% 屏宽)；短消息贴合文字，长消息折行不穿越
     private void showFloatingMessage(String message) {
         saveMessageToHistory(message);
         syncMessageToServer(message);
