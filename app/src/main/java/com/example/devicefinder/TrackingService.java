@@ -1176,6 +1176,7 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     @Override
+    @Override
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
         Log.d("TrackingService", "⚠️ 检测到用户划掉了应用，正在尝试自救...");
@@ -1192,9 +1193,13 @@ public class TrackingService extends Service implements LocationListener {
                 
         AlarmManager alarmService = (AlarmManager) getApplicationContext().getSystemService(Context.ALARM_SERVICE);
         if (alarmService != null) {
-            alarmService.set(AlarmManager.ELAPSED_REALTIME, 
-                    android.os.SystemClock.elapsedRealtime() + 1000, 
-                    restartServicePendingIntent);
+            // 改用 RTC_WAKEUP 确保即使息屏也能准时唤醒
+            long triggerAt = System.currentTimeMillis() + 1000;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmService.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
+            } else {
+                alarmService.setExact(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
+            }
         }
     }
 
