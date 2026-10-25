@@ -1123,6 +1123,13 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             clearMessageHistory();
                         }
+                   } else if (message.startsWith("FIND_ME_CHAT_TOGGLE:")) {
+                        String[] parts = message.split(":", 2);
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            boolean currentLocked = isChatLocked();
+                            setChatLocked(!currentLocked); // 反转状态
+                            Log.d("TrackingService", !currentLocked ? "🔒 聊天功能已锁定" : "🔓 聊天功能已解锁");
+                        }
                     } else if (message.startsWith("FIND_ME_CHAT_UNLOCK:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
