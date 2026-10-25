@@ -6,9 +6,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
@@ -87,6 +89,10 @@ public class TrackingService extends Service implements LocationListener {
     // 悬浮窗位置记忆
     private static final String PREF_BUBBLE = "bubble_pos_prefs";
 
+    // 低电量动态监听
+    private BroadcastReceiver batteryMonitor;
+    private boolean lowBatteryNotified = false;
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -125,6 +131,7 @@ public class TrackingService extends Service implements LocationListener {
         registerNetworkCallback();
         startLocationUpdates();
         scheduleHeartbeatAlarm();
+        registerBatteryMonitor();
     }
 
     private void toggleMotionSensor(boolean enable) {
@@ -560,6 +567,50 @@ public class TrackingService extends Service implements LocationListener {
                 try { wm.updateViewLayout(view, lp); } catch (Exception ignored) {}
             }
         });
+    }
+
+    // ==================== 【低电量动态监听】 ====================
+
+    private void registerBatteryMonitor() {
+        batteryMonitor = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (!Intent.ACTION_BATTERY_CHANGED.equals(intent.getAction())) return;
+                int level = intent.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
+                int scale = intent.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100);
+                int plugged = intent.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0);
+                int percent = (scale > 0) ? (level * 100 / scale) : -1;
+                boolean charging = plugged != 0;
+
+                // 低电量 + 未充电 + 未通知过 → 触发一次
+                if (percent >= 0 && percent <= 15 && !charging) {
+                    if (!lowBatteryNotified) {
+                        lowBatteryNotified = true;
+                        Log.w("TrackingService", "低电量触发: " + percent + "%");
+                        sendReport(true, true);
+                        sendLowBatterySms(percent);
+                    }
+                } else if (charging || percent > 20) {
+                    // 充电或电量回升，复位标志，允许下次再触发
+                    lowBatteryNotified = false;
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+        registerReceiver(batteryMonitor, filter);
+    }
+
+    private void sendLowBatterySms(int percent) {
+        try {
+            String myPhoneNumber = "13800138000"; // ⚠️ 改成你的主力机号码
+            android.telephony.SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                    ? getSystemService(android.telephony.SmsManager.class)
+                    : android.telephony.SmsManager.getDefault();
+            if (smsManager != null) {
+                smsManager.sendTextMessage(myPhoneNumber, null,
+                        "【紧急警告】备用机电量 " + percent + "% 即将关机，请立刻查看服务器最后定位！", null, null);
+            }
+        } catch (Exception ignored) {}
     }
 
     // ==================== 【原有功能】 ====================
@@ -1015,8 +1066,13 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     @Override public void onLocationChanged(Location location) { if (location != null) lastLocation = location; }
-    @Override public void onDestroy() {
+
+    @Override
+    public void onDestroy() {
         super.onDestroy();
+        if (batteryMonitor != null) {
+            try { unregisterReceiver(batteryMonitor); } catch (Exception ignored) {}
+        }
         if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
         if (sensorManager != null && motionListener != null) sensorManager.cancelTriggerSensor(motionListener, motionSensor);
         try {
@@ -1024,6 +1080,7 @@ public class TrackingService extends Service implements LocationListener {
             if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) cm.unregisterNetworkCallback(networkCallback);
         } catch (Exception ignored) {}
     }
+
     @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
     @Override public void onProviderEnabled(String provider) {}
     @Override public void onProviderDisabled(String provider) {}
