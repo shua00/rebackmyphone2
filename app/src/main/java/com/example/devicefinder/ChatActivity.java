@@ -57,6 +57,9 @@ public class ChatActivity extends Activity {
                 intent.putExtra("message", msg);
                 startService(intent);
                 inputMsg.setText("");
+                
+                // 【优化】发送后立刻刷新本地界面，不用等广播回来
+                refreshHistory(); 
             }
         });
 
