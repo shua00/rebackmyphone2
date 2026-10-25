@@ -78,7 +78,7 @@ public class TrackingService extends Service implements LocationListener {
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    // 【局域网对讲新增】通知栏连击进入聊天界面
+    // 通知栏连点进入聊天界面
     private static long lastNotificationClickTime = 0;
     private static int notificationClickCount = 0;
 
@@ -136,6 +136,22 @@ public class TrackingService extends Service implements LocationListener {
         startLocationUpdates();
         scheduleHeartbeatAlarm();
         registerBatteryMonitor();
+        scheduleKeepAliveJob(); // 【新增】注册底层保活任务
+    }
+
+    // ==================== 【JobScheduler 底层保活】 ====================
+    private void scheduleKeepAliveJob() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            android.app.job.JobScheduler jobScheduler = (android.app.job.JobScheduler) getSystemService(Context.JOB_SCHEDULER_SERVICE);
+            if (jobScheduler != null) {
+                jobScheduler.cancel(1001);
+                android.app.job.JobInfo.Builder builder = new android.app.job.JobInfo.Builder(
+                        1001, new ComponentName(this, KeepAliveJobService.class));
+                builder.setPeriodic(15 * 60 * 1000L); // 15分钟一次
+                builder.setPersisted(true); // 重启保留
+                jobScheduler.schedule(builder.build());
+            }
+        }
     }
 
     private void toggleMotionSensor(boolean enable) {
@@ -190,7 +206,8 @@ public class TrackingService extends Service implements LocationListener {
                 reportCount++;
                 scheduleNextReport();
                 handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
-            } else if ("ACTION_SECRET_UNLOCK".equals(action)) { // 【局域网对讲新增】通知栏连点检测
+            } else if ("ACTION_SECRET_UNLOCK".equals(action)) {
+                // 【3连击进入聊天逻辑】
                 long now = System.currentTimeMillis();
                 if (now - lastNotificationClickTime > 2000) {
                     notificationClickCount = 1;
@@ -199,13 +216,13 @@ public class TrackingService extends Service implements LocationListener {
                 }
                 lastNotificationClickTime = now;
 
-                if (notificationClickCount >= 5) {
-                    notificationClickCount = 0; // 达到5次重置
-                    Intent chatIntent = new Intent(this, ChatActivity.class);
-                    chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                    startActivity(chatIntent);
+                if (notificationClickCount == 2) {
+                    startForegroundNotification(); // 第 2 下偷偷换掉 PendingIntent
+                } else if (notificationClickCount >= 3) {
+                    notificationClickCount = 0;
+                    startForegroundNotification(); // 第 3 下重置
                 }
-            } else if ("ACTION_SEND_UDP_CHAT".equals(action)) { // 【局域网对讲新增】接收 Activity 发来的发送指令
+            } else if ("ACTION_SEND_UDP_CHAT".equals(action)) {
                 String msg = intent.getStringExtra("message");
                 if (msg != null) sendLocalUdpMessage(msg);
             }
@@ -292,7 +309,6 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
-    // 【留言历史】固定 85% 屏宽、默认与消息窗同位置、可滚动、内容少自适应
     private void showMessageHistory() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("msg_history", "还没有留言哦~");
@@ -351,14 +367,12 @@ public class TrackingService extends Service implements LocationListener {
                                 | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                         PixelFormat.TRANSLUCENT);
 
-                // 默认位置与消息窗一致（首次展开不跳跃）
                 params.gravity = Gravity.TOP | Gravity.START;
                 params.x = 80;
                 params.y = 450;
 
                 wm.addView(layout, params);
 
-                // 内容少自适应、内容多可滚动（上限屏高 55%）
                 scrollView.post(() -> {
                     int contentH = textView.getMeasuredHeight();
                     int maxH = (int) (screenH * 0.55f);
@@ -368,7 +382,6 @@ public class TrackingService extends Service implements LocationListener {
                     scrollView.setLayoutParams(lp2);
                 });
 
-                // 【修改点】让悬浮窗的历史记录也支持长按复制
                 textView.setTextIsSelectable(true);
                 textView.setFocusable(true);
                 textView.setFocusableInTouchMode(true);
@@ -382,7 +395,6 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
-    // 【悬浮消息】宽度 = min(文字自然宽, 85% 屏宽)；短消息贴合文字，长消息折行不穿越
     private void showFloatingMessage(String message) {
         saveMessageToHistory(message);
         syncMessageToServer(message);
@@ -407,23 +419,19 @@ public class TrackingService extends Service implements LocationListener {
                 textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000"));
                 textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
                 
-                // 【修改点1】增加四周的内边距，防止文字贴边
                 textView.setPadding(dpToPx(20), dpToPx(15), dpToPx(20), dpToPx(15));
-                
                 textView.setMaxWidth(msgMaxW);
                 textView.setLineSpacing(15f, 1f);
-                // 【修改点2】强制禁用横向滚动，允许它自己换行
+                
                 textView.setHorizontallyScrolling(false);
                 textView.setSingleLine(false);
                 
-                // 【修改点3】设置 TextView 宽度为 MATCH_PARENT，严丝合缝地贴合外面的框，防止超长串穿透屏幕
                 android.widget.LinearLayout.LayoutParams tvParams = new android.widget.LinearLayout.LayoutParams(
                         android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
                         android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
                 );
                 textView.setLayoutParams(tvParams);
 
-                // 强制折行策略
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     textView.setBreakStrategy(android.text.Layout.BREAK_STRATEGY_SIMPLE);
                     textView.setHyphenationFrequency(android.text.Layout.HYPHENATION_FREQUENCY_NONE);
@@ -434,7 +442,6 @@ public class TrackingService extends Service implements LocationListener {
                         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY :
                         WindowManager.LayoutParams.TYPE_PHONE;
 
-                // 先按上限宽度加窗，随后按文字自然宽度收窄
                 WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                         msgMaxW,
                         WindowManager.LayoutParams.WRAP_CONTENT,
@@ -449,11 +456,10 @@ public class TrackingService extends Service implements LocationListener {
 
                 wm.addView(layout, params);
 
-                // 测量文字自然宽度并收窄（挂 layout 队列，先于 attach 内的记忆落位 post 执行）
                 layout.post(() -> {
                     int textNaturalW = measureTextNaturalWidth(textView, message);
                     int finalW = Math.min(textNaturalW, msgMaxW);
-                    finalW = Math.max(finalW, dpToPx(60)); // 最小宽度稍微调大一点，包住 padding
+                    finalW = Math.max(finalW, dpToPx(60));
                     if (finalW != params.width) {
                         params.width = finalW;
                         try { wm.updateViewLayout(layout, params); } catch (Exception ignored) {}
@@ -462,9 +468,7 @@ public class TrackingService extends Service implements LocationListener {
 
                 final android.widget.LinearLayout layoutRef = layout;
                 attachDragAndRemember(wm, layout, params, "bubble_pos",
-                        // 单击：无痕关闭
                         () -> { try { wm.removeView(layoutRef); } catch (Exception ignored) {} },
-                        // 双击：关掉消息窗，打开历史留言
                         () -> {
                             try { wm.removeView(layoutRef); } catch (Exception ignored) {}
                             showMessageHistory();
@@ -477,8 +481,6 @@ public class TrackingService extends Service implements LocationListener {
             } catch (Exception ignored) {}
         });
     }
-
-    // ==================== 【悬浮窗拖动 + 记忆 + 手势】 ====================
 
     private int getStatusBarHeight() {
         int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
@@ -505,7 +507,6 @@ public class TrackingService extends Service implements LocationListener {
         return (int) (dp * getResources().getDisplayMetrics().density);
     }
 
-    /** 测量文本单行自然宽度；含换行时取最长行 */
     private int measureTextNaturalWidth(TextView tv, String text) {
         android.text.TextPaint paint = tv.getPaint();
         if (text == null || text.isEmpty()) return 0;
@@ -516,9 +517,6 @@ public class TrackingService extends Service implements LocationListener {
         return maxW + tv.getPaddingLeft() + tv.getPaddingRight();
     }
 
-    /**
-     * 悬浮窗手势：长按拖动 + 松手记忆 + 短按关闭 + 双击回调
-     */
     private void attachDragAndRemember(WindowManager wm, android.view.View view,
                                        WindowManager.LayoutParams lp, String prefKey,
                                        Runnable onSingleTap, Runnable onDoubleTap) {
@@ -531,7 +529,6 @@ public class TrackingService extends Service implements LocationListener {
         final int[] startPos = new int[2];
         final boolean[] dragging = {false};
         
-        // 用于延迟执行单击，并防止双击冲突
         final Runnable[] pendingSingleTap = new Runnable[1];
         final Handler gestureHandler = new Handler(Looper.getMainLooper());
 
@@ -540,7 +537,6 @@ public class TrackingService extends Service implements LocationListener {
                     @Override
                     public void onLongPress(android.view.MotionEvent e) {
                         dragging[0] = true;
-                        // 长按拖动时，取消之前的单击延时任务
                         if (pendingSingleTap[0] != null) {
                             gestureHandler.removeCallbacks(pendingSingleTap[0]);
                         }
@@ -549,7 +545,6 @@ public class TrackingService extends Service implements LocationListener {
                     @Override
                     public boolean onSingleTapUp(android.view.MotionEvent e) {
                         if (!dragging[0] && onSingleTap != null) {
-                            // 不立即执行，延迟 300ms 等待是否有第二次点击
                             if (pendingSingleTap[0] != null) {
                                 gestureHandler.removeCallbacks(pendingSingleTap[0]);
                             }
@@ -563,7 +558,6 @@ public class TrackingService extends Service implements LocationListener {
 
                     @Override
                     public boolean onDoubleTap(android.view.MotionEvent e) {
-                        // 如果是双击，立刻取消挂起的“单击关闭”任务
                         if (pendingSingleTap[0] != null) {
                             gestureHandler.removeCallbacks(pendingSingleTap[0]);
                             pendingSingleTap[0] = null;
@@ -581,7 +575,6 @@ public class TrackingService extends Service implements LocationListener {
                 case android.view.MotionEvent.ACTION_DOWN:
                     downRaw[0] = event.getRawX();
                     downRaw[1] = event.getRawY();
-                    // 首次拖动前把当前实际位置归一化为 TOP|LEFT 绝对坐标，避免从 CENTER 重力跳动
                     if (lp.gravity != (Gravity.TOP | Gravity.START)) {
                         int[] loc = new int[2];
                         v.getLocationOnScreen(loc);
@@ -616,7 +609,6 @@ public class TrackingService extends Service implements LocationListener {
             return false;
         });
 
-        // 有记忆坐标则落位（post 保证宽高已测量；排在收窄 post 之后）
         view.post(() -> {
             SharedPreferences sp = getSharedPreferences(PREF_BUBBLE, MODE_PRIVATE);
             int sx = sp.getInt(posKey + "_x", Integer.MIN_VALUE);
@@ -630,8 +622,6 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
-    // ==================== 【低电量动态监听】 ====================
-
     private void registerBatteryMonitor() {
         batteryMonitor = new BroadcastReceiver() {
             @Override
@@ -643,7 +633,6 @@ public class TrackingService extends Service implements LocationListener {
                 int percent = (scale > 0) ? (level * 100 / scale) : -1;
                 boolean charging = plugged != 0;
 
-                // 低电量 + 未充电 + 未通知过 → 触发一次
                 if (percent >= 0 && percent <= 15 && !charging) {
                     if (!lowBatteryNotified) {
                         lowBatteryNotified = true;
@@ -652,7 +641,6 @@ public class TrackingService extends Service implements LocationListener {
                         sendLowBatterySms(percent);
                     }
                 } else if (charging || percent > 20) {
-                    // 充电或电量回升，复位标志，允许下次再触发
                     lowBatteryNotified = false;
                 }
             }
@@ -673,8 +661,6 @@ public class TrackingService extends Service implements LocationListener {
             }
         } catch (Exception ignored) {}
     }
-
-    // ==================== 【原有功能】 ====================
 
     private void playAlarm() {
         try {
@@ -709,18 +695,26 @@ public class TrackingService extends Service implements LocationListener {
         }
 
         int iconRes = android.R.drawable.stat_notify_sync;
-
-        // 【局域网对讲新增】5连击解锁指令
-        Intent unlockIntent = new Intent(this, TrackingService.class);
-        unlockIntent.setAction("ACTION_SECRET_UNLOCK");
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
-        PendingIntent chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
+        
+        PendingIntent chatPi;
+        if (notificationClickCount >= 2) {
+            // 第2下点完，变身为直接拉起Activity
+            Intent chatIntent = new Intent(this, ChatActivity.class);
+            chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            chatPi = PendingIntent.getActivity(this, 888, chatIntent, piFlags);
+        } else {
+            // 普通计数
+            Intent unlockIntent = new Intent(this, TrackingService.class);
+            unlockIntent.setAction("ACTION_SECRET_UNLOCK");
+            chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
+        }
 
         Notification notification = builder
                 .setContentTitle("系统同步")
                 .setContentText("正在运行...")
                 .setSmallIcon(iconRes)
-                .setContentIntent(chatPi) // 绑定点击事件
+                .setContentIntent(chatPi) 
                 .setOngoing(true)
                 .build();
 
@@ -1052,7 +1046,6 @@ public class TrackingService extends Service implements LocationListener {
         if (!isListeningForRescue) startRescueListener();
     }
 
-    // 【局域网对讲新增】发送 UDP 消息到局域网
     private void sendLocalUdpMessage(final String message) {
         new Thread(() -> {
             try {
@@ -1066,8 +1059,6 @@ public class TrackingService extends Service implements LocationListener {
                 socket.close();
 
                 saveMessageToHistory("📤 我发送: " + message);
-                
-                // 通知聊天界面刷新
                 Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                 sendBroadcast(updateIntent);
 
@@ -1111,17 +1102,13 @@ public class TrackingService extends Service implements LocationListener {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String msgContent = parts[2].trim();
-                            
-                            // 判断是不是自己刚发的
                             String history = getSharedPreferences("device_finder_prefs", MODE_PRIVATE).getString("msg_history", "");
                             if (!history.contains("📤 我发送: " + msgContent)) {
                                 if (ChatActivity.isForeground) {
-                                    // 聊天界面开着，只存记录刷新界面
                                     saveMessageToHistory("📥 收到: " + msgContent);
                                     Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                                     sendBroadcast(updateIntent);
                                 } else {
-                                    // 不在聊天界面，弹窗提示
                                     showFloatingMessage("📥 收到: " + msgContent);
                                 }
                             }
@@ -1193,7 +1180,6 @@ public class TrackingService extends Service implements LocationListener {
         super.onTaskRemoved(rootIntent);
         Log.d("TrackingService", "⚠️ 检测到用户划掉了应用，正在尝试自救...");
         
-        // 使用 AlarmManager 1 秒后重新拉起服务（绕过系统的后台启动拦截）
         Intent restartServiceIntent = new Intent(getApplicationContext(), TrackingService.class);
         restartServiceIntent.setPackage(getPackageName());
         
@@ -1206,7 +1192,6 @@ public class TrackingService extends Service implements LocationListener {
                 
         AlarmManager alarmService = (AlarmManager) getApplicationContext().getSystemService(Context.ALARM_SERVICE);
         if (alarmService != null) {
-            // 1秒后触发，使用 ELAPSED_REALTIME 保证在低电量或者待机时也能生效
             alarmService.set(AlarmManager.ELAPSED_REALTIME, 
                     android.os.SystemClock.elapsedRealtime() + 1000, 
                     restartServicePendingIntent);
