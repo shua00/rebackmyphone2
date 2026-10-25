@@ -94,7 +94,7 @@
         <!-- 局域网聊天界面 -->
         <activity
             android:name=".ChatActivity"
-            android:exported="ture" />
+            android:exported="true" />
         <activity
             android:name=".MainActivity"
             android:exported="true">
