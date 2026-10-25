@@ -12,7 +12,6 @@ def send_udp(command_str, target_ip="255.255.255.255"):
     
     print(f"\n📡 发送指令至 {target_ip}: {command_str}")
     
-    # 【优化】判断发送次数
     send_times = 3 if target_ip == "255.255.255.255" else 1
     
     for i in range(send_times):
@@ -37,17 +36,23 @@ def main():
         print("4. 更换手机的配置中心地址")
         print("5. 🔊 强制手机播放警报音 (响铃)")
         print("6. 💬 在手机屏幕显示悬浮文字")
+        print("7. 🔐 切换聊天入口开关 (锁定/解锁)")
+        print("8. 🧹 清空手机本地历史留言")
         print("0. 退出")
         print("="*45)
         
-        choice = input("请输入选项 (0-6): ").strip()
+        choice = input("请输入选项 (0-8): ").strip()
         
-        # 只要不是退出，就询问目标 IP
-        target_ip = "255.255.255.255"
-        if choice in ['1', '2', '3', '4', '5', '6']:
-            ip_input = input("🎯 请输入目标手机 IP (直接回车=全局广播): ").strip()
-            if ip_input:
-                target_ip = ip_input
+        if choice == '0':
+            print("👋 退出。")
+            break
+            
+        if choice not in ['1', '2', '3', '4', '5', '6', '7', '8']:
+            print("❌ 无效选项，请重新输入。\n")
+            continue
+
+        ip_input = input("🎯 目标手机 IP (回车直接发全局广播): ").strip()
+        target_ip = ip_input if ip_input else "255.255.255.255"
         
         if choice == '1':
             send_udp(f"FIND_ME_REPORT:{RESCUE_SECRET}", target_ip)
@@ -75,12 +80,12 @@ def main():
             msg_text = input("请输入要显示在手机屏幕上的文字: ").strip()
             if msg_text:
                 send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:{msg_text}", target_ip)
+                
+        elif choice == '7':
+            send_udp(f"FIND_ME_CHAT_TOGGLE:{RESCUE_SECRET}", target_ip)
             
-        elif choice == '0':
-            print("👋 退出。")
-            break
-        else:
-            print("❌ 无效选项，请重新输入。\n")
+        elif choice == '8':
+            send_udp(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", target_ip)
 
 if __name__ == "__main__":
     try:
