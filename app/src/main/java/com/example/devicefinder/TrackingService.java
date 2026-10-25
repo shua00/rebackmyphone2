@@ -447,8 +447,9 @@ public class TrackingService extends Service implements LocationListener {
                 TextView textView = new TextView(this);
                 // 2. 悬浮窗展示：纯净纯文本，不带前缀
                 textView.setText(message);
-                textView.setTextSize(26f);
-                textView.setTypeface(null, android.graphics.Typeface.BOLD);
+                // 把 26f 改成 18f 或者 20f，看起来会更像壁纸上的格言
+                textView.setTextSize(20f); 
+                textView.setTypeface(null, android.graphics.Typeface.NORMAL); // 把 BOLD 改成 NORMAL，去掉粗体
                 textView.setTextColor(Color.WHITE);
                 textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000"));
                 textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
