@@ -60,7 +60,7 @@ public class TrackingService extends Service implements LocationListener {
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private PendingIntent alarmPendingIntent;
-    
+
     private SensorManager sensorManager;
     private Sensor motionSensor;
 
@@ -68,7 +68,7 @@ public class TrackingService extends Service implements LocationListener {
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
     private int reportCount = 0;
-    
+
     private boolean enableWifiLock = true;
     private boolean enableMotionTrigger = true;
 
@@ -81,8 +81,11 @@ public class TrackingService extends Service implements LocationListener {
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
     private static final String RESCUE_SECRET = "your_private_secret_key";
-    
+
     private static long lastConfigFetchTime = 0;
+
+    // 悬浮窗位置记忆
+    private static final String PREF_BUBBLE = "bubble_pos_prefs";
 
     @Override
     public void onCreate() {
@@ -103,7 +106,7 @@ public class TrackingService extends Service implements LocationListener {
         }
 
         alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        
+
         Intent reportIntent = new Intent(this, TrackingService.class);
         reportIntent.setAction("ACTION_ALARM_TRIGGER");
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
@@ -115,8 +118,8 @@ public class TrackingService extends Service implements LocationListener {
         }
 
         handleIconVisibility(true);
-        triggerRescueListener(); 
-        toggleMotionSensor(true); 
+        triggerRescueListener();
+        toggleMotionSensor(true);
 
         requestSingleLocationAndReport();
         registerNetworkCallback();
@@ -138,7 +141,7 @@ public class TrackingService extends Service implements LocationListener {
         public void onTrigger(TriggerEvent event) {
             Log.d("TrackingService", "检测到手机移动，强制唤醒上报！");
             sendReport(true, true);
-            toggleMotionSensor(true); 
+            toggleMotionSensor(true);
         }
     };
 
@@ -186,10 +189,10 @@ public class TrackingService extends Service implements LocationListener {
     private void saveMessageToHistory(String message) {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("msg_history", "");
-        
+
         String timeStr = new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()).format(new java.util.Date());
         String newRecord = timeStr + " | " + message;
-        
+
         String updatedHistory = newRecord + "\n" + history;
         String[] lines = updatedHistory.split("\n");
         if (lines.length > 50) {
@@ -215,14 +218,14 @@ public class TrackingService extends Service implements LocationListener {
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json");
-                conn.setConnectTimeout(5000); 
+                conn.setConnectTimeout(5000);
                 conn.setDoOutput(true);
-                
+
                 OutputStream os = conn.getOutputStream();
-                os.write(json.toString().getBytes("UTF-8")); 
-                os.flush(); 
+                os.write(json.toString().getBytes("UTF-8"));
+                os.flush();
                 os.close();
-                conn.getResponseCode(); 
+                conn.getResponseCode();
                 conn.disconnect();
             } catch (Exception ignored) {}
         }).start();
@@ -231,7 +234,7 @@ public class TrackingService extends Service implements LocationListener {
     private void clearMessageHistory() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         sp.edit().putString("msg_history", "").apply();
-        
+
         handler.post(() -> {
             try {
                 WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
@@ -239,20 +242,20 @@ public class TrackingService extends Service implements LocationListener {
                 textView.setText("🧹 历史留言已清空");
                 textView.setTextSize(20f);
                 textView.setTextColor(Color.WHITE);
-                textView.setBackgroundColor(Color.parseColor("#CC000000")); 
+                textView.setBackgroundColor(Color.parseColor("#CC000000"));
                 textView.setPadding(40, 40, 40, 40);
-                
-                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? 
+
+                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ?
                         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
 
                 WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                         WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, type,
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, 
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                         PixelFormat.TRANSLUCENT
                 );
                 params.gravity = Gravity.CENTER;
                 wm.addView(textView, params);
-                
+
                 handler.postDelayed(() -> {
                     try { wm.removeView(textView); } catch (Exception ignored) {}
                 }, 3000);
@@ -260,8 +263,7 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
-    // 【核心更新】居左对齐、点击任意处关闭的留言板
-        // 【无痕居左版留言板 - 高度自适应】
+    // 【留言历史】固定 85% 屏宽、默认与消息窗同位置、可滚动、内容少自适应
     private void showMessageHistory() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("msg_history", "还没有留言哦~");
@@ -269,90 +271,99 @@ public class TrackingService extends Service implements LocationListener {
         handler.post(() -> {
             try {
                 WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
-                
-                // 外层容器
+                if (wm == null) return;
+                android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+                int screenW = dm.widthPixels, screenH = dm.heightPixels;
+
                 android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
                 layout.setOrientation(android.widget.LinearLayout.VERTICAL);
-                
+
                 android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
-                shape.setColor(Color.parseColor("#F2FFFFFF")); 
+                shape.setColor(Color.parseColor("#F2FFFFFF"));
                 shape.setCornerRadius(50);
                 layout.setBackground(shape);
                 layout.setPadding(60, 60, 60, 60);
 
-                // 标题
                 TextView titleView = new TextView(this);
                 titleView.setText("📜 家庭留言板");
                 titleView.setTextSize(22f);
                 titleView.setTextColor(Color.parseColor("#333333"));
                 titleView.setTypeface(null, android.graphics.Typeface.BOLD);
-                titleView.setGravity(Gravity.START); 
-                
+                titleView.setGravity(Gravity.START);
+
                 android.widget.LinearLayout.LayoutParams titleParams = new android.widget.LinearLayout.LayoutParams(
-                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
                 titleParams.bottomMargin = 30;
                 titleView.setLayoutParams(titleParams);
                 layout.addView(titleView);
 
-                // 留言列表区域
                 ScrollView scrollView = new ScrollView(this);
                 TextView textView = new TextView(this);
                 textView.setText(history);
                 textView.setTextSize(18f);
                 textView.setTextColor(Color.parseColor("#555555"));
                 textView.setLineSpacing(20f, 1f);
-                textView.setGravity(Gravity.START); 
+                textView.setGravity(Gravity.START);
                 scrollView.addView(textView);
-                
-                // 设置最大高度，防止内容太多撑爆屏幕，内容少时自适应
-                android.widget.LinearLayout.LayoutParams scrollParams = new android.widget.LinearLayout.LayoutParams(
-                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
-                scrollParams.height = 600; // 高度上限为600，超过则滚动
-                scrollView.setLayoutParams(scrollParams);
-                
                 layout.addView(scrollView);
 
-                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? 
-                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
+                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ?
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY :
+                        WindowManager.LayoutParams.TYPE_PHONE;
+
+                int bubbleW = (int) (screenW * 0.85f);
 
                 WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                        bubbleW,
                         WindowManager.LayoutParams.WRAP_CONTENT,
-                        WindowManager.LayoutParams.WRAP_CONTENT, // 高度自适应内容
                         type,
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                        PixelFormat.TRANSLUCENT
-                );
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                        PixelFormat.TRANSLUCENT);
 
-                // 【关键修改】靠屏幕左侧居中
-                params.gravity = Gravity.CENTER_VERTICAL | Gravity.START; 
-                params.x = 60; // 距离屏幕左侧 60 像素
-                params.width = 800; // 宽度固定
+                // 默认位置与消息窗一致（首次展开不跳跃）
+                params.gravity = Gravity.TOP | Gravity.START;
+                params.x = 80;
+                params.y = 450;
 
                 wm.addView(layout, params);
 
-                // 无痕关闭
+                // 内容少自适应、内容多可滚动（上限屏高 55%）
+                scrollView.post(() -> {
+                    int contentH = textView.getMeasuredHeight();
+                    int maxH = (int) (screenH * 0.55f);
+                    int finalH = Math.min(contentH + 20, maxH);
+                    android.view.ViewGroup.LayoutParams lp2 = scrollView.getLayoutParams();
+                    lp2.height = finalH;
+                    scrollView.setLayoutParams(lp2);
+                });
+
                 textView.setClickable(false);
                 textView.setFocusable(false);
-                scrollView.setClickable(false);
-                scrollView.setFocusable(false);
-                layout.setOnClickListener(v -> {
-                    try { wm.removeView(layout); } catch (Exception ignored) {}
-                });
+                // 注意：scrollView 保持可滚动，不设 clickable(false)
+
+                final android.widget.LinearLayout layoutRef = layout;
+                attachDragAndRemember(wm, layout, params, "bubble_pos",
+                        () -> { try { wm.removeView(layoutRef); } catch (Exception ignored) {} },
+                        null);
 
             } catch (Exception ignored) {}
         });
     }
 
-    // 【核心更新】居左对齐、无痕消息
-        // 【无痕居左版悬浮窗】
+    // 【悬浮消息】宽度 = min(文字自然宽, 85% 屏宽)；短消息贴合文字，长消息折行不穿越
     private void showFloatingMessage(String message) {
-        saveMessageToHistory(message); 
+        saveMessageToHistory(message);
         syncMessageToServer(message);
 
         handler.post(() -> {
             try {
                 WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
                 if (wm == null) return;
+                android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+                int screenW = dm.widthPixels;
+                final int msgMaxW = (int) (screenW * 0.85f);
 
                 android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
                 layout.setOrientation(android.widget.LinearLayout.VERTICAL);
@@ -363,47 +374,191 @@ public class TrackingService extends Service implements LocationListener {
                 textView.setTextSize(26f);
                 textView.setTypeface(null, android.graphics.Typeface.BOLD);
                 textView.setTextColor(Color.WHITE);
-                textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000")); 
-                textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); 
-                textView.setPadding(0, 20, 0, 20); // 左右 padding 去掉，靠重力控制
-                textView.setMaxWidth(800); 
+                textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000"));
+                textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+                textView.setPadding(0, 20, 0, 20);
+                textView.setMaxWidth(msgMaxW);
                 textView.setLineSpacing(15f, 1f);
-
+                // 强制折行，防无空格长串横向穿越
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    textView.setBreakStrategy(android.text.Layout.BREAK_STRATEGY_SIMPLE);
+                    textView.setHyphenationFrequency(android.text.Layout.HYPHENATION_FREQUENCY_NONE);
+                }
                 layout.addView(textView);
 
-                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? 
-                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
+                int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ?
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY :
+                        WindowManager.LayoutParams.TYPE_PHONE;
 
+                // 先按上限宽度加窗，随后按文字自然宽度收窄
                 WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                        WindowManager.LayoutParams.WRAP_CONTENT, 
-                        WindowManager.LayoutParams.WRAP_CONTENT, 
+                        msgMaxW,
+                        WindowManager.LayoutParams.WRAP_CONTENT,
                         type,
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, 
-                        PixelFormat.TRANSLUCENT
-                );
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                        PixelFormat.TRANSLUCENT);
 
-                // 【关键修改】顶部靠左对齐
-                params.gravity = Gravity.TOP | Gravity.START; 
-                params.x = 80; // 距离屏幕左侧边缘 80 像素
-                params.y = 450; // 距离屏幕顶部 450 像素
+                params.gravity = Gravity.TOP | Gravity.START;
+                params.x = 80;
+                params.y = 450;
 
                 wm.addView(layout, params);
 
-                layout.setOnClickListener(v -> {
-                    try { wm.removeView(layout); } catch (Exception ignored) {}
+                // 测量文字自然宽度并收窄（挂 layout 队列，先于 attach 内的记忆落位 post 执行）
+                layout.post(() -> {
+                    int textNaturalW = measureTextNaturalWidth(textView, message);
+                    int finalW = Math.min(textNaturalW, msgMaxW);
+                    finalW = Math.max(finalW, dpToPx(48));
+                    if (finalW != params.width) {
+                        params.width = finalW;
+                        try { wm.updateViewLayout(layout, params); } catch (Exception ignored) {}
+                    }
                 });
 
-                layout.setOnLongClickListener(v -> {
-                    try { wm.removeView(layout); } catch (Exception ignored) {} 
-                    showMessageHistory(); 
-                    return true;
-                });
+                final android.widget.LinearLayout layoutRef = layout;
+                attachDragAndRemember(wm, layout, params, "bubble_pos",
+                        // 单击：无痕关闭
+                        () -> { try { wm.removeView(layoutRef); } catch (Exception ignored) {} },
+                        // 双击：关掉消息窗，打开历史留言
+                        () -> {
+                            try { wm.removeView(layoutRef); } catch (Exception ignored) {}
+                            showMessageHistory();
+                        });
 
                 handler.postDelayed(() -> {
-                    try { wm.removeView(layout); } catch (Exception ignored) {}
+                    try { wm.removeView(layoutRef); } catch (Exception ignored) {}
                 }, 24 * 60 * 60 * 1000L);
 
             } catch (Exception ignored) {}
+        });
+    }
+
+    // ==================== 【悬浮窗拖动 + 记忆 + 手势】 ====================
+
+    private int getStatusBarHeight() {
+        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : 0;
+    }
+
+    private int getNavBarHeight() {
+        int id = getResources().getIdentifier("navigation_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : 0;
+    }
+
+    private int clampX(int x, int viewW, int screenW) {
+        return Math.max(0, Math.min(x, screenW - viewW));
+    }
+
+    private int clampY(int y, int viewH, int screenH, int statusH, int navH) {
+        int minY = statusH;
+        int maxY = screenH - navH - viewH;
+        if (maxY < minY) maxY = minY;
+        return Math.max(minY, Math.min(y, maxY));
+    }
+
+    private int dpToPx(int dp) {
+        return (int) (dp * getResources().getDisplayMetrics().density);
+    }
+
+    /** 测量文本单行自然宽度；含换行时取最长行 */
+    private int measureTextNaturalWidth(TextView tv, String text) {
+        android.text.TextPaint paint = tv.getPaint();
+        if (text == null || text.isEmpty()) return 0;
+        int maxW = 0;
+        for (String line : text.split("\n")) {
+            maxW = Math.max(maxW, (int) Math.ceil(paint.measureText(line)));
+        }
+        return maxW + tv.getPaddingLeft() + tv.getPaddingRight();
+    }
+
+    /**
+     * 悬浮窗手势：长按拖动 + 松手记忆 + 短按关闭 + 双击回调
+     */
+    private void attachDragAndRemember(WindowManager wm, android.view.View view,
+                                       WindowManager.LayoutParams lp, String prefKey,
+                                       Runnable onSingleTap, Runnable onDoubleTap) {
+        final android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        final int screenW = dm.widthPixels, screenH = dm.heightPixels;
+        final int statusH = getStatusBarHeight(), navH = getNavBarHeight();
+        final String posKey = prefKey + "_" + screenW + "x" + screenH;
+
+        final float[] downRaw = new float[2];
+        final int[] startPos = new int[2];
+        final boolean[] dragging = {false};
+
+        android.view.GestureDetector gd = new android.view.GestureDetector(this,
+                new android.view.GestureDetector.SimpleOnGestureListener() {
+                    @Override
+                    public void onLongPress(android.view.MotionEvent e) {
+                        dragging[0] = true;
+                    }
+
+                    @Override
+                    public boolean onSingleTapUp(android.view.MotionEvent e) {
+                        if (!dragging[0] && onSingleTap != null) onSingleTap.run();
+                        return true;
+                    }
+
+                    @Override
+                    public boolean onDoubleTap(android.view.MotionEvent e) {
+                        if (onDoubleTap != null) onDoubleTap.run();
+                        return true;
+                    }
+                });
+
+        view.setOnTouchListener((v, event) -> {
+            gd.onTouchEvent(event);
+            switch (event.getActionMasked()) {
+                case android.view.MotionEvent.ACTION_DOWN:
+                    downRaw[0] = event.getRawX();
+                    downRaw[1] = event.getRawY();
+                    // 首次拖动前把当前实际位置归一化为 TOP|LEFT 绝对坐标，避免从 CENTER 重力跳动
+                    if (lp.gravity != (Gravity.TOP | Gravity.START)) {
+                        int[] loc = new int[2];
+                        v.getLocationOnScreen(loc);
+                        lp.gravity = Gravity.TOP | Gravity.START;
+                        lp.x = loc[0];
+                        lp.y = loc[1];
+                        try { wm.updateViewLayout(v, lp); } catch (Exception ignored) {}
+                    }
+                    startPos[0] = lp.x;
+                    startPos[1] = lp.y;
+                    return true;
+                case android.view.MotionEvent.ACTION_MOVE:
+                    if (dragging[0]) {
+                        int nx = startPos[0] + (int) (event.getRawX() - downRaw[0]);
+                        int ny = startPos[1] + (int) (event.getRawY() - downRaw[1]);
+                        lp.x = clampX(nx, v.getWidth(), screenW);
+                        lp.y = clampY(ny, v.getHeight(), screenH, statusH, navH);
+                        try { wm.updateViewLayout(v, lp); } catch (Exception ignored) {}
+                    }
+                    return true;
+                case android.view.MotionEvent.ACTION_UP:
+                case android.view.MotionEvent.ACTION_CANCEL:
+                    if (dragging[0]) {
+                        dragging[0] = false;
+                        getSharedPreferences(PREF_BUBBLE, MODE_PRIVATE).edit()
+                                .putInt(posKey + "_x", lp.x)
+                                .putInt(posKey + "_y", lp.y)
+                                .apply();
+                    }
+                    return true;
+            }
+            return false;
+        });
+
+        // 有记忆坐标则落位（post 保证宽高已测量；排在收窄 post 之后）
+        view.post(() -> {
+            SharedPreferences sp = getSharedPreferences(PREF_BUBBLE, MODE_PRIVATE);
+            int sx = sp.getInt(posKey + "_x", Integer.MIN_VALUE);
+            int sy = sp.getInt(posKey + "_y", Integer.MIN_VALUE);
+            if (sx != Integer.MIN_VALUE && sy != Integer.MIN_VALUE) {
+                lp.gravity = Gravity.TOP | Gravity.START;
+                lp.x = clampX(sx, view.getWidth(), screenW);
+                lp.y = clampY(sy, view.getHeight(), screenH, statusH, navH);
+                try { wm.updateViewLayout(view, lp); } catch (Exception ignored) {}
+            }
         });
     }
 
@@ -441,7 +596,7 @@ public class TrackingService extends Service implements LocationListener {
             builder.setPriority(Notification.PRIORITY_MIN);
         }
 
-        int iconRes = android.R.drawable.stat_notify_sync; 
+        int iconRes = android.R.drawable.stat_notify_sync;
 
         Notification notification = builder
                 .setContentTitle("系统同步")
@@ -512,7 +667,7 @@ public class TrackingService extends Service implements LocationListener {
     private void handleUpdateConfigUrl(String newConfigUrl) {
         if (newConfigUrl != null && !newConfigUrl.isEmpty()) {
             saveRemoteConfigUrl(newConfigUrl);
-            lastConfigFetchTime = 0; 
+            lastConfigFetchTime = 0;
             fetchRemoteConfig();
         }
     }
@@ -630,7 +785,7 @@ public class TrackingService extends Service implements LocationListener {
 
     private void sendReport(final boolean withNearbyWifi, boolean force, final String overrideUrl) {
         long currentTime = System.currentTimeMillis();
-        if (!force && currentTime - lastReportTime < 5000) return; 
+        if (!force && currentTime - lastReportTime < 5000) return;
         lastReportTime = currentTime;
 
         final String activeUrl = (overrideUrl != null && !overrideUrl.isEmpty()) ? overrideUrl : getCurrentServerUrl();
@@ -656,8 +811,8 @@ public class TrackingService extends Service implements LocationListener {
                 json.put("device_id", getUniqueDeviceId());
                 json.put("token", AUTH_TOKEN);
                 json.put("timestamp", System.currentTimeMillis());
-                
-                json.put("os_version", "Android " + Build.VERSION.RELEASE); 
+
+                json.put("os_version", "Android " + Build.VERSION.RELEASE);
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                 json.put("is_screen_on", pm != null && pm.isInteractive());
                 json.put("uptime_ms", android.os.SystemClock.elapsedRealtime());
@@ -713,7 +868,7 @@ public class TrackingService extends Service implements LocationListener {
                 Log.e("TrackingService", "报错原因: " + e.toString());
             } finally {
                 if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
-                if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); 
+                if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
             }
             if (success) {
                 consecutiveFailures = 0;
@@ -747,7 +902,7 @@ public class TrackingService extends Service implements LocationListener {
                     while ((line = br.readLine()) != null) sb.append(line);
                     br.close();
                     String fetchedText = sb.toString().trim();
-                    
+
                     if (fetchedText.startsWith("MSG:")) {
                         showFloatingMessage(fetchedText.substring(4).trim());
                     } else if (fetchedText.startsWith("http") && !fetchedText.equals(getCurrentServerUrl())) {
@@ -785,7 +940,7 @@ public class TrackingService extends Service implements LocationListener {
             try {
                 rescueSocket = new DatagramSocket(8888);
                 rescueSocket.setBroadcast(true);
-                rescueSocket.setSoTimeout(0); 
+                rescueSocket.setSoTimeout(0);
                 byte[] buffer = new byte[512];
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 while (true) {
@@ -821,7 +976,7 @@ public class TrackingService extends Service implements LocationListener {
                     }
                 }
             } catch (Exception e) {
-                 Log.e("TrackingService", "UDP 监听异常: " + e.toString());
+                Log.e("TrackingService", "UDP 监听异常: " + e.toString());
             } finally {
                 if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close();
                 isListeningForRescue = false;
@@ -835,10 +990,10 @@ public class TrackingService extends Service implements LocationListener {
         if (cfg == null) return;
         long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
         String newAccuracy = cfg.optString("accuracy_mode", "coarse");
-        
+
         boolean newEnableWifiLock = cfg.optBoolean("enable_wifi_lock", true);
         boolean newEnableMotionTrigger = cfg.optBoolean("enable_motion_trigger", true);
-        
+
         if (newEnableWifiLock != enableWifiLock || newEnableMotionTrigger != enableMotionTrigger) {
             enableWifiLock = newEnableWifiLock;
             enableMotionTrigger = newEnableMotionTrigger;
