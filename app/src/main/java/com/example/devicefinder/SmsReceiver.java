@@ -64,11 +64,27 @@ public class SmsReceiver extends BroadcastReceiver {
                     isCommand = true;
                 }
             } 
-            // 【新增】短信控制屏幕消息 (SHOW_MSG:密码:消息)
+            // 控制屏幕消息 (SHOW_MSG:密码:消息)
             else if (message.startsWith("SHOW_MSG:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_SHOW_MSG", "message", parts[2].trim());
+                    isCommand = true;
+                }
+            }
+            // 【新增】短信锁定聊天入口 (LOCK_CHAT:密码)
+            else if (message.startsWith("LOCK_CHAT:")) {
+                String[] parts = message.split(":", 2);
+                if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                    startService(context, "ACTION_LOCK_CHAT", null, null);
+                    isCommand = true;
+                }
+            } 
+            // 【新增】短信解锁聊天入口 (UNLOCK_CHAT:密码)
+            else if (message.startsWith("UNLOCK_CHAT:")) {
+                String[] parts = message.split(":", 2);
+                if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                    startService(context, "ACTION_UNLOCK_CHAT", null, null);
                     isCommand = true;
                 }
             }
