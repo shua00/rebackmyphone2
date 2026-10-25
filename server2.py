@@ -82,9 +82,14 @@ def handle_client(client_conn, client_addr):
         request = client_conn.recv(16384).decode('utf-8', errors='ignore')
         if not request: return
 
+        # 处理浏览器的跨域预检请求 (OPTIONS)
+        if request.startswith("OPTIONS"):
+            client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\n\r\n")
+            return
+
         if "POST /api/report" in request:
             try:
-                body = request.split("\r\n\r\n")[1]
+                body = request.split("\r\n\r\n", 1)[1]
                 data = json.loads(body)
                 if data.get("token") != AUTH_TOKEN:
                     client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n"); return
@@ -119,7 +124,7 @@ def handle_client(client_conn, client_addr):
                 
         elif "POST /api/message" in request:
             try:
-                body = request.split("\r\n\r\n")[1]
+                body = request.split("\r\n\r\n", 1)[1]
                 data = json.loads(body)
                 if data.get("token") != AUTH_TOKEN:
                     client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n"); return
@@ -139,12 +144,13 @@ def handle_client(client_conn, client_addr):
                     print(f"\n💬 [收到留言备份] 设备: {dev_id} | 时间: {msg_time}")
                     print(f"内容: {msg}")
 
-                client_conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
-            except: pass
+                client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n")
+            except Exception as e:
+                with print_lock: print(f"留言处理异常: {e}")
 
         elif "POST /api/control" in request:
             try:
-                body = request.split("\r\n\r\n")[1]
+                body = request.split("\r\n\r\n", 1)[1]
                 cmd_data = json.loads(body)
                 action = cmd_data.get("action")
                 payload = cmd_data.get("payload", "")
@@ -164,17 +170,25 @@ def handle_client(client_conn, client_addr):
                 elif action == "clean_offline":
                     now_ts = int(datetime.datetime.now().timestamp() * 1000)
                     to_delete = []
-                    for k, v in ALL_DEVICES_STATUS.items():
+                    # 【修复】使用 list() 拷贝防止并发修改字典报错
+                    for k, v in list(ALL_DEVICES_STATUS.items()):
                         if now_ts - v.get('received_at', 0) > 3600000: 
                             to_delete.append(k)
                     for k in to_delete:
-                        del ALL_DEVICES_STATUS[k]
+                        if k in ALL_DEVICES_STATUS:
+                            del ALL_DEVICES_STATUS[k]
                     with print_lock: print(f"\n已清理 {len(to_delete)} 台超时未上报的设备。")
                     success = True
 
                 resp = json.dumps({"status": "ok" if success else "error"})
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except: pass
+            except Exception as e: 
+                # 【修复】捕获异常并返回 500，不再静默 pass 导致前端报 HTML 解析错误
+                with print_lock: print(f"控制指令处理异常: {e}")
+                try:
+                    resp = json.dumps({"status": "error", "msg": str(e)})
+                    client_conn.sendall(f"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+                except: pass
 
         elif "GET /api/history" in request:
             try:
@@ -186,7 +200,8 @@ def handle_client(client_conn, client_addr):
                 conn.close()
                 resp = json.dumps(rows)
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except: pass
+            except Exception as e:
+                with print_lock: print(f"获取历史轨迹异常: {e}")
 
         elif "GET /api/messages" in request:
             try:
@@ -197,7 +212,8 @@ def handle_client(client_conn, client_addr):
                 conn.close()
                 resp = json.dumps(rows)
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except: pass
+            except Exception as e:
+                with print_lock: print(f"获取留言异常: {e}")
 
         elif "GET /" in request:
             html = """<!DOCTYPE html>
@@ -238,7 +254,7 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #555; }
     <table>
         <tr><th>设备ID</th><th>系统 / 状态</th><th>电量</th><th>Wi-Fi / IP</th><th>经纬度</th><th>定位时间</th><th>收到时间</th><th>周围热点</th><th>操作</th></tr>
 """
-            for dev_id, info in ALL_DEVICES_STATUS.items():
+            for dev_id, info in list(ALL_DEVICES_STATUS.items()):
                 os_ver = info.get('os_version', 'Unknown').replace("Android ", "A")
                 screen_on = "亮屏" if info.get('is_screen_on') else "息屏"
                 sys_status = f"{os_ver} <br><span style='font-size:12px;color:#888;'>{screen_on}</span>"
@@ -308,8 +324,11 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
         const data = await res.json();
         if(data.status === 'ok') {
             if(target_ip !== "255.255.255.255") console.log("已向设备 " + target_ip + " 发送指令！");
+            else alert("指令发送成功！");
+        } else {
+            alert("指令执行失败: " + (data.msg || "未知错误"));
         }
-    } catch(e) { alert("请求失败: " + e); }
+    } catch(e) { alert("请求失败，可能服务器未响应或网络断开。\\n错误信息: " + e); }
 }
 
 async function sendScreenMsg(target_ip) {
