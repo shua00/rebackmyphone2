@@ -11,10 +11,18 @@ def send_udp(command_str, target_ip="255.255.255.255"):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     
     print(f"\n📡 发送指令至 {target_ip}: {command_str}")
-    for i in range(3):
+    
+    # 【优化】判断发送次数
+    send_times = 3 if target_ip == "255.255.255.255" else 1
+    
+    for i in range(send_times):
         sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
-        print(f"   [{i+1}/3] 发送中...")
-        time.sleep(1)
+        if send_times > 1:
+            print(f"   [{i+1}/3] 发送中...")
+            time.sleep(1)
+        else:
+            print(f"   [1/1] 发送成功 (单播模式)")
+            
     sock.close()
     print("✅ 发送完毕。请查看手机响应。\n")
 
