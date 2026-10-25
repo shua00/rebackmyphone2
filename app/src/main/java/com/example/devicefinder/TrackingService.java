@@ -360,6 +360,7 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     // 【悬浮消息】宽度 = min(文字自然宽, 85% 屏宽)；短消息贴合文字，长消息折行不穿越
+    // 【悬浮消息】宽度 = min(文字自然宽, 85% 屏宽)；短消息贴合文字，长消息折行不穿越
     private void showFloatingMessage(String message) {
         saveMessageToHistory(message);
         syncMessageToServer(message);
@@ -383,10 +384,24 @@ public class TrackingService extends Service implements LocationListener {
                 textView.setTextColor(Color.WHITE);
                 textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000"));
                 textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-                textView.setPadding(0, 20, 0, 20);
+                
+                // 【修改点1】增加四周的内边距，防止文字贴边
+                textView.setPadding(dpToPx(20), dpToPx(15), dpToPx(20), dpToPx(15));
+                
                 textView.setMaxWidth(msgMaxW);
                 textView.setLineSpacing(15f, 1f);
-                // 强制折行，防无空格长串横向穿越
+                // 【修改点2】强制禁用横向滚动，允许它自己换行
+                textView.setHorizontallyScrolling(false);
+                textView.setSingleLine(false);
+                
+                // 【修改点3】设置 TextView 宽度为 MATCH_PARENT，严丝合缝地贴合外面的框，防止超长串穿透屏幕
+                android.widget.LinearLayout.LayoutParams tvParams = new android.widget.LinearLayout.LayoutParams(
+                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                );
+                textView.setLayoutParams(tvParams);
+
+                // 强制折行策略
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     textView.setBreakStrategy(android.text.Layout.BREAK_STRATEGY_SIMPLE);
                     textView.setHyphenationFrequency(android.text.Layout.HYPHENATION_FREQUENCY_NONE);
@@ -416,7 +431,7 @@ public class TrackingService extends Service implements LocationListener {
                 layout.post(() -> {
                     int textNaturalW = measureTextNaturalWidth(textView, message);
                     int finalW = Math.min(textNaturalW, msgMaxW);
-                    finalW = Math.max(finalW, dpToPx(48));
+                    finalW = Math.max(finalW, dpToPx(60)); // 最小宽度稍微调大一点，包住 padding
                     if (finalW != params.width) {
                         params.width = finalW;
                         try { wm.updateViewLayout(layout, params); } catch (Exception ignored) {}
