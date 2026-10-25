@@ -34,7 +34,7 @@ public class ChatActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_chat);
 
-        // 【新增】每次打开聊天界面，强制检查并拉起后台服务
+        // 【双保险】每次打开聊天界面，顺手把后台服务拉活
         Intent svc = new Intent(this, TrackingService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(svc);
