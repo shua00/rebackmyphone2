@@ -95,10 +95,11 @@
             </intent-filter>
         </receiver>
 
-        <!-- 局域网聊天界面：excludeFromRecents="true" 防止出现在最近任务被划死 -->
+        <!-- 局域网聊天界面：adjustResize 顶起键盘，excludeFromRecents 防划死 -->
         <activity
             android:name=".ChatActivity"
             android:exported="true"
+            android:windowSoftInputMode="adjustResize"
             android:excludeFromRecents="true" />
 
         <activity
