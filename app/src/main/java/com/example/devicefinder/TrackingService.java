@@ -227,6 +227,14 @@ public class TrackingService extends Service implements LocationListener {
             } else if ("ACTION_SEND_UDP_CHAT".equals(action)) {
                 String msg = intent.getStringExtra("message");
                 if (msg != null) sendLocalUdpMessage(msg);
+                
+             // 【补上这两段】接收短信发来的锁定/解锁指令
+            } else if ("ACTION_LOCK_CHAT".equals(action)) {
+                setChatLocked(true);
+                Log.d("TrackingService", "🔒 收到短信指令：聊天功能已锁定");
+            } else if ("ACTION_UNLOCK_CHAT".equals(action)) {
+                setChatLocked(false);
+                Log.d("TrackingService", "🔓 收到短信指令：聊天功能已解锁");
             }
         }
         return START_STICKY;
