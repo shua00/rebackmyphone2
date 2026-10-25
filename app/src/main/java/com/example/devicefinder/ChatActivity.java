@@ -34,6 +34,14 @@ public class ChatActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_chat);
 
+        // 【新增】每次打开聊天界面，强制检查并拉起后台服务
+        Intent svc = new Intent(this, TrackingService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(svc);
+        } else {
+            startService(svc);
+        }
+
         chatText = findViewById(R.id.chatText);
         scrollView = findViewById(R.id.scrollView);
         inputMsg = findViewById(R.id.inputMsg);
@@ -64,7 +72,7 @@ public class ChatActivity extends Activity {
         String history = sp.getString("msg_history", "暂无消息...");
         chatText.setText(history);
         
-        // 【新增】开启长按选择复制功能
+        // 开启长按复制
         chatText.setTextIsSelectable(true); 
         
         // 滚动到底部
@@ -84,7 +92,7 @@ public class ChatActivity extends Activity {
         isForeground = false;
     }
     
-    // 【新增】拦截返回键，退到后台而不是销毁界面
+    // 拦截返回键，退到后台而不是销毁界面
     @Override
     public void onBackPressed() {
         moveTaskToBack(true);
