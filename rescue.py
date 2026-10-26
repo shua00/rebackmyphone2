@@ -39,16 +39,18 @@ def main():
         print(" 8. 🔓 解锁局域网聊天入口")
         print(" 9. 🧹 清空手机本地历史留言")
         print("10. 📱 设置紧急接收短信的手机号")
+        print("11. ☁️ 开启云端日志（上传黑匣子到网页）")
+        print("12. ☁️ 关闭云端日志")
         print(" 0. 🚪 退出")
         print("="*45)
         
-        choice = input("请输入选项 (0-10): ").strip()
+        choice = input("请输入选项 (0-12): ").strip()
         
         if choice == '0':
             print("👋 退出。")
             break
             
-        if choice not in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']:
+        if choice not in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12']:
             print("❌ 无效选项，请重新输入。\n")
             continue
 
@@ -86,6 +88,10 @@ def main():
             num = input("请输入你要接收报警短信的真实手机号 (如 13812345678): ").strip()
             if num:
                 send_udp(f"FIND_ME_SET_SMS_NUM:{RESCUE_SECRET}:{num}", target_ip)
+        elif choice == '11':
+            send_udp(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:1", target_ip)
+        elif choice == '12':
+            send_udp(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:0", target_ip)
 
 if __name__ == "__main__":
     try:
