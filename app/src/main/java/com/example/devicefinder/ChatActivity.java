@@ -8,6 +8,8 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.KeyEvent;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
@@ -23,6 +25,8 @@ public class ChatActivity extends Activity {
     private Button btnSend;
 
     public static boolean isForeground = false;
+
+    private final Handler refreshHandler = new Handler(Looper.getMainLooper());
 
     private final BroadcastReceiver msgReceiver = new BroadcastReceiver() {
         @Override
@@ -69,7 +73,6 @@ public class ChatActivity extends Activity {
     private void sendMessage() {
         String msg = inputMsg.getText().toString().trim();
         if (!msg.isEmpty()) {
-            // 【核心修复】先本地落盘并瞬间刷新，解决自己发消息延迟
             SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
             String history = sp.getString("chat_history", "");
             String timeStr = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(new java.util.Date());
@@ -77,9 +80,8 @@ public class ChatActivity extends Activity {
             sp.edit().putString("chat_history", updatedHistory).apply();
 
             inputMsg.setText("");
-            refreshHistory(); // 秒回显
+            refreshHistory();
 
-            // 再交给后台服务去发 UDP
             Intent intent = new Intent(this, TrackingService.class);
             intent.setAction("ACTION_SEND_UDP_CHAT");
             intent.putExtra("message", msg);
@@ -90,8 +92,12 @@ public class ChatActivity extends Activity {
     private void refreshHistory() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("chat_history", "暂无消息...");
+        
+        // 【修复】强制覆盖更新
         chatText.setText(history);
         chatText.setTextIsSelectable(true); 
+        
+        // 强制滚到底部
         scrollView.post(() -> scrollView.fullScroll(ScrollView.FOCUS_DOWN));
     }
 
@@ -99,13 +105,19 @@ public class ChatActivity extends Activity {
     protected void onResume() {
         super.onResume();
         isForeground = true;
+        
+        // 【修复】打开界面瞬间连刷3次，专治各种后台写入延迟
         refreshHistory();
+        refreshHandler.postDelayed(this::refreshHistory, 500);
+        refreshHandler.postDelayed(this::refreshHistory, 1000);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
         isForeground = false;
+        // 清除所有未执行的刷新任务
+        refreshHandler.removeCallbacksAndMessages(null);
     }
     
     @Override
