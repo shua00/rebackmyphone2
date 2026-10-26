@@ -18,6 +18,7 @@ GLOBAL_DEFAULT_CONFIG = {
 }
 
 ALL_DEVICES_STATUS = {}
+CHAT_MESSAGES = [] # 【新增】专门用于存放局域网对讲机聊天记录
 print_lock = threading.Lock()
 
 def init_db():
@@ -31,6 +32,33 @@ def init_db():
     conn.close()
 
 init_db()
+
+# 【新增】后台监听 UDP 8888 端口，截获手机发出的对讲机消息
+def udp_listener():
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        udp_sock.bind(('0.0.0.0', 8888))
+        print("🎧 UDP 监听已启动，等待局域网对讲机消息...")
+        while True:
+            data, addr = udp_sock.recvfrom(1024)
+            msg = data.decode('utf-8', errors='ignore')
+            # 格式：FIND_ME_MSG:密钥:发送者ID:内容
+            if msg.startswith("FIND_ME_MSG:"):
+                parts = msg.split(":", 4)
+                if len(parts) == 4 and parts[1] == RESCUE_SECRET:
+                    sender = parts[2]
+                    content = parts[3]
+                    # 过滤掉网页/PC自己发出去的消息，只记录手机的
+                    if sender not in ["Web_Console", "PC_Terminal"]:
+                        ts = datetime.datetime.now().strftime("%H:%M:%S")
+                        with print_lock:
+                            print(f"\n🗣️ [对讲机] {sender} 说: {content}")
+                            CHAT_MESSAGES.append({"time": ts, "sender": sender, "content": content})
+                            if len(CHAT_MESSAGES) > 100: # 最多保留100条
+                                CHAT_MESSAGES.pop(0)
+    except Exception as e:
+        print(f"❌ UDP 监听绑定失败 (端口可能被占用): {e}")
 
 def save_history(dev_id, lat, lng, ts):
     if lat is None or lng is None: return
@@ -172,7 +200,7 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_ALARM:{RESCUE_SECRET}", target_ip)
                 elif action == "custom_msg": 
                     success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}", target_ip)
-                elif action == "chat_msg": # 【新增】发到对讲机
+                elif action == "chat_msg": 
                     success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:Web_Console:{payload}", target_ip)
                 elif action == "change_server": 
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
@@ -236,6 +264,14 @@ def handle_client(client_conn, client_addr):
             except Exception as e:
                 with print_lock: print(f"获取留言异常: {e}")
 
+        elif "GET /api/chat_history" in request:
+            try:
+                with print_lock:
+                    resp = json.dumps(CHAT_MESSAGES)
+                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+            except Exception as e:
+                pass
+
         elif "GET /" in request:
             html = """<!DOCTYPE html>
 <html><head><meta charset='utf-8'>
@@ -259,13 +295,7 @@ def handle_client(client_conn, client_addr):
     --color-btn-primary-hover-bg: #1b1f24;
     --color-btn-danger-bg: #cf222e;
 }
-
-/* 【彻底消除全局点击闪烁】 */
-* {
-    -webkit-tap-highlight-color: transparent !important;
-    outline: none !important;
-}
-
+* { -webkit-tap-highlight-color: transparent !important; outline: none !important; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 24px; background: var(--color-canvas-subtle); color: var(--color-fg-default); }
 h2 { font-size: 20px; font-weight: 600; margin-bottom: 20px; }
 .panel { background: var(--color-canvas-default); padding: 16px; border-radius: 6px; border: 1px solid var(--color-border-default); margin-bottom: 24px; }
@@ -288,14 +318,11 @@ tr:last-child td { border-bottom: none; }
 tr:hover { background-color: var(--color-canvas-subtle); }
 a { color: var(--color-accent-fg); text-decoration: none; }
 a:hover { text-decoration: underline; }
-
-/* 【彻底消除 details 闪烁】 */
 details { cursor: pointer; color: var(--color-fg-default); font-weight: 600; user-select: none; }
 details summary::-webkit-details-marker { display: none; }
 details summary { display: flex; align-items: center; user-select: none; }
 details summary::before { content: '▶'; font-size: 10px; margin-right: 8px; transition: transform 0.2s; }
 details[open] summary::before { transform: rotate(90deg); }
-
 .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .btn-group button { margin: 0; }
 .input-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
@@ -313,7 +340,6 @@ details[open] summary::before { transform: rotate(90deg); }
 #toast { visibility: hidden; min-width: 250px; background-color: var(--color-fg-default); color: #fff; text-align: center; border-radius: 6px; padding: 12px; position: fixed; z-index: 10000; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 14px; opacity: 0; transition: opacity 0.3s, bottom 0.3s; }
 #toast.show { visibility: visible; opacity: 1; bottom: 50px; }
 
-/* 【全局生效】无论是 PC 还是手机，操作按钮都变成 3 + 3 网格 */
 td button.btn-sm {
     display: inline-block;
     width: 32%;
@@ -325,11 +351,15 @@ td button.btn-sm {
     font-size: 12px;
     white-space: nowrap;
 }
+td button.btn-sm:nth-child(3n) { margin-right: 0; }
 
-/* 每一行的第三个按钮去掉右边距，完美对齐 */
-td button.btn-sm:nth-child(3n) {
-    margin-right: 0; 
-}
+/* 聊天室相关样式 */
+#chatBox { display: none; margin-top: 24px; background: #fff; border-radius: 6px; border: 1px solid var(--color-border-default); flex-direction: column; height: 400px; }
+#chatMessages { flex: 1; overflow-y: auto; padding: 16px; font-size: 14px; line-height: 1.5; }
+.chat-msg { margin-bottom: 8px; }
+.chat-time { color: #8c959f; font-size: 12px; margin-right: 8px; }
+.chat-sender { color: #0969da; font-weight: 600; margin-right: 8px; }
+.chat-input-area { display: flex; padding: 12px; border-top: 1px solid var(--color-border-muted); background: #f6f8fa; gap: 8px; }
 
 @media (max-width: 768px) {
     body { margin: 12px; }
@@ -350,14 +380,10 @@ td button.btn-sm:nth-child(3n) {
         <input type="text" id="msgText" placeholder="输入要群发到所有手机屏幕上的文字...">
         <button class="btn-primary" onclick="sendScreenMsg('255.255.255.255')">发送群发提示</button>
     </div>
-    <!-- 【新增】发送到对讲机 -->
-    <div class="input-row">
-        <input type="text" id="chatText" placeholder="输入要发到对讲机聊天室的文字...">
-        <button onclick="sendChatMsg('255.255.255.255')" style="color:#0969da; border-color:#0969da;">发送到对讲机</button>
-    </div>
     <div class="quick-actions">
         <button class="btn-primary" onclick="sendCmd('force_report')">全局同步状态</button>
         <button onclick="showServerMessages()">查看云端留言</button>
+        <button onclick="toggleChatBox()" style="color:#0969da; border-color:#0969da;">🗣️ 局域网对讲机</button>
     </div>
     <details style="margin-top: 16px; border-top: 1px solid var(--color-border-muted); padding-top: 12px;">
         <summary>⚙️ 高级设置与系统工具</summary>
@@ -377,6 +403,16 @@ td button.btn-sm:nth-child(3n) {
         </div>
     </details>
 </div>
+
+<!-- 【新增】对讲机面板 -->
+<div id="chatBox">
+    <div id="chatMessages"></div>
+    <div class="chat-input-area">
+        <input type="text" id="chatInput" placeholder="输入消息发给局域网手机..." style="flex:1; margin:0;" onkeypress="handleChatEnter(event)">
+        <button class="btn-primary" onclick="sendChat()">发送</button>
+    </div>
+</div>
+
 <div class="table-responsive">
     <table>
         <tr>
@@ -465,6 +501,7 @@ var map = null;
 var markersLayer = null;
 var polyline = null;
 var isMapVisible = false;
+var isChatVisible = false;
 var allDevicesData = """ + json.dumps(ALL_DEVICES_STATUS) + """;
 
 function showToast(msg) {
@@ -472,6 +509,63 @@ function showToast(msg) {
     toast.innerText = msg;
     toast.className = "show";
     setTimeout(function(){ toast.className = toast.className.replace("show", ""); }, 3000);
+}
+
+// 【新增】对讲机面板控制与轮询
+function toggleChatBox() {
+    var chatBox = document.getElementById('chatBox');
+    isChatVisible = !isChatVisible;
+    if (isChatVisible) {
+        chatBox.style.display = 'flex';
+        fetchChatHistory();
+    } else {
+        chatBox.style.display = 'none';
+    }
+}
+
+function handleChatEnter(e) {
+    if (e.key === 'Enter') sendChat();
+}
+
+async function sendChat() {
+    let msg = document.getElementById('chatInput').value.trim();
+    if(!msg) return;
+    document.getElementById('chatInput').value = "";
+    // 调用之前定义的 4 段式发送接口
+    await fetch('/api/control', {
+        method: 'POST', 
+        headers: {'Content-Type': 'application/json'}, 
+        body: JSON.stringify({action: 'chat_msg', payload: msg, target_ip: '255.255.255.255'})
+    });
+    setTimeout(fetchChatHistory, 300); // 发送后稍等片刻刷新
+}
+
+async function fetchChatHistory() {
+    if (!isChatVisible) return;
+    try {
+        const res = await fetch('/api/chat_history');
+        const data = await res.json();
+        const chatDiv = document.getElementById('chatMessages');
+        
+        let html = "";
+        data.forEach(item => {
+            let senderColor = item.sender.includes("Web_Console") ? "#cf222e" : "#0969da";
+            html += `<div class="chat-msg">
+                <span class="chat-time">${item.time}</span>
+                <span class="chat-sender" style="color:${senderColor}">[${item.sender}]</span>
+                <span class="chat-content">${item.content}</span>
+            </div>`;
+        });
+        
+        // 只有当内容变化时才重绘，防止选中文字被打断
+        if (chatDiv.innerHTML !== html) {
+            chatDiv.innerHTML = html;
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+        }
+    } catch(e) {}
+    
+    // 2 秒轮询一次
+    if (isChatVisible) setTimeout(fetchChatHistory, 2000);
 }
 
 function toggleMap() {
@@ -544,7 +638,9 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
 
         if(data.status === 'ok') {
             showToast("✅ 指令发送成功");
-            setTimeout(() => location.reload(), 1500);
+            if (action !== "chat_msg") {
+                setTimeout(() => location.reload(), 1500);
+            }
         } else {
             showToast("❌ 失败: " + (data.msg || "未知错误"));
         }
@@ -555,14 +651,6 @@ async function sendScreenMsg(target_ip) {
     let msg = document.getElementById('msgText').value;
     if(!msg) { showToast("请先在输入框输入文字！"); return; }
     await sendCmd('custom_msg', msg, target_ip);
-}
-
-// 【新增】发送到对讲机
-async function sendChatMsg(target_ip) {
-    let msg = document.getElementById('chatText').value;
-    if(!msg) { showToast("请先在输入框输入文字！"); return; }
-    await sendCmd('chat_msg', msg, target_ip);
-    document.getElementById('chatText').value = "";
 }
 
 async function sendSmsNum(target_ip) {
@@ -603,6 +691,9 @@ async function showServerMessages() {
         except: pass
 
 def start_server():
+    # 启动 UDP 监听线程，专收对讲机消息
+    threading.Thread(target=udp_listener, daemon=True).start()
+    
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try: server.bind(('0.0.0.0', PORT))
