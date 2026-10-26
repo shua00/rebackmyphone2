@@ -77,7 +77,7 @@ public class TrackingService extends Service implements LocationListener {
     private boolean enableMotionTrigger = true;
 
     private static long lastReportTime = 0;
-    private static final Object reportLock = new Object(); // 【新增】并发上报锁
+    private static final Object reportLock = new Object(); // 并发上报锁
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
@@ -95,7 +95,6 @@ public class TrackingService extends Service implements LocationListener {
 
     private BroadcastReceiver batteryMonitor;
     
-    // 用于管理当前的悬浮窗（单条覆盖）
     private final List<android.view.View> activeBubbles = new ArrayList<>();
 
     @Override
@@ -148,7 +147,7 @@ public class TrackingService extends Service implements LocationListener {
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         PendingIntent pi = PendingIntent.getService(this, 1002, intent, flags);
         
-        long triggerAt = System.currentTimeMillis() + 15 * 60 * 1000L; // 15分钟
+        long triggerAt = System.currentTimeMillis() + 15 * 60 * 1000L;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
         } else {
@@ -868,7 +867,6 @@ public class TrackingService extends Service implements LocationListener {
     private void sendReport(final boolean withNearbyWifi, boolean force, final String overrideUrl) {
         long currentTime = System.currentTimeMillis();
         
-        // 【修复】用锁防止并发重复上报
         synchronized (reportLock) {
             if (!force && currentTime - lastReportTime < 5000) return;
             if (force && currentTime - lastReportTime < 2000) return; 
@@ -971,10 +969,7 @@ public class TrackingService extends Service implements LocationListener {
                 java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length, java.net.InetAddress.getByName("255.255.255.255"), 8888);
                 socket.send(packet); socket.close();
                 
-                // 【修改】由 ChatActivity 完成本地存储和刷新，这里只负责 UDP 发送
-                // saveChatToHistory("[我] " + message);
-                // Intent updateIntent = new Intent("UPDATE_CHAT_UI"); sendBroadcast(updateIntent);
-
+                // 注意：本地存储和广播已在 ChatActivity 完成，这里仅发送 UDP
             } catch (Exception e) { Log.e("TrackingService", "UDP 发送失败: " + e.toString()); }
         }).start();
     }
@@ -1017,9 +1012,9 @@ public class TrackingService extends Service implements LocationListener {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
                             
-                            // 如果是自己发出去的广播，直接忽略
+                            // 【修复】如果是自己发出去的广播，跳过本次循环，绝对不能 return
                             if (senderId.equals(getUniqueDeviceId())) {
-                                return;
+                                continue; 
                             }
                             
                             String shortName = senderId;
@@ -1057,8 +1052,20 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { setChatLocked(true); handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔒 聊天功能已锁定", android.widget.Toast.LENGTH_SHORT).show()); }
                     }
                 }
-            } catch (Exception e) { Log.e("TrackingService", "UDP 监听异常: " + e.toString()); }
-            finally { if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close(); isListeningForRescue = false; }
+            } catch (Exception e) { 
+                Log.e("TrackingService", "UDP 监听异常: " + e.toString()); 
+            } finally { 
+                if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close(); 
+                isListeningForRescue = false;
+                
+                // 【修复】如果监听异常断开，5秒后自动重连
+                handler.postDelayed(() -> {
+                    if (!isListeningForRescue) {
+                        FileLogger.log(TrackingService.this, "UDP", "监听断开，正在尝试重连...");
+                        triggerRescueListener();
+                    }
+                }, 5000);
+            }
         }).start();
     }
 
