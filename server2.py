@@ -106,11 +106,12 @@ def handle_client(client_conn, client_addr):
                     uptime_hours = round(uptime_ms / (1000 * 60 * 60), 1) if uptime_ms else 0
                     screen_on = "亮屏" if data.get('is_screen_on') else "息屏"
                     os_ver = data.get('os_version', 'Unknown')
+                    chat_lock = "🔒 已锁" if data.get('chat_locked') else "🔓 未锁"
                     loc_str = f"{lat:.6f}, {lng:.6f}" if lat is not None and lng is not None else "未获取"
 
                     print("\n" + "="*50)
                     print(f"收到上报 | 设备: {dev_id}")
-                    print(f"状态: {os_ver} | {screen_on} | 已开机 {uptime_hours} 小时")
+                    print(f"状态: {os_ver} | {screen_on} | {chat_lock} | 已开机 {uptime_hours} 小时")
                     print(f"Wi-Fi: {data.get('network', {}).get('wifi_ssid')} (IP: {data.get('network', {}).get('local_ip')})")
                     print(f"电量: {data.get('battery', {}).get('level')}%")
                     print(f"定位: {loc_str}")
@@ -166,8 +167,10 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clear_history": 
                     success = send_udp_broadcast(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", target_ip)
-                elif action == "toggle_chat":
-                    success = send_udp_broadcast(f"FIND_ME_CHAT_TOGGLE:{RESCUE_SECRET}", target_ip)
+                elif action == "lock_chat":  # 明确拆分
+                    success = send_udp_broadcast(f"FIND_ME_CHAT_LOCK:{RESCUE_SECRET}", target_ip)
+                elif action == "unlock_chat": # 明确拆分
+                    success = send_udp_broadcast(f"FIND_ME_CHAT_UNLOCK:{RESCUE_SECRET}", target_ip)
                 elif action == "clean_offline":
                     now_ts = int(datetime.datetime.now().timestamp() * 1000)
                     to_delete = []
@@ -233,6 +236,8 @@ button:hover{background:#f3f4f6;border-color:#9ca3af;}
 .btn-primary:hover{background:#111827;}
 .btn-danger{color:#ef4444;border-color:#fca5a5;}
 .btn-danger:hover{background:#fef2f2;border-color:#ef4444;}
+.btn-warning{color:#d97706;border-color:#fcd34d;}
+.btn-warning:hover{background:#fef3c7;border-color:#d97706;}
 
 /* 表格内小按钮（桌面端两两并排） */
 button.btn-sm {
@@ -282,7 +287,8 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
 <div class="panel">
     <button class="btn-primary" onclick="sendCmd('force_report')">全局同步状态</button>
     <button class="btn-danger" onclick="sendCmd('play_alarm')">全局测试音频</button>
-    <button onclick="sendCmd('toggle_chat')">切换聊天入口</button>
+    <button onclick="sendCmd('lock_chat')">🔒 全局锁定聊天</button>
+    <button onclick="sendCmd('unlock_chat')">🔓 全局解锁聊天</button>
     <button onclick="sendCmd('clean_offline')">清理离线设备</button>
     <button onclick="showServerMessages()">查看云端留言</button>
     <button onclick="sendCmd('clear_history')">清空手机历史</button>
@@ -308,7 +314,11 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
             for dev_id, info in list(ALL_DEVICES_STATUS.items()):
                 os_ver = info.get('os_version', 'Unknown').replace("Android ", "A")
                 screen_on = "亮屏" if info.get('is_screen_on') else "息屏"
-                sys_status = f"{os_ver} <br><span style='font-size:11px;color:#9ca3af;'>{screen_on}</span>"
+                
+                # 获取并展示聊天锁状态
+                is_locked = info.get('chat_locked', False)
+                chat_lock_str = "<span style='color:#ef4444;'>🔒 已锁</span>" if is_locked else "<span style='color:#10b981;'>🔓 未锁</span>"
+                sys_status = f"{os_ver} <br><span style='font-size:11px;color:#9ca3af;'>{screen_on} | {chat_lock_str}</span>"
                 
                 lat = info.get('location', {}).get('latitude')
                 lng = info.get('location', {}).get('longitude')
@@ -344,7 +354,13 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
                 html += f"<button class='btn-sm' onclick=\"sendCmd('force_report', '', '{local_ip}')\">同步</button>"
                 html += f"<button class='btn-sm' onclick=\"sendScreenMsg('{local_ip}')\">提示</button>"
                 html += f"<button class='btn-sm btn-danger' onclick=\"sendCmd('play_alarm', '', '{local_ip}')\">响铃</button>"
-                html += f"<button class='btn-sm' onclick=\"sendCmd('toggle_chat', '', '{local_ip}')\">聊天</button>"
+                
+                # 动态渲染锁定/解锁按钮
+                if is_locked:
+                    html += f"<button class='btn-sm btn-warning' onclick=\"sendCmd('unlock_chat', '', '{local_ip}')\">🔓 解锁</button>"
+                else:
+                    html += f"<button class='btn-sm btn-primary' onclick=\"sendCmd('lock_chat', '', '{local_ip}')\">🔒 锁定</button>"
+                    
                 html += f"<button class='btn-sm' onclick=\"showTrack('{dev_id}')\">轨迹</button>"
                 html += f"</td></tr>"
                 
@@ -426,6 +442,9 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
         if(data.status === 'ok') {
             if(target_ip !== "255.255.255.255") console.log("已向设备 " + target_ip + " 发送指令！");
             else alert("指令发送成功！");
+            
+            // 【核心】指令发送成功后，延迟1.5秒自动刷新页面获取最新状态
+            setTimeout(() => location.reload(), 1500);
         } else {
             alert("指令执行失败: " + (data.msg || "未知错误"));
         }
