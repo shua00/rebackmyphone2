@@ -136,18 +136,21 @@ public class TrackingService extends Service implements LocationListener {
         scheduleKeepAliveJob();
     }
 
+    // 【修改点 1】把 JobScheduler 替换为底层 AlarmManager 闹钟
     private void scheduleKeepAliveJob() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            android.app.job.JobScheduler jobScheduler = (android.app.job.JobScheduler) getSystemService(Context.JOB_SCHEDULER_SERVICE);
-            if (jobScheduler != null) {
-                jobScheduler.cancel(1001);
-                android.app.job.JobInfo.Builder builder = new android.app.job.JobInfo.Builder(
-                        1001, new ComponentName(this, KeepAliveJobService.class));
-                builder.setPeriodic(15 * 60 * 1000L);
-                builder.setPersisted(true);
-                jobScheduler.schedule(builder.build());
-            }
+        if (alarmManager == null) return;
+        Intent intent = new Intent(this, TrackingService.class);
+        intent.setAction("ACTION_KEEP_ALIVE");
+        int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
+        PendingIntent pi = PendingIntent.getService(this, 1002, intent, flags);
+        
+        long triggerAt = System.currentTimeMillis() + 15 * 60 * 1000L; // 15分钟
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
+        } else {
+            alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pi);
         }
+        Log.d("TrackingService", "⏰ 注册 15 分钟防杀心跳闹钟");
     }
 
     private void toggleMotionSensor(boolean enable) {
@@ -172,7 +175,12 @@ public class TrackingService extends Service implements LocationListener {
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null) {
             String action = intent.getAction();
-            if ("ACTION_MANUAL_REPORT".equals(action) || "ACTION_FORCE_REPORT".equals(action)) {
+            
+            // 【修改点 2】接收重置通知指令（防单击秒进）
+            if ("ACTION_RESET_NOTIFICATION".equals(action)) {
+                notificationClickCount = 0;
+                startForegroundNotification();
+            } else if ("ACTION_MANUAL_REPORT".equals(action) || "ACTION_FORCE_REPORT".equals(action)) {
                 sendReport(true, true);
             } else if ("ACTION_UPDATE_SERVER".equals(action) || "ACTION_ADB_UPDATE".equals(action)) {
                 String newUrl = intent.getStringExtra("server_url");
@@ -235,6 +243,9 @@ public class TrackingService extends Service implements LocationListener {
                 String msg = intent.getStringExtra("message");
                 if (msg != null) sendLocalUdpMessage(msg);
                 
+            // 【修改点 3】接收底层闹钟保活心跳
+            } else if ("ACTION_KEEP_ALIVE".equals(action)) {
+                scheduleKeepAliveJob();
             // 【补上】接收短信发来的锁定/解锁指令
             } else if ("ACTION_LOCK_CHAT".equals(action)) {
                 setChatLocked(true);
@@ -441,13 +452,15 @@ public class TrackingService extends Service implements LocationListener {
 
                 TextView textView = new TextView(this);
                 textView.setText(message);
-                textView.setTextSize(20f); // 字体调小，更像壁纸格言
-                textView.setTypeface(null, android.graphics.Typeface.NORMAL); // 不加粗，像壁纸文字
+                
+                // 【修改点 4】字体调小，不加粗，更像壁纸
+                textView.setTextSize(20f); 
+                textView.setTypeface(null, android.graphics.Typeface.NORMAL); 
+                
                 textView.setTextColor(Color.WHITE);
                 textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000"));
                 textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
                 
-                // 【修改】左边距变小，贴紧屏幕左侧
                 textView.setPadding(dpToPx(10), dpToPx(15), dpToPx(20), dpToPx(15));
                 textView.setMaxWidth(msgMaxW);
                 textView.setLineSpacing(15f, 1f);
@@ -480,7 +493,7 @@ public class TrackingService extends Service implements LocationListener {
                         PixelFormat.TRANSLUCENT);
 
                 params.gravity = Gravity.TOP | Gravity.START;
-                params.x = 20; // 【修改】x 从 80 改为 20，直接贴向屏幕左侧
+                params.x = 20; // 【修改点 5】贴靠左侧
                 params.y = 450;
 
                 wm.addView(layout, params);
@@ -954,6 +967,7 @@ public class TrackingService extends Service implements LocationListener {
                 json.put("timestamp", System.currentTimeMillis());
 
                 json.put("os_version", "Android " + Build.VERSION.RELEASE);
+                json.put("chat_locked", isChatLocked()); // 【修改点 6】同步聊天锁状态到网页
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                 json.put("is_screen_on", pm != null && pm.isInteractive());
                 json.put("uptime_ms", android.os.SystemClock.elapsedRealtime());
@@ -1086,7 +1100,7 @@ public class TrackingService extends Service implements LocationListener {
                 socket.send(packet);
                 socket.close();
 
-                saveMessageToHistory(message); // 【修改】只存纯文本
+                saveMessageToHistory(message); // 【修改点 7】去前缀
                 Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                 sendBroadcast(updateIntent);
 
@@ -1131,10 +1145,10 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String msgContent = parts[2].trim();
                             String history = getSharedPreferences("device_finder_prefs", MODE_PRIVATE).getString("msg_history", "");
-                            // 判断是不是自己刚发的
+                            // 【修改点 8】判断是否包含，并且去前缀
                             if (!history.contains(msgContent)) {
                                 if (ChatActivity.isForeground) {
-                                    saveMessageToHistory(msgContent); // 只存纯文本
+                                    saveMessageToHistory(msgContent); // 存纯文本
                                     Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                                     sendBroadcast(updateIntent);
                                 } else {
@@ -1154,7 +1168,6 @@ public class TrackingService extends Service implements LocationListener {
                             setChatLocked(!currentLocked); // 反转状态
                             String stateMsg = !currentLocked ? "🔒 聊天功能已锁定" : "🔓 聊天功能已解锁";
                             Log.d("TrackingService", stateMsg);
-                            // 【新增】加 Toast，网页点一下，手机立刻弹提示
                             handler.post(() -> android.widget.Toast.makeText(TrackingService.this, stateMsg, android.widget.Toast.LENGTH_SHORT).show());
                         }
                     } else if (message.startsWith("FIND_ME_CHAT_UNLOCK:")) {
