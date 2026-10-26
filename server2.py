@@ -95,12 +95,10 @@ def handle_client(client_conn, client_addr):
                 dev_id = data.get("device_id", "unknown_device")
                 data["received_at"] = int(datetime.datetime.now().timestamp() * 1000)
                 
-                # 接收云端日志
                 if "cloud_logs" in data:
                     ALL_DEVICES_STATUS[dev_id]["cloud_logs"] = data["cloud_logs"]
                     ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"] = data["received_at"]
                 elif dev_id in ALL_DEVICES_STATUS and "cloud_logs" in ALL_DEVICES_STATUS[dev_id]:
-                    # 如果本次没发（可能关掉了开关），保留上一次的日志
                     data["cloud_logs"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs"]
                     data["cloud_logs_time"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"]
 
@@ -259,6 +257,13 @@ def handle_client(client_conn, client_addr):
     --color-btn-primary-hover-bg: #1b1f24;
     --color-btn-danger-bg: #cf222e;
 }
+
+/* 【彻底消除全局点击闪烁】 */
+* {
+    -webkit-tap-highlight-color: transparent !important;
+    outline: none !important;
+}
+
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 24px; background: var(--color-canvas-subtle); color: var(--color-fg-default); }
 h2 { font-size: 20px; font-weight: 600; margin-bottom: 20px; }
 .panel { background: var(--color-canvas-default); padding: 16px; border-radius: 6px; border: 1px solid var(--color-border-default); margin-bottom: 24px; }
@@ -271,7 +276,7 @@ button:hover { background-color: var(--color-btn-hover-bg); }
 .btn-warning { background-color: var(--color-canvas-default); color: #9a6700; border-color: var(--color-border-default); }
 .btn-warning:hover { background-color: #9a6700; color: #fff; }
 button.btn-sm { padding: 3px 12px; font-size: 12px; line-height: 18px; }
-input[type="text"] { padding: 5px 12px; font-size: 14px; line-height: 20px; border: 1px solid var(--color-border-default); border-radius: 6px; outline: none; transition: border-color 0.2s, box-shadow 0.2s; }
+input[type="text"] { padding: 5px 12px; font-size: 14px; line-height: 20px; border: 1px solid var(--color-border-default); border-radius: 6px; transition: border-color 0.2s, box-shadow 0.2s; }
 input[type="text"]:focus { border-color: var(--color-accent-fg); box-shadow: 0 0 0 3px rgba(9,105,218,0.3); }
 .table-responsive { width: 100%; overflow-x: auto; background: var(--color-canvas-default); border-radius: 6px; border: 1px solid var(--color-border-default); }
 table { border-collapse: collapse; width: 100%; min-width: 900px; }
@@ -282,10 +287,10 @@ tr:hover { background-color: var(--color-canvas-subtle); }
 a { color: var(--color-accent-fg); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
-/* 消除 details 和 summary 的高亮闪烁 */
-details { cursor: pointer; color: var(--color-fg-default); font-weight: 600; user-select: none; outline: none; }
+/* 【彻底消除 details 闪烁】 */
+details { cursor: pointer; color: var(--color-fg-default); font-weight: 600; user-select: none; }
 details summary::-webkit-details-marker { display: none; }
-details summary { display: flex; align-items: center; outline: none; -webkit-tap-highlight-color: transparent; }
+details summary { display: flex; align-items: center; user-select: none; }
 details summary::before { content: '▶'; font-size: 10px; margin-right: 8px; transition: transform 0.2s; }
 details[open] summary::before { transform: rotate(90deg); }
 
@@ -306,23 +311,15 @@ details[open] summary::before { transform: rotate(90deg); }
 #toast { visibility: hidden; min-width: 250px; background-color: var(--color-fg-default); color: #fff; text-align: center; border-radius: 6px; padding: 12px; position: fixed; z-index: 10000; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 14px; opacity: 0; transition: opacity 0.3s, bottom 0.3s; }
 #toast.show { visibility: visible; opacity: 1; bottom: 50px; }
 
-/* 移动端布局适配 */
 @media (max-width: 768px) {
     body { margin: 12px; }
-    
-    /* 顶部输入框占满整行 */
     .input-row { flex-direction: column; align-items: stretch; }
     .input-row button { width: 100%; padding: 8px; margin-top: 4px; }
-    
-    /* 高频操作和高级设置保持两列 */
     .quick-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
     .quick-actions button { width: 100%; padding: 8px 4px; text-align: center; }
     .btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .btn-group button { width: 100%; text-align: center; padding: 8px 4px; font-size: 13px;}
-    
     .hide-mobile { display: none !important; }
-
-    /* 【重点优化】手机端操作按钮上三下三，极致紧凑 */
     td button.btn-sm {
         display: inline-block;
         width: 32%;
@@ -334,8 +331,6 @@ details[open] summary::before { transform: rotate(90deg); }
         font-size: 12px;
         white-space: nowrap;
     }
-    
-    /* 每一行的第三个按钮去掉右边距，完美对齐 */
     td button.btn-sm:nth-child(3n) {
         margin-right: 0; 
     }
