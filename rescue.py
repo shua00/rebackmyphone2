@@ -39,16 +39,17 @@ def main():
         print("7. 🔒 锁定局域网聊天入口")
         print("8. 🔓 解锁局域网聊天入口")
         print("9. 🧹 清空手机本地历史留言")
+        print("10. 📱 设置紧急接收短信的手机号")
         print("0. 退出")
         print("="*45)
         
-        choice = input("请输入选项 (0-9): ").strip()
+        choice = input("请输入选项 (0-10): ").strip()
         
         if choice == '0':
             print("👋 退出。")
             break
             
-        if choice not in ['1', '2', '3', '4', '5', '6', '7', '8', '9']:
+        if choice not in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']:
             print("❌ 无效选项，请重新输入。\n")
             continue
 
@@ -82,6 +83,10 @@ def main():
             send_udp(f"FIND_ME_CHAT_UNLOCK:{RESCUE_SECRET}", target_ip)
         elif choice == '9':
             send_udp(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", target_ip)
+        elif choice == '10':
+            num = input("请输入你要接收报警短信的真实手机号 (如 13812345678): ").strip()
+            if num:
+                send_udp(f"FIND_ME_SET_SMS_NUM:{RESCUE_SECRET}:{num}", target_ip)
 
 if __name__ == "__main__":
     try:
