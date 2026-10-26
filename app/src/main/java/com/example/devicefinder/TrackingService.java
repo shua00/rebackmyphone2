@@ -693,7 +693,16 @@ public class TrackingService extends Service implements LocationListener {
 
     private void sendLowBatterySms(int percent) {
         try {
-            String myPhoneNumber = "13800138000"; // ⚠️ 改成你的主力机号码
+            // 从本地配置读取，默认空字符串
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            String myPhoneNumber = sp.getString("emergency_sms_number", "");
+
+            // 如果没设置号码，直接返回不发送
+            if (myPhoneNumber == null || myPhoneNumber.trim().isEmpty()) {
+                Log.w("TrackingService", "低电量报警：未设置紧急短信接收号码，跳过发送。");
+                return;
+            }
+
             android.telephony.SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                     ? getSystemService(android.telephony.SmsManager.class)
                     : android.telephony.SmsManager.getDefault();
@@ -1160,6 +1169,15 @@ public class TrackingService extends Service implements LocationListener {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             clearMessageHistory();
+                        }
+                    // 【新增】通过局域网设置紧急短信接收号码
+                    } else if (message.startsWith("FIND_ME_SET_SMS_NUM:")) {
+                        String[] parts = message.split(":", 3);
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                            String newNum = parts[2].trim();
+                            getSharedPreferences("device_finder_prefs", MODE_PRIVATE).edit()
+                                    .putString("emergency_sms_number", newNum).apply();
+                            handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "紧急号码已更新: " + newNum, android.widget.Toast.LENGTH_LONG).show());
                         }
                     } else if (message.startsWith("FIND_ME_CHAT_TOGGLE:")) {
                         String[] parts = message.split(":", 2);
