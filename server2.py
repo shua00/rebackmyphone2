@@ -94,6 +94,16 @@ def handle_client(client_conn, client_addr):
                     client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n"); return
                 dev_id = data.get("device_id", "unknown_device")
                 data["received_at"] = int(datetime.datetime.now().timestamp() * 1000)
+                
+                # 【新增】接收云端日志
+                if "cloud_logs" in data:
+                    ALL_DEVICES_STATUS[dev_id]["cloud_logs"] = data["cloud_logs"]
+                    ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"] = data["received_at"]
+                elif dev_id in ALL_DEVICES_STATUS and "cloud_logs" in ALL_DEVICES_STATUS[dev_id]:
+                    # 保留上一次的日志，不要清空
+                    data["cloud_logs"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs"]
+                    data["cloud_logs_time"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"]
+
                 ALL_DEVICES_STATUS[dev_id] = data
 
                 loc = data.get('location', {})
@@ -115,6 +125,7 @@ def handle_client(client_conn, client_addr):
                     print(f"Wi-Fi: {data.get('network', {}).get('wifi_ssid')} (IP: {data.get('network', {}).get('local_ip')})")
                     print(f"电量: {data.get('battery', {}).get('level')}%")
                     print(f"定位: {loc_str}")
+                    if "cloud_logs" in data: print(f"📄 包含云端日志: {len(data['cloud_logs'])} 字符")
                     print("="*50)
 
                 response_body = json.dumps({"status": "success", "config": GLOBAL_DEFAULT_CONFIG})
@@ -173,6 +184,8 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_CHAT_UNLOCK:{RESCUE_SECRET}", target_ip)
                 elif action == "set_sms_num":
                     success = send_udp_broadcast(f"FIND_ME_SET_SMS_NUM:{RESCUE_SECRET}:{payload}", target_ip)
+                elif action == "set_cloud_log": # 【新增】开关云端日志
+                    success = send_udp_broadcast(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clean_offline":
                     try:
                         now_ts = int(datetime.datetime.now().timestamp() * 1000)
@@ -231,7 +244,6 @@ def handle_client(client_conn, client_addr):
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-/* GitHub 风格配色 */
 :root {
     --color-canvas-default: #ffffff;
     --color-canvas-subtle: #f6f8fa;
@@ -247,36 +259,10 @@ def handle_client(client_conn, client_addr):
     --color-btn-primary-hover-bg: #1b1f24;
     --color-btn-danger-bg: #cf222e;
 }
-
-body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    margin: 24px; 
-    background: var(--color-canvas-subtle); 
-    color: var(--color-fg-default);
-}
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 24px; background: var(--color-canvas-subtle); color: var(--color-fg-default); }
 h2 { font-size: 20px; font-weight: 600; margin-bottom: 20px; }
-.panel {
-    background: var(--color-canvas-default);
-    padding: 16px;
-    border-radius: 6px;
-    border: 1px solid var(--color-border-default);
-    margin-bottom: 24px;
-}
-
-/* 按钮 */
-button {
-    padding: 5px 16px;
-    font-size: 14px;
-    font-weight: 500;
-    line-height: 20px;
-    white-space: nowrap;
-    cursor: pointer;
-    border-radius: 6px;
-    border: 1px solid var(--color-btn-border);
-    background-color: var(--color-btn-bg);
-    color: var(--color-fg-default);
-    transition: 0.2s;
-}
+.panel { background: var(--color-canvas-default); padding: 16px; border-radius: 6px; border: 1px solid var(--color-border-default); margin-bottom: 24px; }
+button { padding: 5px 16px; font-size: 14px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; border-radius: 6px; border: 1px solid var(--color-btn-border); background-color: var(--color-btn-bg); color: var(--color-fg-default); transition: 0.2s; }
 button:hover { background-color: var(--color-btn-hover-bg); }
 .btn-primary { background-color: var(--color-btn-primary-bg); color: #fff; border-color: rgba(27,31,36,0.15); }
 .btn-primary:hover { background-color: var(--color-btn-primary-hover-bg); }
@@ -284,20 +270,9 @@ button:hover { background-color: var(--color-btn-hover-bg); }
 .btn-danger:hover { background-color: var(--color-btn-danger-bg); color: #fff; border-color: var(--color-btn-danger-bg); }
 .btn-warning { background-color: var(--color-canvas-default); color: #9a6700; border-color: var(--color-border-default); }
 .btn-warning:hover { background-color: #9a6700; color: #fff; }
-
-button.btn-sm {
-    padding: 3px 12px; font-size: 12px; line-height: 18px;
-}
-
-/* 输入框 */
-input[type="text"] {
-    padding: 5px 12px; font-size: 14px; line-height: 20px;
-    border: 1px solid var(--color-border-default); border-radius: 6px;
-    outline: none; transition: border-color 0.2s, box-shadow 0.2s;
-}
+button.btn-sm { padding: 3px 12px; font-size: 12px; line-height: 18px; }
+input[type="text"] { padding: 5px 12px; font-size: 14px; line-height: 20px; border: 1px solid var(--color-border-default); border-radius: 6px; outline: none; transition: border-color 0.2s, box-shadow 0.2s; }
 input[type="text"]:focus { border-color: var(--color-accent-fg); box-shadow: 0 0 0 3px rgba(9,105,218,0.3); }
-
-/* 表格 */
 .table-responsive { width: 100%; overflow-x: auto; background: var(--color-canvas-default); border-radius: 6px; border: 1px solid var(--color-border-default); }
 table { border-collapse: collapse; width: 100%; min-width: 900px; }
 th, td { border-bottom: 1px solid var(--color-border-muted); padding: 12px 16px; text-align: left; font-size: 14px; vertical-align: middle; }
@@ -306,20 +281,16 @@ tr:last-child td { border-bottom: none; }
 tr:hover { background-color: var(--color-canvas-subtle); }
 a { color: var(--color-accent-fg); text-decoration: none; }
 a:hover { text-decoration: underline; }
-
 details { cursor: pointer; color: var(--color-fg-default); font-weight: 600; user-select: none; outline: none; }
 details summary::-webkit-details-marker { display: none; }
 details summary { display: flex; align-items: center; }
 details summary::before { content: '▶'; font-size: 10px; margin-right: 8px; transition: transform 0.2s; }
 details[open] summary::before { transform: rotate(90deg); }
-
-/* 布局 */
 .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .btn-group button { margin: 0; }
 .input-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
 .input-row input[type="text"] { flex: 1; min-width: 200px; }
 .input-row button { margin: 0; }
-
 #mapContainer { display: none; margin-top: 24px; }
 #map { height: 500px; width: 100%; border-radius: 6px; border: 1px solid var(--color-border-default); }
 #msgModal { display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }
@@ -329,28 +300,16 @@ details[open] summary::before { transform: rotate(90deg); }
 .close-btn { cursor: pointer; color: var(--color-fg-muted); font-size: 20px; line-height: 1; }
 .close-btn:hover { color: var(--color-btn-danger-bg); }
 .modal-body { padding: 16px; line-height: 1.6; font-size: 14px; }
-
-#toast {
-    visibility: hidden; min-width: 250px; background-color: var(--color-fg-default); color: #fff;
-    text-align: center; border-radius: 6px; padding: 12px; position: fixed; z-index: 10000;
-    left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 14px; opacity: 0; transition: opacity 0.3s, bottom 0.3s;
-}
+#toast { visibility: hidden; min-width: 250px; background-color: var(--color-fg-default); color: #fff; text-align: center; border-radius: 6px; padding: 12px; position: fixed; z-index: 10000; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 14px; opacity: 0; transition: opacity 0.3s, bottom 0.3s; }
 #toast.show { visibility: visible; opacity: 1; bottom: 50px; }
-
-/* 移动端布局适配 */
 @media (max-width: 768px) {
     body { margin: 12px; }
     .input-row { flex-direction: column; align-items: stretch; }
     .input-row button { width: 100%; padding: 8px; margin-top: 4px; }
-    
-    /* 高频操作网格 */
     .quick-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
     .quick-actions button { width: 100%; padding: 8px 4px; text-align: center; }
-    
-    /* 高级菜单网格 */
     .btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .btn-group button { width: 100%; text-align: center; padding: 8px 4px; font-size: 13px;}
-    
     .hide-mobile { display: none !important; }
     button.btn-sm { display: block; width: 100%; margin-bottom: 6px; text-align: center; padding: 6px; }
 }
@@ -358,26 +317,22 @@ details[open] summary::before { transform: rotate(90deg); }
 </head>
 <body>
 <h2>📱 终端设备状态同步中心</h2>
-
 <div class="panel">
-    <!-- 核心高频交互 -->
     <div class="input-row">
         <input type="text" id="msgText" placeholder="输入要群发到所有手机屏幕上的文字...">
         <button class="btn-primary" onclick="sendScreenMsg('255.255.255.255')">发送群发提示</button>
     </div>
-    
-    <!-- 常用快捷操作 -->
     <div class="quick-actions">
         <button class="btn-primary" onclick="sendCmd('force_report')">全局同步状态</button>
         <button onclick="showServerMessages()">查看云端留言</button>
     </div>
-
-    <!-- 低频高级工具 (折叠) -->
     <details style="margin-top: 16px; border-top: 1px solid var(--color-border-muted); padding-top: 12px;">
         <summary>⚙️ 高级设置与系统工具</summary>
         <div class="btn-group" style="margin-top: 12px;">
             <button onclick="sendCmd('lock_chat')">🔒 锁定聊天</button>
             <button onclick="sendCmd('unlock_chat')">🔓 解锁聊天</button>
+            <button onclick="sendCmd('set_cloud_log', '1')">☁️ 开启云端日志</button>
+            <button onclick="sendCmd('set_cloud_log', '0')">☁️ 关闭云端日志</button>
             <button class="btn-danger" onclick="sendCmd('play_alarm')">全局测试音频</button>
             <button id="toggleMapBtn" onclick="toggleMap()">🗺️ 展开地图</button>
             <button onclick="sendCmd('clean_offline')">清理离线设备</button>
@@ -389,7 +344,6 @@ details[open] summary::before { transform: rotate(90deg); }
         </div>
     </details>
 </div>
-
 <div class="table-responsive">
     <table>
         <tr>
@@ -453,6 +407,8 @@ details[open] summary::before { transform: rotate(90deg); }
                     html += f"<button class='btn-sm' onclick=\"sendCmd('lock_chat', '', '{local_ip}')\">🔒 锁定</button>"
                     
                 html += f"<button class='btn-sm' onclick=\"showTrack('{dev_id}')\">轨迹</button>"
+                # 【新增】查看云端日志按钮
+                html += f"<button class='btn-sm' style='margin-top:6px;' onclick=\"showCloudLogs('{dev_id}')\">📄 日志</button>"
                 html += f"</td></tr>"
                 
             if not ALL_DEVICES_STATUS:
@@ -465,7 +421,7 @@ details[open] summary::before { transform: rotate(90deg); }
 <div id="msgModal">
     <div id="msgContent">
         <div class="modal-header">
-            <h3>📜 云端留言备份</h3>
+            <h3 id="modalTitle">📜 云端留言备份</h3>
             <span class="close-btn" onclick="document.getElementById('msgModal').style.display='none'">✖</span>
         </div>
         <div class="modal-body" id="msgList"></div>
@@ -477,6 +433,7 @@ var map = null;
 var markersLayer = null;
 var polyline = null;
 var isMapVisible = false;
+var allDevicesData = """ + json.dumps(ALL_DEVICES_STATUS) + """;
 
 function showToast(msg) {
     var toast = document.getElementById("toast");
@@ -488,14 +445,12 @@ function showToast(msg) {
 function toggleMap() {
     var container = document.getElementById('mapContainer');
     var btn = document.getElementById('toggleMapBtn');
-    
     if (isMapVisible) {
         container.style.display = 'none';
         btn.innerHTML = '🗺️ 展开地图';
     } else {
         container.style.display = 'block';
         btn.innerHTML = '⬆️ 收起地图';
-        
         if (!map) {
             map = L.map('map').setView([39.9, 116.4], 13);
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19}).addTo(map);
@@ -511,7 +466,6 @@ async function showTrack(devId) {
     const res = await fetch(`/api/history?device_id=${devId}`);
     const data = await res.json();
     if (data.length === 0) return showToast("暂无该设备的轨迹数据");
-    
     setTimeout(() => {
         markersLayer.clearLayers();
         if (polyline) map.removeLayer(polyline);
@@ -529,6 +483,22 @@ async function showTrack(devId) {
     }, 250);
 }
 
+// 【新增】查看云端日志
+function showCloudLogs(devId) {
+    var info = allDevicesData[devId];
+    var logs = info && info.cloud_logs ? info.cloud_logs : "该设备尚未上传日志。\\n请先在【高级设置】中开启「云端日志」，并在手机端等待下一次上报。";
+    var logTime = info && info.cloud_logs_time ? new Date(info.cloud_logs_time).toLocaleString() : "未知";
+    
+    document.getElementById('modalTitle').innerText = "📄 运行日志 - " + devId;
+    document.getElementById('msgList').innerHTML = `
+        <div style="color:#57606a; margin-bottom: 10px; font-size: 13px;">
+            最近快照时间: ${logTime}
+        </div>
+        <pre style="background: #f6f8fa; padding: 12px; border-radius: 6px; font-size: 12px; white-space: pre-wrap; border: 1px solid #d0d7de; color: #24292f; max-height: 400px; overflow-y: auto;">${logs}</pre>
+    `;
+    document.getElementById('msgModal').style.display = 'block';
+}
+
 async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
     try {
         const res = await fetch('/api/control', {
@@ -536,15 +506,10 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
             headers: {'Content-Type': 'application/json'}, 
             body: JSON.stringify({action: action, payload: payload, target_ip: target_ip})
         });
-        
         if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
         const text = await res.text();
         let data;
-        try {
-            data = JSON.parse(text);
-        } catch (e) {
-            throw new Error("服务器返回了无效的格式");
-        }
+        try { data = JSON.parse(text); } catch (e) { throw new Error("服务器返回了无效的格式"); }
 
         if(data.status === 'ok') {
             showToast("✅ 指令发送成功");
@@ -552,9 +517,7 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
         } else {
             showToast("❌ 失败: " + (data.msg || "未知错误"));
         }
-    } catch(e) { 
-        showToast("❌ 请求失败: " + e.message); 
-    }
+    } catch(e) { showToast("❌ 请求失败: " + e.message); }
 }
 
 async function sendScreenMsg(target_ip) {
@@ -575,7 +538,7 @@ async function showServerMessages() {
         const res = await fetch('/api/messages');
         const data = await res.json();
         const listDiv = document.getElementById('msgList');
-        
+        document.getElementById('modalTitle').innerText = "📜 云端留言备份";
         if(data.length === 0) {
             listDiv.innerHTML = "<p style='color:var(--color-fg-muted);'>服务器还没有记录哦~</p>";
         } else {
