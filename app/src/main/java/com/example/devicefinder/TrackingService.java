@@ -95,6 +95,7 @@ public class TrackingService extends Service implements LocationListener {
 
     private BroadcastReceiver batteryMonitor;
     
+    // 用于管理当前的悬浮窗（单条覆盖）
     private final List<android.view.View> activeBubbles = new ArrayList<>();
 
     @Override
@@ -206,7 +207,7 @@ public class TrackingService extends Service implements LocationListener {
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
                 FileLogger.log(this, "ALARM", "⏰ 定时上报闹钟被唤醒");
                 if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire();
-                // 【修复】去掉了这里的 reportCount++ 和 scheduleNextReport()，统一交由 sendReport 的 finally 处理
+                // 注意：scheduleNextReport 移到了 sendReport 的 finally 中，防止断档
                 sendReport(true, true);
                 handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             } else if ("ACTION_SECRET_UNLOCK".equals(action)) {
@@ -249,6 +250,11 @@ public class TrackingService extends Service implements LocationListener {
     private void setChatLocked(boolean locked) {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         sp.edit().putBoolean("chat_locked", locked).apply();
+    }
+
+    private boolean isCloudLogEnabled() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        return sp.getBoolean("enable_cloud_log", false);
     }
 
     private void saveMessageToHistory(String message) {
@@ -710,6 +716,7 @@ public class TrackingService extends Service implements LocationListener {
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         
         PendingIntent chatPi;
+        // 锁定状态下绝对不替换为 Activity 的 PendingIntent
         if (notificationClickCount >= 2 && !isChatLocked()) {
             Intent chatIntent = new Intent(this, ChatActivity.class);
             chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -902,6 +909,15 @@ public class TrackingService extends Service implements LocationListener {
                 if (loc != null) { locObj.put("latitude", loc.getLatitude()); locObj.put("longitude", loc.getLongitude()); locObj.put("accuracy", loc.getAccuracy()); locObj.put("provider", loc.getProvider()); locObj.put("time", loc.getTime()); }
                 else { locObj.put("latitude", JSONObject.NULL); locObj.put("longitude", JSONObject.NULL); locObj.put("accuracy", -1.0); locObj.put("provider", "none"); locObj.put("time", 0L); }
                 json.put("location", locObj);
+                
+                // 【新增】动态云端黑匣子打包
+                if (isCloudLogEnabled()) {
+                    String memoryLogs = FileLogger.getMemoryLogs();
+                    if (!memoryLogs.isEmpty()) {
+                        json.put("cloud_logs", memoryLogs);
+                    }
+                }
+
                 if (withNearbyWifi) {
                     try { List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(TrackingService.this); if (nearby != null && !nearby.isEmpty()) { JSONArray arr = new JSONArray(); for (JSONObject obj : nearby) arr.put(obj); json.put("nearby_wifi", arr); } } catch (Exception ignored) {}
                 }
@@ -923,7 +939,7 @@ public class TrackingService extends Service implements LocationListener {
                 if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); 
                 if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); 
                 
-                // 【补丁】无论网络成功还是超时，只要走完这一趟，立刻重新挂载下一次闹钟！
+                // 【修复】强制兜底，无论网络成败，必然挂起下一次闹钟，防止断联
                 if (overrideUrl == null) {
                     reportCount++;
                     scheduleNextReport();
@@ -985,8 +1001,7 @@ public class TrackingService extends Service implements LocationListener {
                 byte[] buf = payload.getBytes("UTF-8");
                 java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length, java.net.InetAddress.getByName("255.255.255.255"), 8888);
                 socket.send(packet); socket.close();
-                
-                // 本地存储和广播已在 ChatActivity 完成，这里仅发送 UDP
+                // 注意：本地存储和广播已在 ChatActivity 完成，这里仅发送 UDP
             } catch (Exception e) { Log.e("TrackingService", "UDP 发送失败: " + e.toString()); }
         }).start();
     }
@@ -1029,14 +1044,11 @@ public class TrackingService extends Service implements LocationListener {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
                             
-                            // 【修复】强制存储，绝对不能用 return 杀死线程
                             FileLogger.log(TrackingService.this, "CHAT", "收到并强制存储: [" + senderId + "] " + msgContent);
                             
                             String shortName = senderId;
                             if (shortName.contains("_")) { shortName = shortName.substring(0, shortName.lastIndexOf("_")); }
-                            if (senderId.equals(getUniqueDeviceId())) {
-                                shortName = "我";
-                            }
+                            if (senderId.equals(getUniqueDeviceId())) { shortName = "我"; }
 
                             saveChatToHistory("[" + shortName + "] " + msgContent);
                             
@@ -1053,6 +1065,14 @@ public class TrackingService extends Service implements LocationListener {
                             String newNum = parts[2].trim();
                             getSharedPreferences("device_finder_prefs", MODE_PRIVATE).edit().putString("emergency_sms_number", newNum).apply();
                             handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "紧急号码已更新: " + newNum, android.widget.Toast.LENGTH_LONG).show());
+                        }
+                    } else if (message.startsWith("FIND_ME_CLOUD_LOG:")) {
+                        String[] parts = message.split(":", 3);
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                            boolean enable = "1".equals(parts[2].trim());
+                            getSharedPreferences("device_finder_prefs", MODE_PRIVATE).edit().putBoolean("enable_cloud_log", enable).apply();
+                            String stateMsg = enable ? "☁️ 云端日志已开启" : "☁️ 云端日志已关闭";
+                            handler.post(() -> android.widget.Toast.makeText(TrackingService.this, stateMsg, android.widget.Toast.LENGTH_SHORT).show());
                         }
                     } else if (message.startsWith("FIND_ME_CHAT_TOGGLE:")) {
                         String[] parts = message.split(":", 2);
