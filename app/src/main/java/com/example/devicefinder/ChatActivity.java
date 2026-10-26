@@ -50,7 +50,6 @@ public class ChatActivity extends Activity {
 
         btnSend.setOnClickListener(v -> sendMessage());
 
-        // 监听键盘回车发送
         inputMsg.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_SEND || 
                (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
@@ -70,18 +69,27 @@ public class ChatActivity extends Activity {
     private void sendMessage() {
         String msg = inputMsg.getText().toString().trim();
         if (!msg.isEmpty()) {
+            // 【核心修复】先本地落盘并瞬间刷新，解决自己发消息延迟
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            String history = sp.getString("chat_history", "");
+            String timeStr = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(new java.util.Date());
+            String updatedHistory = timeStr + " | [我] " + msg + "\n" + history;
+            sp.edit().putString("chat_history", updatedHistory).apply();
+
+            inputMsg.setText("");
+            refreshHistory(); // 秒回显
+
+            // 再交给后台服务去发 UDP
             Intent intent = new Intent(this, TrackingService.class);
             intent.setAction("ACTION_SEND_UDP_CHAT");
             intent.putExtra("message", msg);
             startService(intent);
-            inputMsg.setText("");
-            refreshHistory();
         }
     }
 
     private void refreshHistory() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-        String history = sp.getString("chat_history", "暂无消息..."); // 读取独立的聊天记录
+        String history = sp.getString("chat_history", "暂无消息...");
         chatText.setText(history);
         chatText.setTextIsSelectable(true); 
         scrollView.post(() -> scrollView.fullScroll(ScrollView.FOCUS_DOWN));
