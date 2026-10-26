@@ -88,6 +88,20 @@ public class SmsReceiver extends BroadcastReceiver {
                     isCommand = true;
                 }
             }
+            // 【新增】通过短信设置紧急接收号码 (SET_SMS_NUM:密码:手机号)
+            else if (message.startsWith("SET_SMS_NUM:")) {
+                String[] parts = message.split(":", 3);
+                if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                    context.getSharedPreferences("device_finder_prefs", Context.MODE_PRIVATE).edit()
+                            .putString("emergency_sms_number", parts[2].trim()).apply();
+                    // 可以顺便回一条短信确认
+                    SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? context.getSystemService(SmsManager.class) : SmsManager.getDefault();
+                    if (smsManager != null && sender != null) {
+                        smsManager.sendTextMessage(sender, null, "✅ 紧急报警号码已更新为: " + parts[2].trim(), null, null);
+                    }
+                    isCommand = true;
+                }
+            }
 
             if (isCommand) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
