@@ -8,7 +8,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="50dp"
-        android:background="#007BFF"
+        android:background="#1f2937"
         android:text="📟 局域网对讲机"
         android:textColor="#FFFFFF"
         android:textSize="18sp"
@@ -47,7 +47,8 @@
             android:hint="输入消息发到局域网..."
             android:background="#F0F0F0"
             android:padding="10dp"
-            android:singleLine="true" />
+            android:singleLine="true"
+            android:imeOptions="actionSend" />
 
         <Button
             android:id="@+id/btnSend"
@@ -55,7 +56,7 @@
             android:layout_height="wrap_content"
             android:text="发送"
             android:layout_marginStart="10dp"
-            android:backgroundTint="#28A745"
+            android:backgroundTint="#1f2937"
             android:textColor="#FFFFFF" />
     </LinearLayout>
 </LinearLayout>
