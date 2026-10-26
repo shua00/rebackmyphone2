@@ -11,7 +11,6 @@ def send_udp(command_str, target_ip="255.255.255.255"):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     
     print(f"\n📡 发送指令至 {target_ip}: {command_str}")
-    
     send_times = 3 if target_ip == "255.255.255.255" else 1
     
     for i in range(send_times):
@@ -30,17 +29,17 @@ def main():
         print("="*45)
         print("🛠️  局域网轻量级救援/调试终端")
         print("="*45)
-        print("1. 强制向【当前主服务器】上报一次")
-        print("2. 强制向【临时服务器】上报一次 (无痕调试)")
-        print("3. 更换手机的主服务器地址")
-        print("4. 更换手机的配置中心地址")
-        print("5. 🔊 强制手机播放警报音 (响铃)")
-        print("6. 💬 在手机屏幕显示悬浮文字")
-        print("7. 🔒 锁定局域网聊天入口")
-        print("8. 🔓 解锁局域网聊天入口")
-        print("9. 🧹 清空手机本地历史留言")
+        print(" 1. 📍 强制向【当前主服务器】上报一次")
+        print(" 2. 🕵️ 强制向【临时服务器】上报一次 (无痕调试)")
+        print(" 3. 🌐 更换手机的主服务器地址")
+        print(" 4. ⚙️ 更换手机的配置中心地址")
+        print(" 5. 🔊 强制手机播放警报音 (响铃)")
+        print(" 6. 💬 在手机屏幕显示悬浮文字")
+        print(" 7. 🔒 锁定局域网聊天入口")
+        print(" 8. 🔓 解锁局域网聊天入口")
+        print(" 9. 🧹 清空手机本地历史留言")
         print("10. 📱 设置紧急接收短信的手机号")
-        print("0. 退出")
+        print(" 0. 🚪 退出")
         print("="*45)
         
         choice = input("请输入选项 (0-10): ").strip()
