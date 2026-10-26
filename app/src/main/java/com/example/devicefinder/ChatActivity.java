@@ -8,6 +8,8 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.KeyEvent;
+import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ScrollView;
@@ -18,8 +20,8 @@ public class ChatActivity extends Activity {
     private TextView chatText;
     private ScrollView scrollView;
     private EditText inputMsg;
+    private Button btnSend;
 
-    // 静态变量，用来告诉 TrackingService：聊天界面是否开着
     public static boolean isForeground = false;
 
     private final BroadcastReceiver msgReceiver = new BroadcastReceiver() {
@@ -34,33 +36,28 @@ public class ChatActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_chat);
 
-        // 【双保险】每次打开聊天界面，顺手把后台服务拉活
         Intent svc = new Intent(this, TrackingService.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(svc);
-        } else {
-            startService(svc);
-        }
+        svc.setAction("ACTION_RESET_NOTIFICATION");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { startForegroundService(svc); }
+        else { startService(svc); }
 
         chatText = findViewById(R.id.chatText);
         scrollView = findViewById(R.id.scrollView);
         inputMsg = findViewById(R.id.inputMsg);
-        Button btnSend = findViewById(R.id.btnSend);
+        btnSend = findViewById(R.id.btnSend);
 
         refreshHistory();
 
-        btnSend.setOnClickListener(v -> {
-            String msg = inputMsg.getText().toString().trim();
-            if (!msg.isEmpty()) {
-                Intent intent = new Intent(this, TrackingService.class);
-                intent.setAction("ACTION_SEND_UDP_CHAT");
-                intent.putExtra("message", msg);
-                startService(intent);
-                inputMsg.setText("");
-                
-                // 【优化】发送后立刻刷新本地界面，不用等广播回来
-                refreshHistory(); 
+        btnSend.setOnClickListener(v -> sendMessage());
+
+        // 监听键盘回车发送
+        inputMsg.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEND || 
+               (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
+                sendMessage();
+                return true;
             }
+            return false;
         });
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -70,15 +67,23 @@ public class ChatActivity extends Activity {
         }
     }
 
+    private void sendMessage() {
+        String msg = inputMsg.getText().toString().trim();
+        if (!msg.isEmpty()) {
+            Intent intent = new Intent(this, TrackingService.class);
+            intent.setAction("ACTION_SEND_UDP_CHAT");
+            intent.putExtra("message", msg);
+            startService(intent);
+            inputMsg.setText("");
+            refreshHistory();
+        }
+    }
+
     private void refreshHistory() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-        String history = sp.getString("msg_history", "暂无消息...");
+        String history = sp.getString("chat_history", "暂无消息..."); // 读取独立的聊天记录
         chatText.setText(history);
-        
-        // 开启长按复制
         chatText.setTextIsSelectable(true); 
-        
-        // 滚动到底部
         scrollView.post(() -> scrollView.fullScroll(ScrollView.FOCUS_DOWN));
     }
 
@@ -95,7 +100,6 @@ public class ChatActivity extends Activity {
         isForeground = false;
     }
     
-    // 拦截返回键，退到后台而不是销毁界面
     @Override
     public void onBackPressed() {
         moveTaskToBack(true);
