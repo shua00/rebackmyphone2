@@ -172,6 +172,8 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_ALARM:{RESCUE_SECRET}", target_ip)
                 elif action == "custom_msg": 
                     success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}", target_ip)
+                elif action == "chat_msg": # 【新增】发到对讲机
+                    success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:Web_Console:{payload}", target_ip)
                 elif action == "change_server": 
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clear_history": 
@@ -344,9 +346,14 @@ td button.btn-sm:nth-child(3n) {
 <body>
 <h2>📱 终端设备状态同步中心</h2>
 <div class="panel">
-    <div class="input-row">
+    <div class="input-row" style="margin-top: 0;">
         <input type="text" id="msgText" placeholder="输入要群发到所有手机屏幕上的文字...">
         <button class="btn-primary" onclick="sendScreenMsg('255.255.255.255')">发送群发提示</button>
+    </div>
+    <!-- 【新增】发送到对讲机 -->
+    <div class="input-row">
+        <input type="text" id="chatText" placeholder="输入要发到对讲机聊天室的文字...">
+        <button onclick="sendChatMsg('255.255.255.255')" style="color:#0969da; border-color:#0969da;">发送到对讲机</button>
     </div>
     <div class="quick-actions">
         <button class="btn-primary" onclick="sendCmd('force_report')">全局同步状态</button>
@@ -381,7 +388,7 @@ td button.btn-sm:nth-child(3n) {
             <th class="hide-mobile">定位时间</th>
             <th>收到时间</th>
             <th class="hide-mobile">周围热点</th>
-            <th style="min-width: 180px;">操作</th> <!-- 稍微加宽操作列防止挤压 -->
+            <th style="min-width: 180px;">操作</th>
         </tr>
 """
             for dev_id, info in list(ALL_DEVICES_STATUS.items()):
@@ -548,6 +555,14 @@ async function sendScreenMsg(target_ip) {
     let msg = document.getElementById('msgText').value;
     if(!msg) { showToast("请先在输入框输入文字！"); return; }
     await sendCmd('custom_msg', msg, target_ip);
+}
+
+// 【新增】发送到对讲机
+async function sendChatMsg(target_ip) {
+    let msg = document.getElementById('chatText').value;
+    if(!msg) { showToast("请先在输入框输入文字！"); return; }
+    await sendCmd('chat_msg', msg, target_ip);
+    document.getElementById('chatText').value = "";
 }
 
 async function sendSmsNum(target_ip) {
