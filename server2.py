@@ -52,7 +52,7 @@ def format_loc_time(ts_ms):
         elif seconds < 3600: ago = f"{seconds // 60}分钟前"
         elif seconds < 86400: ago = f"{seconds // 3600}小时前"
         else: ago = f"{seconds // 86400}天前"
-        return f"{dt.strftime('%m-%d %H:%M:%S')} <br><span style='font-size:11px;color:#9ca3af;'>{ago}</span>"
+        return f"{dt.strftime('%m-%d %H:%M:%S')} <br><span style='font-size:12px;color:#57606a;'>{ago}</span>"
     except: return "N/A"
 
 def get_local_ip():
@@ -167,28 +167,34 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clear_history": 
                     success = send_udp_broadcast(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", target_ip)
-                elif action == "lock_chat":  # 明确拆分
+                elif action == "lock_chat":
                     success = send_udp_broadcast(f"FIND_ME_CHAT_LOCK:{RESCUE_SECRET}", target_ip)
-                elif action == "unlock_chat": # 明确拆分
+                elif action == "unlock_chat":
                     success = send_udp_broadcast(f"FIND_ME_CHAT_UNLOCK:{RESCUE_SECRET}", target_ip)
+                elif action == "set_sms_num":
+                    success = send_udp_broadcast(f"FIND_ME_SET_SMS_NUM:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clean_offline":
-                    now_ts = int(datetime.datetime.now().timestamp() * 1000)
-                    to_delete = []
-                    for k, v in list(ALL_DEVICES_STATUS.items()):
-                        if now_ts - v.get('received_at', 0) > 3600000: 
-                            to_delete.append(k)
-                    for k in to_delete:
-                        if k in ALL_DEVICES_STATUS:
-                            del ALL_DEVICES_STATUS[k]
-                    with print_lock: print(f"\n已清理 {len(to_delete)} 台超时未上报的设备。")
-                    success = True
+                    try:
+                        now_ts = int(datetime.datetime.now().timestamp() * 1000)
+                        to_delete = []
+                        for k, v in list(ALL_DEVICES_STATUS.items()):
+                            if now_ts - v.get('received_at', 0) > 3600000: 
+                                to_delete.append(k)
+                        for k in to_delete:
+                            if k in ALL_DEVICES_STATUS:
+                                del ALL_DEVICES_STATUS[k]
+                        with print_lock: print(f"\n已清理 {len(to_delete)} 台超时未上报的设备。")
+                        success = True
+                    except Exception as clean_err:
+                        with print_lock: print(f"清理设备异常: {clean_err}")
+                        success = False
 
-                resp = json.dumps({"status": "ok" if success else "error"})
+                resp = json.dumps({"status": "ok" if success else "error", "msg": "指令执行失败" if not success else ""})
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
             except Exception as e: 
                 with print_lock: print(f"控制指令处理异常: {e}")
                 try:
-                    resp = json.dumps({"status": "error", "msg": str(e)})
+                    resp = json.dumps({"status": "error", "msg": f"服务器内部错误: {str(e)}"})
                     client_conn.sendall(f"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
                 except: pass
 
@@ -225,78 +231,165 @@ def handle_client(client_conn, client_addr):
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:20px;background:#f4f5f7;color:#333;}
-h2{font-size: 20px;font-weight: 600;margin-bottom: 20px;}
-.panel{background:#fff;padding:16px;border-radius:8px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1);border: 1px solid #e5e7eb;}
-
-/* 按钮全局样式 */
-button{padding:6px 14px;background:#fff;color:#374151;border:1px solid #d1d5db;border-radius:6px;cursor:pointer;font-size:14px;transition:all 0.2s;margin-bottom: 8px; margin-right: 8px;}
-button:hover{background:#f3f4f6;border-color:#9ca3af;}
-.btn-primary{background:#1f2937;color:#fff;border-color:#1f2937;}
-.btn-primary:hover{background:#111827;}
-.btn-danger{color:#ef4444;border-color:#fca5a5;}
-.btn-danger:hover{background:#fef2f2;border-color:#ef4444;}
-.btn-warning{color:#d97706;border-color:#fcd34d;}
-.btn-warning:hover{background:#fef3c7;border-color:#d97706;}
-
-/* 表格内小按钮（桌面端两两并排） */
-button.btn-sm {
-    padding: 5px 10px; 
-    font-size: 12px; 
-    margin-bottom: 6px; 
-    margin-right: 6px;
-    border-radius: 4px;
+/* GitHub 风格配色 */
+:root {
+    --color-canvas-default: #ffffff;
+    --color-canvas-subtle: #f6f8fa;
+    --color-border-default: #d0d7de;
+    --color-border-muted: #d8dee4;
+    --color-fg-default: #24292f;
+    --color-fg-muted: #57606a;
+    --color-accent-fg: #0969da;
+    --color-btn-bg: #f6f8fa;
+    --color-btn-border: rgba(27,31,36,0.15);
+    --color-btn-hover-bg: #f3f4f6;
+    --color-btn-primary-bg: #24292f;
+    --color-btn-primary-hover-bg: #1b1f24;
+    --color-btn-danger-bg: #cf222e;
 }
 
-input[type="text"]{padding:6px 12px;border:1px solid #d1d5db;border-radius:6px;margin-right:10px;width:300px;font-size:14px;}
-input[type="text"]:focus{outline:none;border-color:#1f2937;box-shadow:0 0 0 2px rgba(31,41,55,0.1);}
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    margin: 24px; 
+    background: var(--color-canvas-subtle); 
+    color: var(--color-fg-default);
+}
+h2 { font-size: 20px; font-weight: 600; margin-bottom: 20px; }
+.panel {
+    background: var(--color-canvas-default);
+    padding: 16px;
+    border-radius: 6px;
+    border: 1px solid var(--color-border-default);
+    margin-bottom: 24px;
+}
 
-.table-responsive{width:100%;overflow-x:auto;background:#fff;border-radius:8px;border: 1px solid #e5e7eb;}
-table{border-collapse:collapse;width:100%;min-width:900px;}
-th,td{border-bottom:1px solid #e5e7eb;padding:10px 12px;text-align:left;font-size:13px;vertical-align: middle;}
-th{background:#f9fafb;font-weight:600;color:#4b5563;white-space:nowrap;}
-tr:last-child td{border-bottom:none;}
-tr:hover{background:#f9fafb;}
-a{color:#3b82f6;text-decoration:none;}
+/* 按钮 */
+button {
+    padding: 5px 16px;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 20px;
+    white-space: nowrap;
+    cursor: pointer;
+    border-radius: 6px;
+    border: 1px solid var(--color-btn-border);
+    background-color: var(--color-btn-bg);
+    color: var(--color-fg-default);
+    transition: 0.2s;
+}
+button:hover { background-color: var(--color-btn-hover-bg); }
+.btn-primary { background-color: var(--color-btn-primary-bg); color: #fff; border-color: rgba(27,31,36,0.15); }
+.btn-primary:hover { background-color: var(--color-btn-primary-hover-bg); }
+.btn-danger { background-color: var(--color-canvas-default); color: var(--color-btn-danger-bg); border-color: var(--color-border-default); }
+.btn-danger:hover { background-color: var(--color-btn-danger-bg); color: #fff; border-color: var(--color-btn-danger-bg); }
+.btn-warning { background-color: var(--color-canvas-default); color: #9a6700; border-color: var(--color-border-default); }
+.btn-warning:hover { background-color: #9a6700; color: #fff; }
 
-details { cursor: pointer; color: #3b82f6; font-size: 13px;}
-ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
+button.btn-sm {
+    padding: 3px 12px; font-size: 12px; line-height: 18px;
+}
 
-#mapContainer { display: none; margin-top: 20px;}
-#map { height: 500px; width: 100%; border-radius: 8px; box-shadow:0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e5e7eb;}
-#msgModal { display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.4); backdrop-filter: blur(2px); }
-#msgContent { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #fff; padding: 24px; border-radius: 12px; width: 90%; max-width: 600px; max-height: 80%; overflow-y: auto; box-shadow: 0 10px 25px rgba(0,0,0,0.1); }
-.close-btn { float: right; cursor: pointer; font-weight: bold; color: #9ca3af; font-size: 20px; transition: color 0.2s;}
-.close-btn:hover { color: #ef4444; }
+/* 输入框 */
+input[type="text"] {
+    padding: 5px 12px; font-size: 14px; line-height: 20px;
+    border: 1px solid var(--color-border-default); border-radius: 6px;
+    outline: none; transition: border-color 0.2s, box-shadow 0.2s;
+}
+input[type="text"]:focus { border-color: var(--color-accent-fg); box-shadow: 0 0 0 3px rgba(9,105,218,0.3); }
 
-/* 移动端适配 */
+/* 表格 */
+.table-responsive { width: 100%; overflow-x: auto; background: var(--color-canvas-default); border-radius: 6px; border: 1px solid var(--color-border-default); }
+table { border-collapse: collapse; width: 100%; min-width: 900px; }
+th, td { border-bottom: 1px solid var(--color-border-muted); padding: 12px 16px; text-align: left; font-size: 14px; vertical-align: middle; }
+th { background-color: var(--color-canvas-subtle); font-weight: 600; color: var(--color-fg-default); }
+tr:last-child td { border-bottom: none; }
+tr:hover { background-color: var(--color-canvas-subtle); }
+a { color: var(--color-accent-fg); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+details { cursor: pointer; color: var(--color-fg-default); font-weight: 600; user-select: none; outline: none; }
+details summary::-webkit-details-marker { display: none; }
+details summary { display: flex; align-items: center; }
+details summary::before { content: '▶'; font-size: 10px; margin-right: 8px; transition: transform 0.2s; }
+details[open] summary::before { transform: rotate(90deg); }
+
+/* 布局 */
+.btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.btn-group button { margin: 0; }
+.input-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+.input-row input[type="text"] { flex: 1; min-width: 200px; }
+.input-row button { margin: 0; }
+
+#mapContainer { display: none; margin-top: 24px; }
+#map { height: 500px; width: 100%; border-radius: 6px; border: 1px solid var(--color-border-default); }
+#msgModal { display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }
+#msgContent { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--color-canvas-default); border-radius: 6px; border: 1px solid var(--color-border-default); width: 90%; max-width: 600px; max-height: 80%; overflow-y: auto; box-shadow: 0 8px 24px rgba(140,149,159,0.2); }
+.modal-header { padding: 16px; border-bottom: 1px solid var(--color-border-muted); display: flex; justify-content: space-between; align-items: center; }
+.modal-header h3 { margin: 0; font-size: 16px; font-weight: 600; }
+.close-btn { cursor: pointer; color: var(--color-fg-muted); font-size: 20px; line-height: 1; }
+.close-btn:hover { color: var(--color-btn-danger-bg); }
+.modal-body { padding: 16px; line-height: 1.6; font-size: 14px; }
+
+#toast {
+    visibility: hidden; min-width: 250px; background-color: var(--color-fg-default); color: #fff;
+    text-align: center; border-radius: 6px; padding: 12px; position: fixed; z-index: 10000;
+    left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 14px; opacity: 0; transition: opacity 0.3s, bottom 0.3s;
+}
+#toast.show { visibility: visible; opacity: 1; bottom: 50px; }
+
+/* 移动端布局适配 */
 @media (max-width: 768px) {
-    body { margin: 10px; }
-    .panel button { width: 100%; margin-right: 0; }
-    #toggleMapBtn { float: none !important; width: 100%; margin-top: 10px;}
-    input[type="text"] { width: 100%; box-sizing: border-box; margin-bottom: 10px; margin-right: 0;}
-    .hide-mobile { display: none !important; }
+    body { margin: 12px; }
+    .input-row { flex-direction: column; align-items: stretch; }
+    .input-row button { width: 100%; padding: 8px; margin-top: 4px; }
     
-    /* 手机端表格按钮占满整行 */
-    button.btn-sm { width: 100%; margin-right: 0; display: block; }
+    /* 高频操作网格 */
+    .quick-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+    .quick-actions button { width: 100%; padding: 8px 4px; text-align: center; }
+    
+    /* 高级菜单网格 */
+    .btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .btn-group button { width: 100%; text-align: center; padding: 8px 4px; font-size: 13px;}
+    
+    .hide-mobile { display: none !important; }
+    button.btn-sm { display: block; width: 100%; margin-bottom: 6px; text-align: center; padding: 6px; }
 }
 </style>
 </head>
 <body>
 <h2>📱 终端设备状态同步中心</h2>
+
 <div class="panel">
-    <button class="btn-primary" onclick="sendCmd('force_report')">全局同步状态</button>
-    <button class="btn-danger" onclick="sendCmd('play_alarm')">全局测试音频</button>
-    <button onclick="sendCmd('lock_chat')">🔒 全局锁定聊天</button>
-    <button onclick="sendCmd('unlock_chat')">🔓 全局解锁聊天</button>
-    <button onclick="sendCmd('clean_offline')">清理离线设备</button>
-    <button onclick="showServerMessages()">查看云端留言</button>
-    <button onclick="sendCmd('clear_history')">清空手机历史</button>
-    <button id="toggleMapBtn" onclick="toggleMap()" style="float:right; font-weight:600; margin-right:0;">🗺️ 展开地图</button>
-    <br><br>
-    <input type="text" id="msgText" placeholder="输入要群发到所有手机屏幕上的文字...">
-    <button class="btn-primary" onclick="sendScreenMsg('255.255.255.255')" style="margin-bottom:0;">发送群发提示</button>
+    <!-- 核心高频交互 -->
+    <div class="input-row">
+        <input type="text" id="msgText" placeholder="输入要群发到所有手机屏幕上的文字...">
+        <button class="btn-primary" onclick="sendScreenMsg('255.255.255.255')">发送群发提示</button>
+    </div>
+    
+    <!-- 常用快捷操作 -->
+    <div class="quick-actions">
+        <button class="btn-primary" onclick="sendCmd('force_report')">全局同步状态</button>
+        <button onclick="showServerMessages()">查看云端留言</button>
+    </div>
+
+    <!-- 低频高级工具 (折叠) -->
+    <details style="margin-top: 16px; border-top: 1px solid var(--color-border-muted); padding-top: 12px;">
+        <summary>⚙️ 高级设置与系统工具</summary>
+        <div class="btn-group" style="margin-top: 12px;">
+            <button onclick="sendCmd('lock_chat')">🔒 锁定聊天</button>
+            <button onclick="sendCmd('unlock_chat')">🔓 解锁聊天</button>
+            <button class="btn-danger" onclick="sendCmd('play_alarm')">全局测试音频</button>
+            <button id="toggleMapBtn" onclick="toggleMap()">🗺️ 展开地图</button>
+            <button onclick="sendCmd('clean_offline')">清理离线设备</button>
+            <button onclick="sendCmd('clear_history')">清空手机历史</button>
+        </div>
+        <div class="input-row" style="margin-top: 12px;">
+            <input type="text" id="smsNumText" placeholder="输入紧急接收短信的手机号...">
+            <button onclick="sendSmsNum('255.255.255.255')">📱 设置报警号码</button>
+        </div>
+    </details>
 </div>
+
 <div class="table-responsive">
     <table>
         <tr>
@@ -315,21 +408,20 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
                 os_ver = info.get('os_version', 'Unknown').replace("Android ", "A")
                 screen_on = "亮屏" if info.get('is_screen_on') else "息屏"
                 
-                # 获取并展示聊天锁状态
                 is_locked = info.get('chat_locked', False)
-                chat_lock_str = "<span style='color:#ef4444;'>🔒 已锁</span>" if is_locked else "<span style='color:#10b981;'>🔓 未锁</span>"
-                sys_status = f"{os_ver} <br><span style='font-size:11px;color:#9ca3af;'>{screen_on} | {chat_lock_str}</span>"
+                chat_lock_str = "<span style='color:#cf222e;'>🔒 已锁</span>" if is_locked else "<span style='color:#2da44e;'>🔓 未锁</span>"
+                sys_status = f"{os_ver} <br><span style='font-size:12px;color:var(--color-fg-muted);'>{screen_on} | {chat_lock_str}</span>"
                 
                 lat = info.get('location', {}).get('latitude')
                 lng = info.get('location', {}).get('longitude')
                 if lat is not None and lng is not None:
                     coord = f"<a href='https://uri.amap.com/marker?position={lng},{lat}' target='_blank'>{lat:.6f}, {lng:.6f}</a>"
                 else:
-                    coord = "<span style='color:#9ca3af;'>无定位</span>"
+                    coord = "<span style='color:var(--color-fg-muted);'>无定位</span>"
 
                 ssid = info.get('network', {}).get('wifi_ssid', '?')
                 local_ip = info.get('network', {}).get('local_ip', '0.0.0.0')
-                wifi_info = f"{ssid}<br><span style='font-size:11px;color:#9ca3af;'>{local_ip}</span>"
+                wifi_info = f"{ssid}<br><span style='font-size:12px;color:var(--color-fg-muted);'>{local_ip}</span>"
 
                 nearby = info.get('nearby_wifi', [])
                 ap_list_html = ""
@@ -339,7 +431,7 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
                         ap_list_html += f"<li>{ap.get('ssid')} ({ap.get('rssi')} dBm)</li>"
                     ap_list_html += "</ul></details>"
                 else:
-                    ap_list_html = "<span style='color:#9ca3af;'>0 个</span>"
+                    ap_list_html = "<span style='color:var(--color-fg-muted);'>0 个</span>"
 
                 html += f"<tr><td><b>{dev_id}</b></td>"
                 html += f"<td>{sys_status}</td>"
@@ -355,17 +447,16 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
                 html += f"<button class='btn-sm' onclick=\"sendScreenMsg('{local_ip}')\">提示</button>"
                 html += f"<button class='btn-sm btn-danger' onclick=\"sendCmd('play_alarm', '', '{local_ip}')\">响铃</button>"
                 
-                # 动态渲染锁定/解锁按钮
                 if is_locked:
                     html += f"<button class='btn-sm btn-warning' onclick=\"sendCmd('unlock_chat', '', '{local_ip}')\">🔓 解锁</button>"
                 else:
-                    html += f"<button class='btn-sm btn-primary' onclick=\"sendCmd('lock_chat', '', '{local_ip}')\">🔒 锁定</button>"
+                    html += f"<button class='btn-sm' onclick=\"sendCmd('lock_chat', '', '{local_ip}')\">🔒 锁定</button>"
                     
                 html += f"<button class='btn-sm' onclick=\"showTrack('{dev_id}')\">轨迹</button>"
                 html += f"</td></tr>"
                 
             if not ALL_DEVICES_STATUS:
-                html += "<tr><td colspan='9' align='center' style='padding:30px;color:#6b7280;'>暂无设备上报</td></tr>"
+                html += "<tr><td colspan='9' align='center' style='padding:40px;color:var(--color-fg-muted);'>暂无设备上报</td></tr>"
 
             html += """</table></div>
 <div id="mapContainer">
@@ -373,16 +464,26 @@ ul { margin: 5px 0 0 0; padding-left: 20px; font-size: 12px; color: #6b7280; }
 </div>
 <div id="msgModal">
     <div id="msgContent">
-        <span class="close-btn" onclick="document.getElementById('msgModal').style.display='none'">✖</span>
-        <h3 style="margin-top:0;font-size:18px;">📜 云端留言备份</h3>
-        <div id="msgList" style="margin-top: 15px; line-height: 1.6; font-size: 14px;"></div>
+        <div class="modal-header">
+            <h3>📜 云端留言备份</h3>
+            <span class="close-btn" onclick="document.getElementById('msgModal').style.display='none'">✖</span>
+        </div>
+        <div class="modal-body" id="msgList"></div>
     </div>
 </div>
+<div id="toast">提示信息</div>
 <script>
 var map = null;
 var markersLayer = null;
 var polyline = null;
 var isMapVisible = false;
+
+function showToast(msg) {
+    var toast = document.getElementById("toast");
+    toast.innerText = msg;
+    toast.className = "show";
+    setTimeout(function(){ toast.className = toast.className.replace("show", ""); }, 3000);
+}
 
 function toggleMap() {
     var container = document.getElementById('mapContainer');
@@ -407,16 +508,13 @@ function toggleMap() {
 
 async function showTrack(devId) {
     if (!isMapVisible) toggleMap();
-
     const res = await fetch(`/api/history?device_id=${devId}`);
     const data = await res.json();
-    
-    if (data.length === 0) return alert("暂无该设备的轨迹数据");
+    if (data.length === 0) return showToast("暂无该设备的轨迹数据");
     
     setTimeout(() => {
         markersLayer.clearLayers();
         if (polyline) map.removeLayer(polyline);
-        
         var latlngs = [];
         data.reverse().forEach((row, index) => {
             let lat = row[0], lng = row[1];
@@ -426,7 +524,7 @@ async function showTrack(devId) {
                 map.setView([lat, lng], 16);
             }
         });
-        polyline = L.polyline(latlngs, {color: '#1f2937', weight: 4}).addTo(map);
+        polyline = L.polyline(latlngs, {color: '#0969da', weight: 4}).addTo(map);
         map.invalidateSize();
     }, 250);
 }
@@ -438,23 +536,38 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
             headers: {'Content-Type': 'application/json'}, 
             body: JSON.stringify({action: action, payload: payload, target_ip: target_ip})
         });
-        const data = await res.json();
+        
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        const text = await res.text();
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch (e) {
+            throw new Error("服务器返回了无效的格式");
+        }
+
         if(data.status === 'ok') {
-            if(target_ip !== "255.255.255.255") console.log("已向设备 " + target_ip + " 发送指令！");
-            else alert("指令发送成功！");
-            
-            // 【核心】指令发送成功后，延迟1.5秒自动刷新页面获取最新状态
+            showToast("✅ 指令发送成功");
             setTimeout(() => location.reload(), 1500);
         } else {
-            alert("指令执行失败: " + (data.msg || "未知错误"));
+            showToast("❌ 失败: " + (data.msg || "未知错误"));
         }
-    } catch(e) { alert("请求失败，可能服务器未响应或网络断开。\\n错误信息: " + e); }
+    } catch(e) { 
+        showToast("❌ 请求失败: " + e.message); 
+    }
 }
 
 async function sendScreenMsg(target_ip) {
     let msg = document.getElementById('msgText').value;
-    if(!msg) { alert("请先在输入框输入文字！"); return; }
+    if(!msg) { showToast("请先在输入框输入文字！"); return; }
     await sendCmd('custom_msg', msg, target_ip);
+}
+
+async function sendSmsNum(target_ip) {
+    let num = document.getElementById('smsNumText').value.trim();
+    if(!num) { showToast("请先在输入框输入手机号！"); return; }
+    if(!/^1[3-9]\\d{9}$/.test(num)) { showToast("手机号格式好像不太对哦！"); return; }
+    await sendCmd('set_sms_num', num, target_ip);
 }
 
 async function showServerMessages() {
@@ -464,19 +577,19 @@ async function showServerMessages() {
         const listDiv = document.getElementById('msgList');
         
         if(data.length === 0) {
-            listDiv.innerHTML = "<p style='color:#6b7280;'>服务器还没有记录哦~</p>";
+            listDiv.innerHTML = "<p style='color:var(--color-fg-muted);'>服务器还没有记录哦~</p>";
         } else {
             let html = "";
             data.forEach(item => {
-                html += `<div style="border-bottom:1px solid #f3f4f6; padding:10px 0;">
-                            <div style="color:#9ca3af; font-size:12px; margin-bottom:4px;">[${item[1]}] - ${item[0]}</div>
-                            <div style="color:#1f2937;">${item[2]}</div>
+                html += `<div style="border-bottom:1px solid var(--color-border-muted); padding:12px 0;">
+                            <div style="color:var(--color-fg-muted); font-size:12px; margin-bottom:6px;">[${item[1]}] - ${item[0]}</div>
+                            <div>${item[2]}</div>
                          </div>`;
             });
             listDiv.innerHTML = html;
         }
         document.getElementById('msgModal').style.display = 'block';
-    } catch(e) { alert("拉取云端数据失败: " + e); }
+    } catch(e) { showToast("拉取云端数据失败: " + e.message); }
 }
 </script>
 </body></html>"""
