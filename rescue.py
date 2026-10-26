@@ -41,16 +41,17 @@ def main():
         print("10. 📱 设置紧急接收短信的手机号")
         print("11. ☁️ 开启云端日志（上传黑匣子到网页）")
         print("12. ☁️ 关闭云端日志")
+        print("13. 🗣️ 向对讲机聊天室发送消息")
         print(" 0. 🚪 退出")
         print("="*45)
         
-        choice = input("请输入选项 (0-12): ").strip()
+        choice = input("请输入选项 (0-13): ").strip()
         
         if choice == '0':
             print("👋 退出。")
             break
             
-        if choice not in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12']:
+        if choice not in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']:
             print("❌ 无效选项，请重新输入。\n")
             continue
 
@@ -92,10 +93,14 @@ def main():
             send_udp(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:1", target_ip)
         elif choice == '12':
             send_udp(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:0", target_ip)
+        elif choice == '13':
+            chat_text = input("请输入要发到对讲机聊天的文字: ").strip()
+            if chat_text:
+                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:PC_Terminal:{chat_text}", target_ip)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n👋 已手动中断退出。")
+        print("\n👋 手动中断退出。")
         sys.exit(0)
