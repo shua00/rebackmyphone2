@@ -80,6 +80,9 @@ public class TrackingService extends Service implements LocationListener {
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
+    // 【修复】防止并发重复上报的锁
+    private static final Object reportLock = new Object();
+
     private static long lastNotificationClickTime = 0;
     private static int notificationClickCount = 0;
 
@@ -435,7 +438,6 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
-    // 【悬浮窗：单条覆盖 + 壁纸化】
     private void showFloatingMessage(String message) {
         saveMessageToHistory(message);
         syncMessageToServer(message);
@@ -875,8 +877,14 @@ public class TrackingService extends Service implements LocationListener {
 
     private void sendReport(final boolean withNearbyWifi, boolean force, final String overrideUrl) {
         long currentTime = System.currentTimeMillis();
-        if (!force && currentTime - lastReportTime < 5000) return;
-        lastReportTime = currentTime;
+        
+        // 【修复】用锁防止并发重复上报
+        synchronized (reportLock) {
+            if (!force && currentTime - lastReportTime < 5000) return;
+            // 即使是强制上报，2秒内也只允许发一次，防止并发线程堆积
+            if (force && currentTime - lastReportTime < 2000) return; 
+            lastReportTime = currentTime;
+        }
 
         final String activeUrl = (overrideUrl != null && !overrideUrl.isEmpty()) ? overrideUrl : getCurrentServerUrl();
 
@@ -1088,7 +1096,7 @@ public class TrackingService extends Service implements LocationListener {
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
-        FileLogger.log(this, "SERVICE", "⚠️ 用户从最近任务划掉了应用，尝试自救...");
+        FileLogger.log(this, "SERVICE", "⚠️ 任务栈已清空(如退出聊天/侧滑)，触发兜底自救...");
         Intent restartServiceIntent = new Intent(getApplicationContext(), TrackingService.class);
         restartServiceIntent.setPackage(getPackageName());
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_ONE_SHOT;
