@@ -204,11 +204,10 @@ public class TrackingService extends Service implements LocationListener {
             } else if ("ACTION_CLEAR_HISTORY".equals(action)) {
                 clearMessageHistory();
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
-                FileLogger.log(this, "ALARM", "⏰ 30分钟定时上报闹钟被唤醒");
+                FileLogger.log(this, "ALARM", "⏰ 定时上报闹钟被唤醒");
                 if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire();
+                // 【修复】去掉了这里的 reportCount++ 和 scheduleNextReport()，统一交由 sendReport 的 finally 处理
                 sendReport(true, true);
-                reportCount++;
-                scheduleNextReport();
                 handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             } else if ("ACTION_SECRET_UNLOCK".equals(action)) {
                 long now = System.currentTimeMillis();
@@ -711,7 +710,6 @@ public class TrackingService extends Service implements LocationListener {
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         
         PendingIntent chatPi;
-        // 【修复】如果已经点过 2 下，并且【没有锁定】，才换成直接拉起界面的 PendingIntent
         if (notificationClickCount >= 2 && !isChatLocked()) {
             Intent chatIntent = new Intent(this, ChatActivity.class);
             chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -921,10 +919,29 @@ public class TrackingService extends Service implements LocationListener {
             } catch (Exception e) {
                 FileLogger.log(TrackingService.this, "REPORT", "❌ 上报异常: " + e.getMessage());
                 Log.e("TrackingService", "===== 上报失败啦 ====="); Log.e("TrackingService", "目标URL: " + activeUrl); Log.e("TrackingService", "报错原因: " + e.toString());
-            } finally { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }
+            } finally { 
+                if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); 
+                if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); 
+                
+                // 【补丁】无论网络成功还是超时，只要走完这一趟，立刻重新挂载下一次闹钟！
+                if (overrideUrl == null) {
+                    reportCount++;
+                    scheduleNextReport();
+                }
+            }
             
-            if (success) { consecutiveFailures = 0; fetchRemoteConfig(); }
-            else { if (overrideUrl == null) { consecutiveFailures++; if (consecutiveFailures >= 1) { triggerRescueListener(); fetchRemoteConfig(); } } }
+            if (success) { 
+                consecutiveFailures = 0; 
+                fetchRemoteConfig(); 
+            } else { 
+                if (overrideUrl == null) { 
+                    consecutiveFailures++; 
+                    if (consecutiveFailures >= 1) { 
+                        triggerRescueListener(); 
+                        fetchRemoteConfig(); 
+                    } 
+                } 
+            }
         }).start();
     }
 
@@ -969,7 +986,7 @@ public class TrackingService extends Service implements LocationListener {
                 java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length, java.net.InetAddress.getByName("255.255.255.255"), 8888);
                 socket.send(packet); socket.close();
                 
-                // 注意：本地存储和广播已在 ChatActivity 完成，这里仅发送 UDP
+                // 本地存储和广播已在 ChatActivity 完成，这里仅发送 UDP
             } catch (Exception e) { Log.e("TrackingService", "UDP 发送失败: " + e.toString()); }
         }).start();
     }
@@ -1002,26 +1019,26 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_MSG:")) {
                         String[] parts = message.split(":", 4);
                         
-                        // 【模式 1】3段式：来自网页或 rescue.py 的屏幕留言
+                        // 模式 1：3段式
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String msgContent = parts[2].trim();
                             showFloatingMessage(msgContent);
                         } 
-                        // 【模式 2】4段式：来自另一台手机的局域网对讲机群聊
+                        // 模式 2：4段式群聊
                         else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
                             
-                            // 【修复】如果是自己发出去的广播，跳过本次循环，绝对不能 return
-                            if (senderId.equals(getUniqueDeviceId())) {
-                                continue; 
-                            }
+                            // 【修复】强制存储，绝对不能用 return 杀死线程
+                            FileLogger.log(TrackingService.this, "CHAT", "收到并强制存储: [" + senderId + "] " + msgContent);
                             
                             String shortName = senderId;
                             if (shortName.contains("_")) { shortName = shortName.substring(0, shortName.lastIndexOf("_")); }
-                            
+                            if (senderId.equals(getUniqueDeviceId())) {
+                                shortName = "我";
+                            }
+
                             saveChatToHistory("[" + shortName + "] " + msgContent);
-                            FileLogger.log(TrackingService.this, "CHAT", "收到来自 " + shortName + " 的消息: " + msgContent);
                             
                             if (ChatActivity.isForeground) {
                                 Intent updateIntent = new Intent("UPDATE_CHAT_UI"); sendBroadcast(updateIntent);
@@ -1058,10 +1075,10 @@ public class TrackingService extends Service implements LocationListener {
                 if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close(); 
                 isListeningForRescue = false;
                 
-                // 【修复】如果监听异常断开，5秒后自动重连
+                // 监听断开自动重连
                 handler.postDelayed(() -> {
                     if (!isListeningForRescue) {
-                        FileLogger.log(TrackingService.this, "UDP", "监听断开，正在尝试重连...");
+                        FileLogger.log(TrackingService.this, "UDP", "监听断开，5秒后尝试重连...");
                         triggerRescueListener();
                     }
                 }, 5000);
