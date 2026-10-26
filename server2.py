@@ -311,6 +311,24 @@ details[open] summary::before { transform: rotate(90deg); }
 #toast { visibility: hidden; min-width: 250px; background-color: var(--color-fg-default); color: #fff; text-align: center; border-radius: 6px; padding: 12px; position: fixed; z-index: 10000; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 14px; opacity: 0; transition: opacity 0.3s, bottom 0.3s; }
 #toast.show { visibility: visible; opacity: 1; bottom: 50px; }
 
+/* 【全局生效】无论是 PC 还是手机，操作按钮都变成 3 + 3 网格 */
+td button.btn-sm {
+    display: inline-block;
+    width: 32%;
+    margin-bottom: 6px;
+    margin-right: 1.5%;
+    padding: 5px 0;
+    text-align: center;
+    box-sizing: border-box;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+/* 每一行的第三个按钮去掉右边距，完美对齐 */
+td button.btn-sm:nth-child(3n) {
+    margin-right: 0; 
+}
+
 @media (max-width: 768px) {
     body { margin: 12px; }
     .input-row { flex-direction: column; align-items: stretch; }
@@ -320,20 +338,6 @@ details[open] summary::before { transform: rotate(90deg); }
     .btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .btn-group button { width: 100%; text-align: center; padding: 8px 4px; font-size: 13px;}
     .hide-mobile { display: none !important; }
-    td button.btn-sm {
-        display: inline-block;
-        width: 32%;
-        margin-bottom: 6px;
-        margin-right: 1.5%;
-        padding: 6px 0;
-        text-align: center;
-        box-sizing: border-box;
-        font-size: 12px;
-        white-space: nowrap;
-    }
-    td button.btn-sm:nth-child(3n) {
-        margin-right: 0; 
-    }
 }
 </style>
 </head>
@@ -377,7 +381,7 @@ details[open] summary::before { transform: rotate(90deg); }
             <th class="hide-mobile">定位时间</th>
             <th>收到时间</th>
             <th class="hide-mobile">周围热点</th>
-            <th style="min-width: 160px;">操作</th>
+            <th style="min-width: 180px;">操作</th> <!-- 稍微加宽操作列防止挤压 -->
         </tr>
 """
             for dev_id, info in list(ALL_DEVICES_STATUS.items()):
