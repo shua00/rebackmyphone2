@@ -216,8 +216,9 @@ public class TrackingService extends Service implements LocationListener {
                 lastNotificationClickTime = now;
                 android.widget.Toast.makeText(this, "点击次数: " + notificationClickCount, android.widget.Toast.LENGTH_SHORT).show();
 
-                if (notificationClickCount == 2) { startForegroundNotification(); }
-                else if (notificationClickCount >= 3) {
+                if (notificationClickCount == 2) { 
+                    startForegroundNotification(); 
+                } else if (notificationClickCount >= 3) {
                     notificationClickCount = 0;
                     startForegroundNotification(); 
                     if (!isChatLocked()) {
@@ -256,7 +257,6 @@ public class TrackingService extends Service implements LocationListener {
 
     // ==================== 【数据分离存储】 ====================
     
-    // 留言（供网页、短信使用）
     private void saveMessageToHistory(String message) {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("msg_history", "");
@@ -273,7 +273,6 @@ public class TrackingService extends Service implements LocationListener {
         sp.edit().putString("msg_history", updatedHistory).apply();
     }
 
-    // 聊天记录（供对讲机使用）
     private void saveChatToHistory(String message) {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("chat_history", "");
@@ -719,11 +718,14 @@ public class TrackingService extends Service implements LocationListener {
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         
         PendingIntent chatPi;
-        if (notificationClickCount >= 2) {
+        
+        // 【核心修复】如果点了2下，并且没有被锁定，才换成拉起 Activity 的意图
+        if (notificationClickCount >= 2 && !isChatLocked()) {
             Intent chatIntent = new Intent(this, ChatActivity.class);
             chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
             chatPi = PendingIntent.getActivity(this, 888, chatIntent, piFlags);
         } else {
+            // 如果没点够，或者被锁定了，老老实实发回 Service 计数
             Intent unlockIntent = new Intent(this, TrackingService.class);
             unlockIntent.setAction("ACTION_SECRET_UNLOCK");
             chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
@@ -1005,15 +1007,28 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { playAlarm(); }
                     } else if (message.startsWith("FIND_ME_MSG:")) {
                         String[] parts = message.split(":", 4);
-                        if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
+                        
+                        // 【模式 1】3段式：来自网页或 rescue.py 的屏幕留言（存入 msg_history 并弹悬浮窗）
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                            String msgContent = parts[2].trim();
+                            showFloatingMessage(msgContent);
+                        } 
+                        // 【模式 2】4段式：来自另一台手机的局域网对讲机群聊（存入 chat_history，不弹悬浮窗）
+                        else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
-                            if (senderId.equals(getUniqueDeviceId())) { return; }
+                            
+                            // 如果是自己发出去的广播，直接忽略
+                            if (senderId.equals(getUniqueDeviceId())) {
+                                return;
+                            }
+                            
                             String shortName = senderId;
                             if (shortName.contains("_")) { shortName = shortName.substring(0, shortName.lastIndexOf("_")); }
                             
                             saveChatToHistory("[" + shortName + "] " + msgContent);
                             FileLogger.log(TrackingService.this, "CHAT", "收到来自 " + shortName + " 的消息: " + msgContent);
+                            
                             if (ChatActivity.isForeground) {
                                 Intent updateIntent = new Intent("UPDATE_CHAT_UI"); sendBroadcast(updateIntent);
                             }
