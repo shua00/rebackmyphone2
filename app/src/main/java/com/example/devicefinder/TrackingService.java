@@ -77,11 +77,9 @@ public class TrackingService extends Service implements LocationListener {
     private boolean enableMotionTrigger = true;
 
     private static long lastReportTime = 0;
+    private static final Object reportLock = new Object(); // 【新增】并发上报锁
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
-
-    // 【修复】防止并发重复上报的锁
-    private static final Object reportLock = new Object();
 
     private static long lastNotificationClickTime = 0;
     private static int notificationClickCount = 0;
@@ -97,7 +95,7 @@ public class TrackingService extends Service implements LocationListener {
 
     private BroadcastReceiver batteryMonitor;
     
-    // 【单条覆盖】用于管理当前的悬浮窗
+    // 用于管理当前的悬浮窗（单条覆盖）
     private final List<android.view.View> activeBubbles = new ArrayList<>();
 
     @Override
@@ -217,11 +215,9 @@ public class TrackingService extends Service implements LocationListener {
                 long now = System.currentTimeMillis();
                 if (now - lastNotificationClickTime > 3000) { notificationClickCount = 1; } else { notificationClickCount++; }
                 lastNotificationClickTime = now;
-                android.widget.Toast.makeText(this, "点击次数: " + notificationClickCount, android.widget.Toast.LENGTH_SHORT).show();
 
-                if (notificationClickCount == 2) { 
-                    startForegroundNotification(); 
-                } else if (notificationClickCount >= 3) {
+                if (notificationClickCount == 2) { startForegroundNotification(); }
+                else if (notificationClickCount >= 3) {
                     notificationClickCount = 0;
                     startForegroundNotification(); 
                     if (!isChatLocked()) {
@@ -229,7 +225,7 @@ public class TrackingService extends Service implements LocationListener {
                         chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                         try { startActivity(chatIntent); } catch (Exception ignored) {}
                     } else {
-                        android.widget.Toast.makeText(this, "服务已锁定", android.widget.Toast.LENGTH_SHORT).show();
+                        android.widget.Toast.makeText(this, "服务已锁定，无法进入", android.widget.Toast.LENGTH_SHORT).show();
                     }
                 }
             } else if ("ACTION_SEND_UDP_CHAT".equals(action)) {
@@ -247,7 +243,6 @@ public class TrackingService extends Service implements LocationListener {
         return START_STICKY;
     }
 
-    // ==================== 聊天锁定状态 ====================
     private boolean isChatLocked() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         return sp.getBoolean("chat_locked", false);
@@ -258,8 +253,6 @@ public class TrackingService extends Service implements LocationListener {
         sp.edit().putBoolean("chat_locked", locked).apply();
     }
 
-    // ==================== 【数据分离存储】 ====================
-    
     private void saveMessageToHistory(String message) {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("msg_history", "");
@@ -520,7 +513,6 @@ public class TrackingService extends Service implements LocationListener {
                         () -> { try { wm.removeView(layoutRef); } catch (Exception ignored) {} activeBubbles.remove(layoutRef); },
                         () -> { try { wm.removeView(layoutRef); } catch (Exception ignored) {} activeBubbles.remove(layoutRef); showMessageHistory(); });
 
-                // 24 小时常驻
                 handler.postDelayed(() -> {
                     try { wm.removeView(layoutRef); } catch (Exception ignored) {}
                     activeBubbles.remove(layoutRef);
@@ -720,14 +712,12 @@ public class TrackingService extends Service implements LocationListener {
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         
         PendingIntent chatPi;
-        
-        // 【核心修复】如果点了2下，并且没有被锁定，才换成拉起 Activity 的意图
+        // 【修复】如果已经点过 2 下，并且【没有锁定】，才换成直接拉起界面的 PendingIntent
         if (notificationClickCount >= 2 && !isChatLocked()) {
             Intent chatIntent = new Intent(this, ChatActivity.class);
             chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
             chatPi = PendingIntent.getActivity(this, 888, chatIntent, piFlags);
         } else {
-            // 如果没点够，或者被锁定了，老老实实发回 Service 计数
             Intent unlockIntent = new Intent(this, TrackingService.class);
             unlockIntent.setAction("ACTION_SECRET_UNLOCK");
             chatPi = PendingIntent.getService(this, 888, unlockIntent, piFlags);
@@ -881,7 +871,6 @@ public class TrackingService extends Service implements LocationListener {
         // 【修复】用锁防止并发重复上报
         synchronized (reportLock) {
             if (!force && currentTime - lastReportTime < 5000) return;
-            // 即使是强制上报，2秒内也只允许发一次，防止并发线程堆积
             if (force && currentTime - lastReportTime < 2000) return; 
             lastReportTime = currentTime;
         }
@@ -981,9 +970,11 @@ public class TrackingService extends Service implements LocationListener {
                 byte[] buf = payload.getBytes("UTF-8");
                 java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length, java.net.InetAddress.getByName("255.255.255.255"), 8888);
                 socket.send(packet); socket.close();
-                saveChatToHistory("[我] " + message);
-                FileLogger.log(TrackingService.this, "CHAT", "发送给局域网: " + message);
-                Intent updateIntent = new Intent("UPDATE_CHAT_UI"); sendBroadcast(updateIntent);
+                
+                // 【修改】由 ChatActivity 完成本地存储和刷新，这里只负责 UDP 发送
+                // saveChatToHistory("[我] " + message);
+                // Intent updateIntent = new Intent("UPDATE_CHAT_UI"); sendBroadcast(updateIntent);
+
             } catch (Exception e) { Log.e("TrackingService", "UDP 发送失败: " + e.toString()); }
         }).start();
     }
@@ -1016,12 +1007,12 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_MSG:")) {
                         String[] parts = message.split(":", 4);
                         
-                        // 【模式 1】3段式：来自网页或 rescue.py 的屏幕留言（存入 msg_history 并弹悬浮窗）
+                        // 【模式 1】3段式：来自网页或 rescue.py 的屏幕留言
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String msgContent = parts[2].trim();
                             showFloatingMessage(msgContent);
                         } 
-                        // 【模式 2】4段式：来自另一台手机的局域网对讲机群聊（存入 chat_history，不弹悬浮窗）
+                        // 【模式 2】4段式：来自另一台手机的局域网对讲机群聊
                         else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
