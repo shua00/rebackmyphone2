@@ -15,21 +15,45 @@
         android:gravity="center"
         android:textStyle="bold" />
 
-    <ScrollView
-        android:id="@+id/scrollView"
+    <!-- 用 RelativeLayout 包裹，为了放置悬浮标签 -->
+    <RelativeLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1"
-        android:padding="10dp">
+        android:layout_weight="1">
 
-        <TextView
-            android:id="@+id/chatText"
+        <ScrollView
+            android:id="@+id/scrollView"
             android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:padding="10dp">
+
+            <TextView
+                android:id="@+id/chatText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="16sp"
+                android:textColor="#333333"
+                android:lineSpacingExtra="8dp" />
+        </ScrollView>
+
+        <!-- 新消息悬浮标签 -->
+        <TextView
+            android:id="@+id/tvNewMsg"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:textSize="16sp"
-            android:textColor="#333333"
-            android:lineSpacingExtra="8dp" />
-    </ScrollView>
+            android:layout_alignParentBottom="true"
+            android:layout_centerHorizontal="true"
+            android:layout_marginBottom="16dp"
+            android:background="#E624292F"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
+            android:paddingTop="8dp"
+            android:paddingBottom="8dp"
+            android:text="↓ 新消息"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:visibility="gone" />
+    </RelativeLayout>
 
     <LinearLayout
         android:layout_width="match_parent"
