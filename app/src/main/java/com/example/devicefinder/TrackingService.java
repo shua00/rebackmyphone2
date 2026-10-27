@@ -84,7 +84,7 @@ public class TrackingService extends Service implements LocationListener {
     private static long lastNotificationClickTime = 0;
     private static int notificationClickCount = 0;
 
-    // 【新增】记录上次传感器触发的时间，防止频繁唤醒导致耗电
+    // 记录上次传感器触发的时间，防止频繁唤醒导致耗电
     private static long lastSensorTriggerTime = 0;
 
     // ⚠️【基础配置区】请按需修改
@@ -168,7 +168,6 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
-    // 【修复】带防抖冷却的运动传感器监听
     private final TriggerEventListener motionListener = new TriggerEventListener() {
         @Override
         public void onTrigger(TriggerEvent event) {
@@ -180,7 +179,6 @@ public class TrackingService extends Service implements LocationListener {
                 return; 
             }
             
-            // 记录本次触发时间
             lastSensorTriggerTime = now;
 
             FileLogger.log(TrackingService.this, "SENSOR", "检测到运动，触发强制上报");
@@ -924,7 +922,7 @@ public class TrackingService extends Service implements LocationListener {
                 else { locObj.put("latitude", JSONObject.NULL); locObj.put("longitude", JSONObject.NULL); locObj.put("accuracy", -1.0); locObj.put("provider", "none"); locObj.put("time", 0L); }
                 json.put("location", locObj);
                 
-                // 【新增】动态云端黑匣子打包
+                // 动态云端黑匣子打包
                 if (isCloudLogEnabled()) {
                     String memoryLogs = FileLogger.getMemoryLogs();
                     if (!memoryLogs.isEmpty()) {
@@ -953,7 +951,7 @@ public class TrackingService extends Service implements LocationListener {
                 if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); 
                 if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); 
                 
-                // 【修复】强制兜底，无论网络成败，必然挂起下一次闹钟，防止断联
+                // 强制兜底，无论网络成败，必然挂起下一次闹钟，防止断联
                 if (overrideUrl == null) {
                     reportCount++;
                     scheduleNextReport();
@@ -1058,13 +1056,16 @@ public class TrackingService extends Service implements LocationListener {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
                             
-                            FileLogger.log(TrackingService.this, "CHAT", "收到并强制存储: [" + senderId + "] " + msgContent);
+                            // 【核心修复】如果是自己发出的广播，直接跳过，防止消息重复存入两次！
+                            if (senderId.equals(getUniqueDeviceId())) {
+                                continue; 
+                            }
                             
                             String shortName = senderId;
                             if (shortName.contains("_")) { shortName = shortName.substring(0, shortName.lastIndexOf("_")); }
-                            if (senderId.equals(getUniqueDeviceId())) { shortName = "我"; }
-
+                            
                             saveChatToHistory("[" + shortName + "] " + msgContent);
+                            FileLogger.log(TrackingService.this, "CHAT", "收到来自 " + shortName + " 的消息: " + msgContent);
                             
                             if (ChatActivity.isForeground) {
                                 Intent updateIntent = new Intent("UPDATE_CHAT_UI"); sendBroadcast(updateIntent);
