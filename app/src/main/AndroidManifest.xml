@@ -115,7 +115,7 @@
         <!-- 桌面启动别名（用于隐藏图标） -->
         <activity-alias
             android:name=".VisibleAliasActivity"
-            android:enabled="false"
+            android:enabled="true"
             android:exported="true"
             android:targetActivity=".MainActivity">
             <intent-filter>
