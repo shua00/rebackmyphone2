@@ -21,6 +21,9 @@ ALL_DEVICES_STATUS = {}
 CHAT_MESSAGES = []
 print_lock = threading.Lock()
 
+# 【3连击去重】全局记录上一次收到的消息和时间
+LAST_MSG_INFO = {"key": "", "time": 0}
+
 def init_db():
     conn = sqlite3.connect('track_history.db')
     c = conn.cursor()
@@ -50,12 +53,27 @@ def udp_listener():
                     sender = parts[2]
                     content = parts[3]
                     
-                    if sender in ALL_DEVICES_STATUS:
+                    if sender not in ["Web_Console", "PC_Terminal"]:
+                        # 【3连击去重】拦截 3 秒内完全相同的重复包
+                        dedup_key = sender + ":" + content
+                        now_ts = time.time()
+                        if dedup_key == LAST_MSG_INFO["key"] and (now_ts - LAST_MSG_INFO["time"] < 3.0):
+                            continue 
+                        LAST_MSG_INFO["key"] = dedup_key
+                        LAST_MSG_INFO["time"] = now_ts
+
+                        if sender not in ALL_DEVICES_STATUS:
+                            ALL_DEVICES_STATUS[sender] = {
+                                "device_id": sender,
+                                "received_at": int(datetime.datetime.now().timestamp() * 1000),
+                                "network": {},
+                                "battery": {"level": "?"}
+                            }
+                        
                         if 'network' not in ALL_DEVICES_STATUS[sender]:
                             ALL_DEVICES_STATUS[sender]['network'] = {}
                         ALL_DEVICES_STATUS[sender]['network']['local_ip'] = source_ip
-                    
-                    if sender not in ["Web_Console", "PC_Terminal"]:
+                        
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         with print_lock:
                             print(f"\n🗣️ [对讲机] {sender} (来自IP: {source_ip}) 说: {content}")
@@ -98,7 +116,12 @@ def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         with print_lock: print(f"\n📡 [控制台] 发送至 {target_ip}: {command_str}")
-        sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
+        
+        # 【3连击去重】连发 3 次
+        for _ in range(3):
+            sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
+            time.sleep(0.05)
+            
         sock.close()
         return True
     except Exception as e: 
@@ -138,23 +161,6 @@ def handle_client(client_conn, client_addr):
                 if lat is not None and lng is not None:
                     save_history(dev_id, lat, lng, data["received_at"])
 
-                with print_lock:
-                    uptime_ms = data.get('uptime_ms', 0)
-                    uptime_hours = round(uptime_ms / (1000 * 60 * 60), 1) if uptime_ms else 0
-                    screen_on = "亮屏" if data.get('is_screen_on') else "息屏"
-                    os_ver = data.get('os_version', 'Unknown')
-                    chat_lock = "🔒 已锁" if data.get('chat_locked') else "🔓 未锁"
-                    loc_str = f"{lat:.6f}, {lng:.6f}" if lat is not None and lng is not None else "未获取"
-
-                    print("\n" + "="*50)
-                    print(f"收到上报 | 设备: {dev_id}")
-                    print(f"状态: {os_ver} | {screen_on} | {chat_lock} | 已开机 {uptime_hours} 小时")
-                    print(f"Wi-Fi: {data.get('network', {}).get('wifi_ssid')} (IP: {data.get('network', {}).get('local_ip')})")
-                    print(f"电量: {data.get('battery', {}).get('level')}%")
-                    print(f"定位: {loc_str}")
-                    if "cloud_logs" in data: print(f"📄 包含云端日志: {len(data['cloud_logs'])} 字符")
-                    print("="*50)
-
                 response_body = json.dumps({"status": "success", "config": GLOBAL_DEFAULT_CONFIG})
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}".encode('utf-8'))
             except Exception as e: 
@@ -178,10 +184,6 @@ def handle_client(client_conn, client_addr):
                 conn.commit()
                 conn.close()
 
-                with print_lock:
-                    print(f"\n💬 [收到留言备份] 设备: {dev_id} | 时间: {msg_time}")
-                    print(f"内容: {msg}")
-
                 client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n")
             except Exception as e:
                 with print_lock: print(f"留言处理异常: {e}")
@@ -198,7 +200,12 @@ def handle_client(client_conn, client_addr):
                 
                 def smart_send(cmd_prefix):
                     sent_any = False
-                    if target_ip == "255.255.255.255" or target_ip == "all":
+                    if isinstance(target_ip, list):
+                        for ip in target_ip:
+                            if ip and ip != '0.0.0.0':
+                                send_udp_broadcast(cmd_prefix, ip)
+                                sent_any = True
+                    elif target_ip == "all" or target_ip == "255.255.255.255":
                         for dev_id, info in ALL_DEVICES_STATUS.items():
                             ip = info.get('network', {}).get('local_ip')
                             if ip and ip != '0.0.0.0':
@@ -228,7 +235,7 @@ def handle_client(client_conn, client_addr):
                     success = smart_send(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}")
                 elif action == "clear_history": 
                     success = smart_send(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}")
-                elif action == "clear_chat": # 【新增】清空手机聊天记录
+                elif action == "clear_chat":
                     success = smart_send(f"FIND_ME_CLEAR_CHAT:{RESCUE_SECRET}")
                 elif action == "lock_chat":
                     success = smart_send(f"FIND_ME_CHAT_LOCK:{RESCUE_SECRET}")
@@ -248,19 +255,13 @@ def handle_client(client_conn, client_addr):
                         for k in to_delete:
                             if k in ALL_DEVICES_STATUS:
                                 del ALL_DEVICES_STATUS[k]
-                        with print_lock: print(f"\n已清理 {len(to_delete)} 台超时未上报的设备。")
                         success = True
-                    except Exception as clean_err:
-                        with print_lock: print(f"清理设备异常: {clean_err}")
+                    except: success = False
 
                 resp = json.dumps({"status": "ok" if success else "error", "msg": "指令执行失败" if not success else ""})
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
             except Exception as e: 
-                with print_lock: print(f"控制指令处理异常: {e}")
-                try:
-                    resp = json.dumps({"status": "error", "msg": f"服务器内部错误: {str(e)}"})
-                    client_conn.sendall(f"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-                except: pass
+                pass
 
         elif "GET /api/history" in request:
             try:
@@ -272,8 +273,7 @@ def handle_client(client_conn, client_addr):
                 conn.close()
                 resp = json.dumps(rows)
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except Exception as e:
-                with print_lock: print(f"获取历史轨迹异常: {e}")
+            except: pass
 
         elif "GET /api/messages" in request:
             try:
@@ -284,23 +284,26 @@ def handle_client(client_conn, client_addr):
                 conn.close()
                 resp = json.dumps(rows)
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except Exception as e:
-                with print_lock: print(f"获取留言异常: {e}")
+            except: pass
 
         elif "GET /api/chat_history" in request:
             try:
-                with print_lock:
-                    resp = json.dumps(CHAT_MESSAGES)
+                devices_list = []
+                for dev_id, info in ALL_DEVICES_STATUS.items():
+                    ip = info.get('network', {}).get('local_ip')
+                    if ip and ip != '0.0.0.0':
+                        devices_list.append({"id": dev_id, "ip": ip})
+
+                data_to_send = {
+                    "messages": CHAT_MESSAGES,
+                    "devices": devices_list
+                }
+                with print_lock: resp = json.dumps(data_to_send)
                 client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except Exception as e:
-                pass
+            except: pass
 
         elif "GET /" in request:
-            chat_options = '<option value="all">所有人 (群发)</option>'
-            for dev_id, info in ALL_DEVICES_STATUS.items():
-                ip = info.get('network', {}).get('local_ip', '')
-                if ip:
-                    chat_options += f'<option value="{ip}">{dev_id}</option>'
+            chat_options = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" checked><span>所有人 (群发)</span></label>'
 
             html = """<!DOCTYPE html>
 <html><head><meta charset='utf-8'>
@@ -310,86 +313,67 @@ def handle_client(client_conn, client_addr):
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 :root {
-    --color-canvas-default: #ffffff;
-    --color-canvas-subtle: #f6f8fa;
-    --color-border-default: #d0d7de;
-    --color-border-muted: #d8dee4;
-    --color-fg-default: #24292f;
-    --color-fg-muted: #57606a;
-    --color-accent-fg: #0969da;
-    --color-btn-bg: #f6f8fa;
-    --color-btn-border: rgba(27,31,36,0.15);
-    --color-btn-hover-bg: #f3f4f6;
-    --color-btn-primary-bg: #24292f;
-    --color-btn-primary-hover-bg: #1b1f24;
-    --color-btn-danger-bg: #cf222e;
+    --color-canvas-default: #ffffff; --color-canvas-subtle: #f6f8fa;
+    --color-border-default: #d0d7de; --color-border-muted: #d8dee4;
+    --color-fg-default: #24292f; --color-fg-muted: #57606a;
+    --color-accent-fg: #0969da; --color-btn-bg: #f6f8fa;
+    --color-btn-primary-bg: #24292f; --color-btn-primary-hover-bg: #1b1f24;
 }
 * { -webkit-tap-highlight-color: transparent !important; outline: none !important; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 24px; background: var(--color-canvas-subtle); color: var(--color-fg-default); }
 h2 { font-size: 20px; font-weight: 600; margin-bottom: 20px; }
 .panel { background: var(--color-canvas-default); padding: 16px; border-radius: 6px; border: 1px solid var(--color-border-default); margin-bottom: 24px; }
-button { padding: 5px 16px; font-size: 14px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; border-radius: 6px; border: 1px solid var(--color-btn-border); background-color: var(--color-btn-bg); color: var(--color-fg-default); transition: 0.2s; }
-button:hover { background-color: var(--color-btn-hover-bg); }
-.btn-primary { background-color: var(--color-btn-primary-bg); color: #fff; border-color: rgba(27,31,36,0.15); }
+button { padding: 5px 16px; font-size: 14px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; border-radius: 6px; border: 1px solid var(--color-border-default); background-color: var(--color-btn-bg); color: var(--color-fg-default); transition: 0.2s; }
+button:hover { background-color: var(--color-border-muted); }
+.btn-primary { background-color: var(--color-btn-primary-bg); color: #fff; border-color: var(--color-btn-primary-bg); }
 .btn-primary:hover { background-color: var(--color-btn-primary-hover-bg); }
-.btn-danger { background-color: var(--color-canvas-default); color: var(--color-btn-danger-bg); border-color: var(--color-border-default); }
-.btn-danger:hover { background-color: var(--color-btn-danger-bg); color: #fff; border-color: var(--color-btn-danger-bg); }
-.btn-warning { background-color: var(--color-canvas-default); color: #9a6700; border-color: var(--color-border-default); }
-.btn-warning:hover { background-color: #9a6700; color: #fff; }
+.btn-danger { background-color: #fff; color: #cf222e; border-color: var(--color-border-default); }
+.btn-danger:hover { background-color: #cf222e; color: #fff; border-color: #cf222e; }
 button.btn-sm { padding: 3px 12px; font-size: 12px; line-height: 18px; }
 input[type="text"] { padding: 5px 12px; font-size: 14px; line-height: 20px; border: 1px solid var(--color-border-default); border-radius: 6px; transition: border-color 0.2s, box-shadow 0.2s; }
 input[type="text"]:focus { border-color: var(--color-accent-fg); box-shadow: 0 0 0 3px rgba(9,105,218,0.3); }
 .table-responsive { width: 100%; overflow-x: auto; background: var(--color-canvas-default); border-radius: 6px; border: 1px solid var(--color-border-default); }
 table { border-collapse: collapse; width: 100%; min-width: 900px; }
 th, td { border-bottom: 1px solid var(--color-border-muted); padding: 12px 16px; text-align: left; font-size: 14px; vertical-align: middle; }
-th { background-color: var(--color-canvas-subtle); font-weight: 600; color: var(--color-fg-default); }
+th { background-color: var(--color-canvas-subtle); font-weight: 600; }
 tr:last-child td { border-bottom: none; }
 tr:hover { background-color: var(--color-canvas-subtle); }
 a { color: var(--color-accent-fg); text-decoration: none; }
-a:hover { text-decoration: underline; }
-details { cursor: pointer; color: var(--color-fg-default); font-weight: 600; user-select: none; }
+details { cursor: pointer; font-weight: 600; user-select: none; }
 details summary::-webkit-details-marker { display: none; }
-details summary { display: flex; align-items: center; user-select: none; }
+details summary { display: flex; align-items: center; }
 details summary::before { content: '▶'; font-size: 10px; margin-right: 8px; transition: transform 0.2s; }
 details[open] summary::before { transform: rotate(90deg); }
 .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-.btn-group button { margin: 0; }
 .input-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
 .input-row input[type="text"] { flex: 1; min-width: 200px; }
-.input-row button { margin: 0; }
 #mapContainer { display: none; margin-top: 24px; }
 #map { height: 500px; width: 100%; border-radius: 6px; border: 1px solid var(--color-border-default); }
 #msgModal { display: none; position: fixed; z-index: 9999; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }
-#msgContent { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--color-canvas-default); border-radius: 6px; border: 1px solid var(--color-border-default); width: 90%; max-width: 600px; max-height: 80%; overflow-y: auto; box-shadow: 0 8px 24px rgba(140,149,159,0.2); }
-.modal-header { padding: 16px; border-bottom: 1px solid var(--color-border-muted); display: flex; justify-content: space-between; align-items: center; }
-.modal-header h3 { margin: 0; font-size: 16px; font-weight: 600; }
-.close-btn { cursor: pointer; color: var(--color-fg-muted); font-size: 20px; line-height: 1; }
-.close-btn:hover { color: var(--color-btn-danger-bg); }
+#msgContent { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: var(--color-canvas-default); border-radius: 6px; border: 1px solid var(--color-border-default); width: 90%; max-width: 600px; max-height: 80%; overflow-y: auto; }
+.modal-header { padding: 16px; border-bottom: 1px solid var(--color-border-muted); display: flex; justify-content: space-between; }
 .modal-body { padding: 16px; line-height: 1.6; font-size: 14px; }
-#toast { visibility: hidden; min-width: 250px; background-color: var(--color-fg-default); color: #fff; text-align: center; border-radius: 6px; padding: 12px; position: fixed; z-index: 10000; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 14px; opacity: 0; transition: opacity 0.3s, bottom 0.3s; }
+#toast { visibility: hidden; min-width: 250px; background-color: #24292f; color: #fff; text-align: center; border-radius: 6px; padding: 12px; position: fixed; z-index: 10000; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 14px; opacity: 0; transition: 0.3s; }
 #toast.show { visibility: visible; opacity: 1; bottom: 50px; }
 
-td button.btn-sm {
-    display: inline-block;
-    width: 32%;
-    margin-bottom: 6px;
-    margin-right: 1.5%;
-    padding: 5px 0;
-    text-align: center;
-    box-sizing: border-box;
-    font-size: 12px;
-    white-space: nowrap;
-}
+td button.btn-sm { display: inline-block; width: 32%; margin-bottom: 6px; margin-right: 1.5%; padding: 5px 0; text-align: center; box-sizing: border-box; font-size: 12px; white-space: nowrap; }
 td button.btn-sm:nth-child(3n) { margin-right: 0; }
 
-#chatBox { display: none; margin-top: 24px; background: #fff; border-radius: 6px; border: 1px solid var(--color-border-default); flex-direction: column; height: 400px; }
+#chatBox { display: none; margin-top: 24px; background: #fff; border-radius: 6px; border: 1px solid var(--color-border-default); flex-direction: column; height: 450px; }
 #chatMessages { flex: 1; overflow-y: auto; padding: 16px; font-size: 14px; line-height: 1.5; }
 .chat-msg { margin-bottom: 8px; }
 .chat-time { color: #8c959f; font-size: 12px; margin-right: 8px; }
 .chat-sender { color: #0969da; font-weight: 600; margin-right: 8px; }
 .chat-content { background: #f0f3f6; padding: 6px 12px; border-radius: 6px; display: inline-block; word-break: break-all; }
-.chat-input-area { display: flex; padding: 12px; border-top: 1px solid var(--color-border-muted); background: #f6f8fa; gap: 8px; }
-select { padding: 8px; border-radius: 6px; border: 1px solid #d0d7de; outline: none; }
+.chat-input-area { display: flex; padding: 12px; border-top: 1px solid var(--color-border-muted); background: #f6f8fa; gap: 8px; flex-wrap: wrap; }
+.chat-input-area input { flex: 1; min-width: 200px; margin: 0; }
+.chat-input-area button { margin: 0; }
+
+.device-selector { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px; border-top: 1px solid var(--color-border-muted); background: #fff; }
+.device-tag { position: relative; cursor: pointer; }
+.device-tag input { position: absolute; opacity: 0; cursor: pointer; height: 0; width: 0; }
+.device-tag span { display: inline-block; padding: 4px 10px; font-size: 12px; border-radius: 20px; border: 1px solid var(--color-border-default); background: #fff; color: var(--color-fg-default); transition: 0.2s; user-select: none; }
+.device-tag input:checked ~ span { background: #24292f; color: #fff; border-color: #24292f; box-shadow: inset 0 1px 3px rgba(0,0,0,0.5); }
 
 @media (max-width: 768px) {
     body { margin: 12px; }
@@ -400,6 +384,7 @@ select { padding: 8px; border-radius: 6px; border: 1px solid #d0d7de; outline: n
     .btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .btn-group button { width: 100%; text-align: center; padding: 8px 4px; font-size: 13px;}
     .hide-mobile { display: none !important; }
+    .chat-input-area input { min-width: 100px; }
 }
 </style>
 </head>
@@ -436,10 +421,12 @@ select { padding: 8px; border-radius: 6px; border: 1px solid #d0d7de; outline: n
 </div>
 
 <div id="chatBox">
+    <div class="device-selector" id="deviceSelector">
+        """ + chat_options + """
+    </div>
     <div id="chatMessages"></div>
     <div class="chat-input-area">
-        <select id="chatTarget">""" + chat_options + """</select>
-        <input type="text" id="chatInput" placeholder="输入消息..." style="flex:1; margin:0;" onkeypress="handleChatEnter(event)">
+        <input type="text" id="chatInput" placeholder="输入消息..." onkeypress="handleChatEnter(event)">
         <button class="btn-primary" onclick="sendChat()">发送</button>
     </div>
 </div>
@@ -521,7 +508,7 @@ select { padding: 8px; border-radius: 6px; border: 1px solid #d0d7de; outline: n
     <div id="msgContent">
         <div class="modal-header">
             <h3 id="modalTitle">📜 云端留言备份</h3>
-            <span class="close-btn" onclick="document.getElementById('msgModal').style.display='none'">✖</span>
+            <span class="close-btn" style="cursor:pointer" onclick="document.getElementById('msgModal').style.display='none'">✖</span>
         </div>
         <div class="modal-body" id="msgList"></div>
     </div>
@@ -553,19 +540,25 @@ function toggleChatBox() {
     }
 }
 
-function handleChatEnter(e) {
-    if (e.key === 'Enter') sendChat();
-}
+function handleChatEnter(e) { if (e.key === 'Enter') sendChat(); }
 
 async function sendChat() {
     let msg = document.getElementById('chatInput').value.trim();
-    let target = document.getElementById('chatTarget').value;
     if(!msg) return;
+    
+    let selectedIps = [];
+    document.querySelectorAll('.target-cb:checked').forEach(cb => {
+        selectedIps.push(cb.value);
+    });
+    
+    if(selectedIps.length === 0) return showToast("请至少选择一个发送目标！");
+    let targetParam = selectedIps.includes("all") ? "all" : selectedIps;
+
     document.getElementById('chatInput').value = "";
     await fetch('/api/control', {
         method: 'POST', 
         headers: {'Content-Type': 'application/json'}, 
-        body: JSON.stringify({action: 'chat_msg', payload: msg, target_ip: target})
+        body: JSON.stringify({action: 'chat_msg', payload: msg, target_ip: targetParam})
     });
     setTimeout(fetchChatHistory, 300);
 }
@@ -575,10 +568,10 @@ async function fetchChatHistory() {
     try {
         const res = await fetch('/api/chat_history');
         const data = await res.json();
-        const chatDiv = document.getElementById('chatMessages');
         
+        const chatDiv = document.getElementById('chatMessages');
         let html = "";
-        data.forEach(item => {
+        data.messages.forEach(item => {
             let senderColor = item.sender.includes("Web_Console") ? "#cf222e" : "#0969da";
             html += `<div class="chat-msg">
                 <span class="chat-time">${item.time}</span>
@@ -586,11 +579,26 @@ async function fetchChatHistory() {
                 <span class="chat-content">${item.content}</span>
             </div>`;
         });
-        
         if (chatDiv.innerHTML !== html) {
             chatDiv.innerHTML = html;
             chatDiv.scrollTop = chatDiv.scrollHeight;
         }
+
+        const selectorDiv = document.getElementById('deviceSelector');
+        let currentChecked = [];
+        document.querySelectorAll('.target-cb:checked').forEach(cb => currentChecked.push(cb.value));
+        
+        let tagHtml = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" ' + (currentChecked.includes('all') || currentChecked.length === 0 ? 'checked' : '') + '><span>所有人 (群发)</span></label>';
+        
+        data.devices.forEach(dev => {
+            let isChecked = currentChecked.includes(dev.ip) ? 'checked' : '';
+            tagHtml += `<label class="device-tag"><input type="checkbox" class="target-cb" value="${dev.ip}" ${isChecked}><span>${dev.id}</span></label>`;
+        });
+        
+        if (selectorDiv.innerHTML !== tagHtml) {
+            selectorDiv.innerHTML = tagHtml;
+        }
+
     } catch(e) {}
     if (isChatVisible) setTimeout(fetchChatHistory, 2000);
 }
@@ -660,14 +668,11 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
         });
         if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
         const text = await res.text();
-        let data;
-        try { data = JSON.parse(text); } catch (e) { throw new Error("服务器返回了无效的格式"); }
+        let data = JSON.parse(text);
 
         if(data.status === 'ok') {
             showToast("✅ 指令发送成功");
-            if (action !== "chat_msg") {
-                setTimeout(() => location.reload(), 1500);
-            }
+            if (action !== "chat_msg") setTimeout(() => location.reload(), 1500);
         } else {
             showToast("❌ 失败: " + (data.msg || "未知错误"));
         }
@@ -683,7 +688,6 @@ async function sendScreenMsg(target_ip) {
 async function sendSmsNum(target_ip) {
     let num = document.getElementById('smsNumText').value.trim();
     if(!num) { showToast("请先在输入框输入手机号！"); return; }
-    if(!/^1[3-9]\\d{9}$/.test(num)) { showToast("手机号格式好像不太对哦！"); return; }
     await sendCmd('set_sms_num', num, target_ip);
 }
 
