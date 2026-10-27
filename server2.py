@@ -24,6 +24,7 @@ print_lock = threading.Lock()
 # 【3连击去重】全局记录上一次收到的消息和时间
 LAST_MSG_INFO = {"key": "", "time": 0}
 
+
 def init_db():
     conn = sqlite3.connect('track_history.db')
     c = conn.cursor()
@@ -34,7 +35,9 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 def udp_listener():
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -46,19 +49,19 @@ def udp_listener():
             data, addr = udp_sock.recvfrom(1024)
             msg = data.decode('utf-8', errors='ignore')
             source_ip = addr[0]
-            
+
             if msg.startswith("FIND_ME_MSG:"):
                 parts = msg.split(":", 4)
                 if len(parts) == 4 and parts[1] == RESCUE_SECRET:
                     sender = parts[2]
                     content = parts[3]
-                    
+
                     if sender not in ["Web_Console", "PC_Terminal"]:
                         # 【3连击去重】拦截 3 秒内完全相同的重复包
                         dedup_key = sender + ":" + content
                         now_ts = time.time()
                         if dedup_key == LAST_MSG_INFO["key"] and (now_ts - LAST_MSG_INFO["time"] < 3.0):
-                            continue 
+                            continue
                         LAST_MSG_INFO["key"] = dedup_key
                         LAST_MSG_INFO["time"] = now_ts
 
@@ -69,70 +72,100 @@ def udp_listener():
                                 "network": {},
                                 "battery": {"level": "?"}
                             }
-                        
+
                         if 'network' not in ALL_DEVICES_STATUS[sender]:
                             ALL_DEVICES_STATUS[sender]['network'] = {}
                         ALL_DEVICES_STATUS[sender]['network']['local_ip'] = source_ip
-                        
+
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         with print_lock:
                             print(f"\n🗣️ [对讲机] {sender} (来自IP: {source_ip}) 说: {content}")
                             CHAT_MESSAGES.append({"time": ts, "sender": sender, "content": content})
-                            if len(CHAT_MESSAGES) > 100: CHAT_MESSAGES.pop(0)
+                            if len(CHAT_MESSAGES) > 100:
+                                CHAT_MESSAGES.pop(0)
+    except OSError as e:
+        # errno 98 = Linux EADDRINUSE，10048 = Windows WSAEADDRINUSE
+        if e.errno in (98, 10048) or "Address already in use" in str(e):
+            print("❌ UDP 8888 被占用（可能 chat.py 正在运行）。")
+            print("   server2.py 的 Web 面板仍可用，但无法接收手机对讲机消息。")
+            print("   请关闭 chat.py 后重启 server2.py；或将 chat.py 升级为「代理模式」版本，二者即可共存。")
+        else:
+            print(f"❌ UDP 监听绑定失败: {e}")
     except Exception as e:
         print(f"❌ UDP 监听绑定失败: {e}")
 
+
 def save_history(dev_id, lat, lng, ts):
-    if lat is None or lng is None: return
+    if lat is None or lng is None:
+        return
     try:
         conn = sqlite3.connect('track_history.db')
         c = conn.cursor()
         c.execute("INSERT INTO history VALUES (?, ?, ?, ?)", (dev_id, lat, lng, ts))
         conn.commit()
         conn.close()
-    except: pass
+    except Exception:
+        pass
+
 
 def format_loc_time(ts_ms):
-    if not ts_ms: return "N/A"
+    if not ts_ms:
+        return "N/A"
     try:
         dt = datetime.datetime.fromtimestamp(ts_ms / 1000.0)
         seconds = int((datetime.datetime.now() - dt).total_seconds())
-        if seconds < 0: ago = "刚刚"
-        elif seconds < 60: ago = f"{seconds}秒前"
-        elif seconds < 3600: ago = f"{seconds // 60}分钟前"
-        elif seconds < 86400: ago = f"{seconds // 3600}小时前"
-        else: ago = f"{seconds // 86400}天前"
+        if seconds < 0:
+            ago = "刚刚"
+        elif seconds < 60:
+            ago = f"{seconds}秒前"
+        elif seconds < 3600:
+            ago = f"{seconds // 60}分钟前"
+        elif seconds < 86400:
+            ago = f"{seconds // 3600}小时前"
+        else:
+            ago = f"{seconds // 86400}天前"
         return f"{dt.strftime('%m-%d %H:%M:%S')} <br><span style='font-size:12px;color:#57606a;'>{ago}</span>"
-    except: return "N/A"
+    except Exception:
+        return "N/A"
+
 
 def get_local_ip():
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]; s.close(); return ip
-    except: return "127.0.0.1"
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
 
 def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        with print_lock: print(f"\n📡 [控制台] 发送至 {target_ip}: {command_str}")
-        
+        with print_lock:
+            print(f"\n📡 [控制台] 发送至 {target_ip}: {command_str}")
+
         # 【3连击去重】连发 3 次
         for _ in range(3):
             sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
             time.sleep(0.05)
-            
+
         sock.close()
         return True
-    except Exception as e: 
-        with print_lock: print(f"发送失败: {e}")
+    except Exception as e:
+        with print_lock:
+            print(f"发送失败: {e}")
         return False
+
 
 def handle_client(client_conn, client_addr):
     try:
         client_conn.settimeout(5.0)
         request = client_conn.recv(16384).decode('utf-8', errors='ignore')
-        if not request: return
+        if not request:
+            return
 
         if request.startswith("OPTIONS"):
             client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\n\r\n")
@@ -143,14 +176,21 @@ def handle_client(client_conn, client_addr):
                 body = request.split("\r\n\r\n", 1)[1]
                 data = json.loads(body)
                 if data.get("token") != AUTH_TOKEN:
-                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n"); return
+                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                    return
+
                 dev_id = data.get("device_id", "unknown_device")
                 data["received_at"] = int(datetime.datetime.now().timestamp() * 1000)
-                
+
+                # 【修复 KeyError】先确保设备条目存在，再合并 cloud_logs
+                if dev_id not in ALL_DEVICES_STATUS:
+                    ALL_DEVICES_STATUS[dev_id] = {}
+
                 if "cloud_logs" in data:
                     ALL_DEVICES_STATUS[dev_id]["cloud_logs"] = data["cloud_logs"]
                     ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"] = data["received_at"]
-                elif dev_id in ALL_DEVICES_STATUS and "cloud_logs" in ALL_DEVICES_STATUS[dev_id]:
+                elif "cloud_logs" in ALL_DEVICES_STATUS[dev_id]:
+                    # 本次没带日志，沿用上一次的，避免面板日志闪没
                     data["cloud_logs"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs"]
                     data["cloud_logs_time"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"]
 
@@ -162,22 +202,25 @@ def handle_client(client_conn, client_addr):
                     save_history(dev_id, lat, lng, data["received_at"])
 
                 response_body = json.dumps({"status": "success", "config": GLOBAL_DEFAULT_CONFIG})
-                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}".encode('utf-8'))
-            except Exception as e: 
-                with print_lock: print(f"解析异常: {e}")
-                
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}".encode('utf-8'))
+            except Exception as e:
+                with print_lock:
+                    print(f"解析异常: {e}")
+
         elif "POST /api/message" in request:
             try:
                 body = request.split("\r\n\r\n", 1)[1]
                 data = json.loads(body)
                 if data.get("token") != AUTH_TOKEN:
-                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n"); return
-                
+                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                    return
+
                 dev_id = data.get("device_id", "unknown")
                 msg_time = data.get("time_str", "")
                 msg = data.get("message", "")
                 ts = data.get("timestamp", 0)
-                
+
                 conn = sqlite3.connect('track_history.db')
                 c = conn.cursor()
                 c.execute("INSERT INTO messages VALUES (?, ?, ?, ?)", (dev_id, msg_time, msg, ts))
@@ -186,7 +229,8 @@ def handle_client(client_conn, client_addr):
 
                 client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n")
             except Exception as e:
-                with print_lock: print(f"留言处理异常: {e}")
+                with print_lock:
+                    print(f"留言处理异常: {e}")
 
         elif "POST /api/control" in request:
             try:
@@ -195,9 +239,9 @@ def handle_client(client_conn, client_addr):
                 action = cmd_data.get("action")
                 payload = cmd_data.get("payload", "")
                 target_ip = cmd_data.get("target_ip", "255.255.255.255")
-                
+
                 success = False
-                
+
                 def smart_send(cmd_prefix):
                     sent_any = False
                     if isinstance(target_ip, list):
@@ -206,7 +250,8 @@ def handle_client(client_conn, client_addr):
                                 send_udp_broadcast(cmd_prefix, ip)
                                 sent_any = True
                     elif target_ip == "all" or target_ip == "255.255.255.255":
-                        for dev_id, info in ALL_DEVICES_STATUS.items():
+                        # 用 list() 快照，避免 UDP 线程并发修改 dict 时抛 RuntimeError
+                        for dev_id, info in list(ALL_DEVICES_STATUS.items()):
                             ip = info.get('network', {}).get('local_ip')
                             if ip and ip != '0.0.0.0':
                                 send_udp_broadcast(cmd_prefix, ip)
@@ -218,22 +263,23 @@ def handle_client(client_conn, client_addr):
                         sent_any = True
                     return sent_any
 
-                if action == "force_report": 
+                if action == "force_report":
                     success = smart_send(f"FIND_ME_REPORT:{RESCUE_SECRET}")
-                elif action == "play_alarm": 
+                elif action == "play_alarm":
                     success = smart_send(f"FIND_ME_ALARM:{RESCUE_SECRET}")
-                elif action == "custom_msg": 
+                elif action == "custom_msg":
                     success = smart_send(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}")
-                elif action == "chat_msg": 
+                elif action == "chat_msg":
                     success = smart_send(f"FIND_ME_MSG:{RESCUE_SECRET}:Web_Console:{payload}")
                     if success:
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         with print_lock:
                             CHAT_MESSAGES.append({"time": ts, "sender": "Web_Console", "content": payload})
-                            if len(CHAT_MESSAGES) > 100: CHAT_MESSAGES.pop(0)
-                elif action == "change_server": 
+                            if len(CHAT_MESSAGES) > 100:
+                                CHAT_MESSAGES.pop(0)
+                elif action == "change_server":
                     success = smart_send(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}")
-                elif action == "clear_history": 
+                elif action == "clear_history":
                     success = smart_send(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}")
                 elif action == "clear_chat":
                     success = smart_send(f"FIND_ME_CLEAR_CHAT:{RESCUE_SECRET}")
@@ -250,17 +296,19 @@ def handle_client(client_conn, client_addr):
                         now_ts = int(datetime.datetime.now().timestamp() * 1000)
                         to_delete = []
                         for k, v in list(ALL_DEVICES_STATUS.items()):
-                            if now_ts - v.get('received_at', 0) > 3600000: 
+                            if now_ts - v.get('received_at', 0) > 3600000:
                                 to_delete.append(k)
                         for k in to_delete:
                             if k in ALL_DEVICES_STATUS:
                                 del ALL_DEVICES_STATUS[k]
                         success = True
-                    except: success = False
+                    except Exception:
+                        success = False
 
                 resp = json.dumps({"status": "ok" if success else "error", "msg": "指令执行失败" if not success else ""})
-                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except Exception as e: 
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+            except Exception:
                 pass
 
         elif "GET /api/history" in request:
@@ -272,8 +320,10 @@ def handle_client(client_conn, client_addr):
                 rows = c.fetchall()
                 conn.close()
                 resp = json.dumps(rows)
-                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except: pass
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+            except Exception:
+                pass
 
         elif "GET /api/messages" in request:
             try:
@@ -283,13 +333,15 @@ def handle_client(client_conn, client_addr):
                 rows = c.fetchall()
                 conn.close()
                 resp = json.dumps(rows)
-                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except: pass
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+            except Exception:
+                pass
 
         elif "GET /api/chat_history" in request:
             try:
                 devices_list = []
-                for dev_id, info in ALL_DEVICES_STATUS.items():
+                for dev_id, info in list(ALL_DEVICES_STATUS.items()):
                     ip = info.get('network', {}).get('local_ip')
                     if ip and ip != '0.0.0.0':
                         devices_list.append({"id": dev_id, "ip": ip})
@@ -298,9 +350,12 @@ def handle_client(client_conn, client_addr):
                     "messages": CHAT_MESSAGES,
                     "devices": devices_list
                 }
-                with print_lock: resp = json.dumps(data_to_send)
-                client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except: pass
+                with print_lock:
+                    resp = json.dumps(data_to_send)
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+            except Exception:
+                pass
 
         elif "GET /" in request:
             chat_options = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" checked><span>所有人 (群发)</span></label>'
@@ -448,11 +503,11 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
             for dev_id, info in list(ALL_DEVICES_STATUS.items()):
                 os_ver = info.get('os_version', 'Unknown').replace("Android ", "A")
                 screen_on = "亮屏" if info.get('is_screen_on') else "息屏"
-                
+
                 is_locked = info.get('chat_locked', False)
                 chat_lock_str = "<span style='color:#cf222e;'>🔒 已锁</span>" if is_locked else "<span style='color:#2da44e;'>🔓 未锁</span>"
                 sys_status = f"{os_ver} <br><span style='font-size:12px;color:var(--color-fg-muted);'>{screen_on} | {chat_lock_str}</span>"
-                
+
                 lat = info.get('location', {}).get('latitude')
                 lng = info.get('location', {}).get('longitude')
                 if lat is not None and lng is not None:
@@ -482,21 +537,21 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
                 html += f"<td class='hide-mobile'>{format_loc_time(info.get('location', {}).get('time', 0))}</td>"
                 html += f"<td>{format_loc_time(info.get('received_at', 0))}</td>"
                 html += f"<td class='hide-mobile'>{ap_list_html}</td>"
-                
+
                 html += f"<td>"
                 html += f"<button class='btn-sm' onclick=\"sendCmd('force_report', '', '{local_ip}')\">同步</button>"
                 html += f"<button class='btn-sm' onclick=\"sendScreenMsg('{local_ip}')\">提示</button>"
                 html += f"<button class='btn-sm btn-danger' onclick=\"sendCmd('play_alarm', '', '{local_ip}')\">响铃</button>"
-                
+
                 if is_locked:
                     html += f"<button class='btn-sm btn-warning' onclick=\"sendCmd('unlock_chat', '', '{local_ip}')\">🔓 解锁</button>"
                 else:
                     html += f"<button class='btn-sm' onclick=\"sendCmd('lock_chat', '', '{local_ip}')\">🔒 锁定</button>"
-                    
+
                 html += f"<button class='btn-sm' onclick=\"showTrack('{dev_id}')\">轨迹</button>"
                 html += f"<button class='btn-sm' onclick=\"showCloudLogs('{dev_id}')\">📄 日志</button>"
                 html += f"</td></tr>"
-                
+
             if not ALL_DEVICES_STATUS:
                 html += "<tr><td colspan='9' align='center' style='padding:40px;color:var(--color-fg-muted);'>暂无设备上报</td></tr>"
 
@@ -520,7 +575,7 @@ var markersLayer = null;
 var polyline = null;
 var isMapVisible = false;
 var isChatVisible = false;
-var allDevicesData = """ + json.dumps(ALL_DEVICES_STATUS) + """;
+var allDevicesData = """ + json.dumps(ALL_DEVICES_STATUS).replace('</', '<\\/') + """;
 
 function showToast(msg) {
     var toast = document.getElementById("toast");
@@ -545,19 +600,19 @@ function handleChatEnter(e) { if (e.key === 'Enter') sendChat(); }
 async function sendChat() {
     let msg = document.getElementById('chatInput').value.trim();
     if(!msg) return;
-    
+
     let selectedIps = [];
     document.querySelectorAll('.target-cb:checked').forEach(cb => {
         selectedIps.push(cb.value);
     });
-    
+
     if(selectedIps.length === 0) return showToast("请至少选择一个发送目标！");
     let targetParam = selectedIps.includes("all") ? "all" : selectedIps;
 
     document.getElementById('chatInput').value = "";
     await fetch('/api/control', {
-        method: 'POST', 
-        headers: {'Content-Type': 'application/json'}, 
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({action: 'chat_msg', payload: msg, target_ip: targetParam})
     });
     setTimeout(fetchChatHistory, 300);
@@ -568,7 +623,7 @@ async function fetchChatHistory() {
     try {
         const res = await fetch('/api/chat_history');
         const data = await res.json();
-        
+
         const chatDiv = document.getElementById('chatMessages');
         let html = "";
         data.messages.forEach(item => {
@@ -587,14 +642,14 @@ async function fetchChatHistory() {
         const selectorDiv = document.getElementById('deviceSelector');
         let currentChecked = [];
         document.querySelectorAll('.target-cb:checked').forEach(cb => currentChecked.push(cb.value));
-        
+
         let tagHtml = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" ' + (currentChecked.includes('all') || currentChecked.length === 0 ? 'checked' : '') + '><span>所有人 (群发)</span></label>';
-        
+
         data.devices.forEach(dev => {
             let isChecked = currentChecked.includes(dev.ip) ? 'checked' : '';
             tagHtml += `<label class="device-tag"><input type="checkbox" class="target-cb" value="${dev.ip}" ${isChecked}><span>${dev.id}</span></label>`;
         });
-        
+
         if (selectorDiv.innerHTML !== tagHtml) {
             selectorDiv.innerHTML = tagHtml;
         }
@@ -648,7 +703,7 @@ function showCloudLogs(devId) {
     var info = allDevicesData[devId];
     var logs = info && info.cloud_logs ? info.cloud_logs : "该设备尚未上传日志。\\n请先在【高级设置】中开启「云端日志」，并在手机端等待下一次上报。";
     var logTime = info && info.cloud_logs_time ? new Date(info.cloud_logs_time).toLocaleString() : "未知";
-    
+
     document.getElementById('modalTitle').innerText = "📄 运行日志 - " + devId;
     document.getElementById('msgList').innerHTML = `
         <div style="color:#57606a; margin-bottom: 10px; font-size: 13px;">
@@ -662,8 +717,8 @@ function showCloudLogs(devId) {
 async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
     try {
         const res = await fetch('/api/control', {
-            method: 'POST', 
-            headers: {'Content-Type': 'application/json'}, 
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({action: action, payload: payload, target_ip: target_ip})
         });
         if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
@@ -714,31 +769,40 @@ async function showServerMessages() {
 }
 </script>
 </body></html>"""
-            client_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}".encode('utf-8'))
+            client_conn.sendall(
+                f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}".encode('utf-8'))
     except Exception:
         pass
     finally:
-        try: client_conn.close()
-        except: pass
+        try:
+            client_conn.close()
+        except Exception:
+            pass
+
 
 def start_server():
     threading.Thread(target=udp_listener, daemon=True).start()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try: server.bind(('0.0.0.0', PORT))
-    except Exception as e: print(f"❌ 端口 {PORT} 绑定失败: {e}"); return
-    
+    try:
+        server.bind(('0.0.0.0', PORT))
+    except Exception as e:
+        print(f"❌ 端口 {PORT} 绑定失败: {e}")
+        return
+
     server.listen(20)
     with print_lock:
-        print("="*50)
+        print("=" * 50)
         print(f"🚀 设备同步服务已启动: http://{get_local_ip()}:{PORT}")
-        print("="*50)
+        print("=" * 50)
 
     while True:
         try:
             conn, addr = server.accept()
             threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
-        except KeyboardInterrupt: break
+        except KeyboardInterrupt:
+            break
+
 
 if __name__ == "__main__":
     start_server()
