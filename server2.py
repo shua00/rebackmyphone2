@@ -18,7 +18,7 @@ GLOBAL_DEFAULT_CONFIG = {
 }
 
 ALL_DEVICES_STATUS = {}
-CHAT_MESSAGES = [] # 【新增】专门用于存放局域网对讲机聊天记录
+CHAT_MESSAGES = [] # 用于存放局域网对讲机聊天记录
 print_lock = threading.Lock()
 
 def init_db():
@@ -33,7 +33,7 @@ def init_db():
 
 init_db()
 
-# 【新增】后台监听 UDP 8888 端口，截获手机发出的对讲机消息
+# 后台监听 UDP 8888 端口，截获手机发出的对讲机消息
 def udp_listener():
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -43,20 +43,22 @@ def udp_listener():
         while True:
             data, addr = udp_sock.recvfrom(1024)
             msg = data.decode('utf-8', errors='ignore')
-            # 格式：FIND_ME_MSG:密钥:发送者ID:内容
+            # 解析 4 段式报文：FIND_ME_MSG:密钥:发送者:内容
             if msg.startswith("FIND_ME_MSG:"):
                 parts = msg.split(":", 4)
-                if len(parts) == 4 and parts[1] == RESCUE_SECRET:
+                if len(parts) == 3 and parts[1] == RESCUE_SECRET:
+                    # 3段式（来自网页/短信提示），不算入聊天室
+                    pass
+                elif len(parts) == 4 and parts[1] == RESCUE_SECRET:
                     sender = parts[2]
                     content = parts[3]
-                    # 过滤掉网页/PC自己发出去的消息，只记录手机的
+                    # 过滤掉自己发出去的广播，防止重复显示
                     if sender not in ["Web_Console", "PC_Terminal"]:
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         with print_lock:
                             print(f"\n🗣️ [对讲机] {sender} 说: {content}")
                             CHAT_MESSAGES.append({"time": ts, "sender": sender, "content": content})
-                            if len(CHAT_MESSAGES) > 100: # 最多保留100条
-                                CHAT_MESSAGES.pop(0)
+                            if len(CHAT_MESSAGES) > 100: CHAT_MESSAGES.pop(0)
     except Exception as e:
         print(f"❌ UDP 监听绑定失败 (端口可能被占用): {e}")
 
@@ -202,6 +204,12 @@ def handle_client(client_conn, client_addr):
                     success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "chat_msg": 
                     success = send_udp_broadcast(f"FIND_ME_MSG:{RESCUE_SECRET}:Web_Console:{payload}", target_ip)
+                    # 【修复】自己发完，手动存入内存列表，让前端能立刻看到
+                    if success:
+                        ts = datetime.datetime.now().strftime("%H:%M:%S")
+                        with print_lock:
+                            CHAT_MESSAGES.append({"time": ts, "sender": "Web_Console", "content": payload})
+                            if len(CHAT_MESSAGES) > 100: CHAT_MESSAGES.pop(0)
                 elif action == "change_server": 
                     success = send_udp_broadcast(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}", target_ip)
                 elif action == "clear_history": 
@@ -353,7 +361,6 @@ td button.btn-sm {
 }
 td button.btn-sm:nth-child(3n) { margin-right: 0; }
 
-/* 聊天室相关样式 */
 #chatBox { display: none; margin-top: 24px; background: #fff; border-radius: 6px; border: 1px solid var(--color-border-default); flex-direction: column; height: 400px; }
 #chatMessages { flex: 1; overflow-y: auto; padding: 16px; font-size: 14px; line-height: 1.5; }
 .chat-msg { margin-bottom: 8px; }
@@ -404,7 +411,6 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
     </details>
 </div>
 
-<!-- 【新增】对讲机面板 -->
 <div id="chatBox">
     <div id="chatMessages"></div>
     <div class="chat-input-area">
@@ -511,7 +517,6 @@ function showToast(msg) {
     setTimeout(function(){ toast.className = toast.className.replace("show", ""); }, 3000);
 }
 
-// 【新增】对讲机面板控制与轮询
 function toggleChatBox() {
     var chatBox = document.getElementById('chatBox');
     isChatVisible = !isChatVisible;
@@ -531,13 +536,12 @@ async function sendChat() {
     let msg = document.getElementById('chatInput').value.trim();
     if(!msg) return;
     document.getElementById('chatInput').value = "";
-    // 调用之前定义的 4 段式发送接口
     await fetch('/api/control', {
         method: 'POST', 
         headers: {'Content-Type': 'application/json'}, 
         body: JSON.stringify({action: 'chat_msg', payload: msg, target_ip: '255.255.255.255'})
     });
-    setTimeout(fetchChatHistory, 300); // 发送后稍等片刻刷新
+    setTimeout(fetchChatHistory, 300);
 }
 
 async function fetchChatHistory() {
@@ -557,14 +561,11 @@ async function fetchChatHistory() {
             </div>`;
         });
         
-        // 只有当内容变化时才重绘，防止选中文字被打断
         if (chatDiv.innerHTML !== html) {
             chatDiv.innerHTML = html;
             chatDiv.scrollTop = chatDiv.scrollHeight;
         }
     } catch(e) {}
-    
-    // 2 秒轮询一次
     if (isChatVisible) setTimeout(fetchChatHistory, 2000);
 }
 
