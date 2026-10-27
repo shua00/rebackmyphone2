@@ -84,6 +84,9 @@ public class TrackingService extends Service implements LocationListener {
     private static long lastNotificationClickTime = 0;
     private static int notificationClickCount = 0;
 
+    // 【新增】记录上次传感器触发的时间，防止频繁唤醒导致耗电
+    private static long lastSensorTriggerTime = 0;
+
     // ⚠️【基础配置区】请按需修改
     private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
@@ -165,12 +168,24 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
+    // 【修复】带防抖冷却的运动传感器监听
     private final TriggerEventListener motionListener = new TriggerEventListener() {
         @Override
         public void onTrigger(TriggerEvent event) {
+            long now = System.currentTimeMillis();
+            
+            // 如果距离上次触发不到 3 分钟，就忽略这次运动，直接重新注册传感器并返回
+            if (now - lastSensorTriggerTime < 3 * 60 * 1000L) {
+                toggleMotionSensor(true); 
+                return; 
+            }
+            
+            // 记录本次触发时间
+            lastSensorTriggerTime = now;
+
             FileLogger.log(TrackingService.this, "SENSOR", "检测到运动，触发强制上报");
             sendReport(true, true);
-            toggleMotionSensor(true);
+            toggleMotionSensor(true); 
         }
     };
 
@@ -207,7 +222,6 @@ public class TrackingService extends Service implements LocationListener {
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
                 FileLogger.log(this, "ALARM", "⏰ 定时上报闹钟被唤醒");
                 if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire();
-                // 注意：scheduleNextReport 移到了 sendReport 的 finally 中，防止断档
                 sendReport(true, true);
                 handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             } else if ("ACTION_SECRET_UNLOCK".equals(action)) {
