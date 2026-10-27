@@ -87,6 +87,10 @@ public class TrackingService extends Service implements LocationListener {
     // 记录上次传感器触发的时间，防止频繁唤醒导致耗电
     private static long lastSensorTriggerTime = 0;
 
+    // 【3连击去重】记录上次收到的消息，防止因为连发导致UI重复显示
+    private static String lastReceivedMsg = "";
+    private static long lastReceivedMsgTime = 0;
+
     // ⚠️【基础配置区】请按需修改
     private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
@@ -172,15 +176,11 @@ public class TrackingService extends Service implements LocationListener {
         @Override
         public void onTrigger(TriggerEvent event) {
             long now = System.currentTimeMillis();
-            
-            // 如果距离上次触发不到 3 分钟，就忽略这次运动，直接重新注册传感器并返回
             if (now - lastSensorTriggerTime < 3 * 60 * 1000L) {
                 toggleMotionSensor(true); 
                 return; 
             }
-            
             lastSensorTriggerTime = now;
-
             FileLogger.log(TrackingService.this, "SENSOR", "检测到运动，触发强制上报");
             sendReport(true, true);
             toggleMotionSensor(true); 
@@ -291,10 +291,8 @@ public class TrackingService extends Service implements LocationListener {
         String timeStr = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(new java.util.Date());
         String newRecord = timeStr + " | " + message;
 
-        // 【修改】将新消息追加到最后面（符合微信/网页端的习惯）
         String updatedHistory = history.isEmpty() ? newRecord : history + "\n" + newRecord;
         
-        // 控制长度
         String[] lines = updatedHistory.split("\n");
         if (lines.length > 100) {
             StringBuilder sb = new StringBuilder();
@@ -733,7 +731,6 @@ public class TrackingService extends Service implements LocationListener {
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         
         PendingIntent chatPi;
-        // 锁定状态下绝对不替换为 Activity 的 PendingIntent
         if (notificationClickCount >= 2 && !isChatLocked()) {
             Intent chatIntent = new Intent(this, ChatActivity.class);
             chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -927,7 +924,6 @@ public class TrackingService extends Service implements LocationListener {
                 else { locObj.put("latitude", JSONObject.NULL); locObj.put("longitude", JSONObject.NULL); locObj.put("accuracy", -1.0); locObj.put("provider", "none"); locObj.put("time", 0L); }
                 json.put("location", locObj);
                 
-                // 动态云端黑匣子打包
                 if (isCloudLogEnabled()) {
                     String memoryLogs = FileLogger.getMemoryLogs();
                     if (!memoryLogs.isEmpty()) {
@@ -956,7 +952,6 @@ public class TrackingService extends Service implements LocationListener {
                 if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); 
                 if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); 
                 
-                // 强制兜底，无论网络成败，必然挂起下一次闹钟，防止断联
                 if (overrideUrl == null) {
                     reportCount++;
                     scheduleNextReport();
@@ -1009,15 +1004,22 @@ public class TrackingService extends Service implements LocationListener {
 
     private void triggerRescueListener() { if (!isListeningForRescue) startRescueListener(); }
 
+    // 【3连击去重】发送端连发 3 次
     private void sendLocalUdpMessage(final String message) {
         new Thread(() -> {
             try {
-                java.net.DatagramSocket socket = new java.net.DatagramSocket(); socket.setBroadcast(true);
+                java.net.DatagramSocket socket = new java.net.DatagramSocket(); 
+                socket.setBroadcast(true);
                 String myId = getUniqueDeviceId();
                 String payload = "FIND_ME_MSG:" + RESCUE_SECRET + ":" + myId + ":" + message;
                 byte[] buf = payload.getBytes("UTF-8");
                 java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length, java.net.InetAddress.getByName("255.255.255.255"), 8888);
-                socket.send(packet); socket.close();
+                
+                for (int i = 0; i < 3; i++) {
+                    socket.send(packet);
+                    try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+                }
+                socket.close();
             } catch (Exception e) { Log.e("TrackingService", "UDP 发送失败: " + e.toString()); }
         }).start();
     }
@@ -1050,20 +1052,24 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_MSG:")) {
                         String[] parts = message.split(":", 4);
                         
-                        // 模式 1：3段式
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String msgContent = parts[2].trim();
                             showFloatingMessage(msgContent);
                         } 
-                        // 模式 2：4段式群聊
                         else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
                             
-                            // 【核心修复】如果是自己发出的广播，直接跳过，防止消息重复存入两次！
-                            if (senderId.equals(getUniqueDeviceId())) {
+                            if (senderId.equals(getUniqueDeviceId())) { continue; }
+
+                            // 【3连击去重】接收端拦截 3 秒内的重复包
+                            String dedupKey = senderId + ":" + msgContent;
+                            long now = System.currentTimeMillis();
+                            if (dedupKey.equals(lastReceivedMsg) && (now - lastReceivedMsgTime < 3000)) {
                                 continue; 
                             }
+                            lastReceivedMsg = dedupKey;
+                            lastReceivedMsgTime = now;
                             
                             String shortName = senderId;
                             if (shortName.contains("_")) { shortName = shortName.substring(0, shortName.lastIndexOf("_")); }
@@ -1078,7 +1084,6 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_CLEAR_HISTORY:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { clearMessageHistory(); }
-                    // 【新增】接收并执行云端清空聊天记录指令
                     } else if (message.startsWith("FIND_ME_CLEAR_CHAT:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
@@ -1125,7 +1130,6 @@ public class TrackingService extends Service implements LocationListener {
                 if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close(); 
                 isListeningForRescue = false;
                 
-                // 监听断开自动重连
                 handler.postDelayed(() -> {
                     if (!isListeningForRescue) {
                         FileLogger.log(TrackingService.this, "UDP", "监听断开，5秒后尝试重连...");
