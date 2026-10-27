@@ -181,7 +181,10 @@ public class TrackingService extends Service implements LocationListener {
         @Override
         public void onTrigger(TriggerEvent event) {
             long now = System.currentTimeMillis();
-            if (now - lastSensorTriggerTime < 3 * 60 * 1000L) {
+            // 【P2 优化】3 分钟 → 15 分钟。TYPE_SIGNIFICANT_MOTION 在移动中每 3-5 分钟就会唤醒，
+            // 原 3 分钟节流等于没节流，导致密集上报和耗电。15 分钟仍远低于 30 分钟定时上报，
+            // 保留「移动兜底」能力，同时避免与定时上报重复。
+            if (now - lastSensorTriggerTime < 15 * 60 * 1000L) {
                 toggleMotionSensor(true); 
                 return; 
             }
@@ -914,6 +917,14 @@ public class TrackingService extends Service implements LocationListener {
                 boolean isOnline = (activeNet != null && activeNet.isConnected());
                 FileLogger.log(TrackingService.this, "REPORT", "准备上报. 网络:" + (isOnline ? activeNet.getTypeName() : "离线") + " | SSID:" + wifiSsid + " | IP:" + ip + " | 电量:" + battery[0] + "%");
 
+                // 【P3 优化】离线且非显式临时上报（FIND_ME_REPORT_TEMP）时，跳过本次请求，
+                // 省掉 15 秒的无效 timeout 与耗电。return 后走 finally：release 锁 + reportCount++ + scheduleNextReport，
+                // 上报链不断，下次闹钟照常触发。
+                if (!isOnline && overrideUrl == null) {
+                    FileLogger.log(TrackingService.this, "REPORT", "⚠️ 网络离线，跳过本次上报");
+                    return;
+                }
+
                 Location loc = lastLocation;
                 if (loc == null) {
                     try { loc = getBetterLocation(locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER), locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)); loc = getBetterLocation(loc, locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER)); } catch (SecurityException ignored) {}
@@ -941,13 +952,19 @@ public class TrackingService extends Service implements LocationListener {
                 }
                 URL url = new URL(activeUrl);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST"); conn.setRequestProperty("Content-Type", "application/json"); conn.setConnectTimeout(10000); conn.setReadTimeout(10000); conn.setDoOutput(true);
+                // 【P4 优化】弱网下 10 秒偏紧，放宽到 15 秒，减少 timeout
+                conn.setRequestMethod("POST"); conn.setRequestProperty("Content-Type", "application/json"); conn.setConnectTimeout(15000); conn.setReadTimeout(15000); conn.setDoOutput(true);
                 OutputStream os = conn.getOutputStream(); os.write(json.toString().getBytes("UTF-8")); os.flush(); os.close();
-                if (conn.getResponseCode() == 200) {
+                // 【P1 优化】提前取 code，非 200 时记录日志，不再静默
+                int httpCode = conn.getResponseCode();
+                if (httpCode == 200) {
                     BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream())); StringBuilder sb = new StringBuilder(); String line;
                     while ((line = br.readLine()) != null) sb.append(line);
                     br.close(); if (overrideUrl == null) parseResponse(new JSONObject(sb.toString())); success = true;
                     FileLogger.log(TrackingService.this, "REPORT", "✅ 上报成功");
+                } else {
+                    // 【P1 优化】非 200（403/500/502/504 等）不再静默，记录状态码便于排查
+                    FileLogger.log(TrackingService.this, "REPORT", "⚠️ 上报返回非200: HTTP " + httpCode + " | " + activeUrl);
                 }
                 conn.disconnect();
             } catch (Exception e) {
