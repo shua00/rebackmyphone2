@@ -101,7 +101,12 @@ public class TrackingService extends Service implements LocationListener {
     private static final String PREF_BUBBLE = "bubble_pos_prefs";
 
     private BroadcastReceiver batteryMonitor;
-    
+
+    // 【P1-4 修复】UDP 救援监听的实例级状态
+    private volatile boolean serviceDestroyed = false;      // onDestroy 时置 true，线程据此退出
+    private volatile boolean rescueRetryScheduled = false;  // 防重复排延迟重试
+    private DatagramSocket rescueSocketRef = null;          // 保存 socket 引用，供 onDestroy 关闭
+
     // 用于管理当前的悬浮窗（单条覆盖）
     private final List<android.view.View> activeBubbles = new ArrayList<>();
 
@@ -1002,7 +1007,24 @@ public class TrackingService extends Service implements LocationListener {
         return l1;
     }
 
-    private void triggerRescueListener() { if (!isListeningForRescue) startRescueListener(); }
+    // 【P1-4 修复】原版「flag=true 就什么都不做」改为「flag=true 排 8 秒后检查」
+    // 8 秒 > 旧实例 onDestroy 后 close socket + 3 秒 soTimeout 的退出窗口
+    private void triggerRescueListener() {
+        if (serviceDestroyed) return;
+        if (isListeningForRescue) {
+            if (!rescueRetryScheduled) {
+                rescueRetryScheduled = true;
+                handler.postDelayed(() -> {
+                    rescueRetryScheduled = false;
+                    if (!isListeningForRescue && !serviceDestroyed) {
+                        startRescueListener();
+                    }
+                }, 8000);
+            }
+            return;
+        }
+        startRescueListener();
+    }
 
     // 【3连击去重】发送端连发 3 次
     private void sendLocalUdpMessage(final String message) {
@@ -1024,15 +1046,26 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
+    // 【P1-4 修复】setSoTimeout(0)→3000、while(true)→while(!serviceDestroyed)、保存 socket 引用
+    // 内部所有 FIND_ME_* 分支与原版一字不差
     private void startRescueListener() {
         isListeningForRescue = true;
         new Thread(() -> {
             DatagramSocket rescueSocket = null;
             try {
-                rescueSocket = new DatagramSocket(8888); rescueSocket.setBroadcast(true); rescueSocket.setSoTimeout(0);
+                rescueSocket = new DatagramSocket(8888); rescueSocket.setBroadcast(true);
+                // 【P1-4 修复】3 秒超时，让线程每 3 秒检查 serviceDestroyed
+                rescueSocket.setSoTimeout(3000);
+                // 【P1-4 修复】保存引用，供 onDestroy 主动 close
+                rescueSocketRef = rescueSocket;
                 byte[] buffer = new byte[512]; DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                while (true) {
-                    rescueSocket.receive(packet);
+                while (!serviceDestroyed) {
+                    try {
+                        rescueSocket.receive(packet);
+                    } catch (java.net.SocketTimeoutException te) {
+                        // 3 秒无包，回到 while 检查 serviceDestroyed，继续等
+                        continue;
+                    }
                     String message = new String(packet.getData(), 0, packet.getLength());
                     if (message.startsWith("FIND_ME_SERVER:")) {
                         String[] parts = message.split(":", 3);
@@ -1128,14 +1161,18 @@ public class TrackingService extends Service implements LocationListener {
                 Log.e("TrackingService", "UDP 监听异常: " + e.toString()); 
             } finally { 
                 if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close(); 
+                rescueSocketRef = null;
                 isListeningForRescue = false;
                 
-                handler.postDelayed(() -> {
-                    if (!isListeningForRescue) {
-                        FileLogger.log(TrackingService.this, "UDP", "监听断开，5秒后尝试重连...");
-                        triggerRescueListener();
-                    }
-                }, 5000);
+                // 【P1-4 修复】主动销毁时不重试，让新实例接管
+                if (!serviceDestroyed) {
+                    handler.postDelayed(() -> {
+                        if (!isListeningForRescue && !serviceDestroyed) {
+                            FileLogger.log(TrackingService.this, "UDP", "监听断开，5秒后尝试重连...");
+                            triggerRescueListener();
+                        }
+                    }, 5000);
+                }
             }
         }).start();
     }
@@ -1153,13 +1190,47 @@ public class TrackingService extends Service implements LocationListener {
 
     @Override public void onLocationChanged(Location location) { if (location != null) lastLocation = location; }
 
+    // 【P1-4 + P2-3 修复】补全资源清理，顺序：置标志 → 关 socket → 定位/悬浮窗 → 原有清理 → handler
     @Override
     public void onDestroy() {
         super.onDestroy();
+
+        // 【P1-4 修复】置销毁标志，让 UDP 线程的 while 循环退出
+        serviceDestroyed = true;
+
+        // 【P1-4 修复】关闭救援 socket，唤醒阻塞在 receive() 的线程
+        // 线程收到 SocketException 后走 finally，因为 serviceDestroyed=true 不再重试
+        if (rescueSocketRef != null) {
+            try { rescueSocketRef.close(); } catch (Exception ignored) {}
+            rescueSocketRef = null;
+        }
+
+        // 【P2-3① 修复】移除定位监听，防止多实例叠加导致息屏耗电上升
+        if (locationManager != null) {
+            try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
+        }
+
+        // 【P2-3② 修复】移除残留的悬浮窗气泡，否则服务死后气泡还挂在屏幕上
+        try {
+            WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+            if (wm != null) {
+                for (android.view.View v : new ArrayList<>(activeBubbles)) {
+                    try { wm.removeView(v); } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+        activeBubbles.clear();
+
+        // 原有清理
         if (batteryMonitor != null) { try { unregisterReceiver(batteryMonitor); } catch (Exception ignored) {} }
         if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        // 【P2-3⑤ 修复】顺手补 wakeLock 释放
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         if (sensorManager != null && motionListener != null) sensorManager.cancelTriggerSensor(motionListener, motionSensor);
         try { ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE); if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) cm.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
+
+        // 【P2-3④ 修复】清理所有 delayed 任务，防止 24 小时后的 removeView / 5 秒重试持有已销毁的 this
+        handler.removeCallbacksAndMessages(null);
     }
 
     @Override
