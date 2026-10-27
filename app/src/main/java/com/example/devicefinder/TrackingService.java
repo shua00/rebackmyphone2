@@ -291,12 +291,17 @@ public class TrackingService extends Service implements LocationListener {
         String timeStr = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(new java.util.Date());
         String newRecord = timeStr + " | " + message;
 
-        String updatedHistory = newRecord + "\n" + history;
+        // 【修改】将新消息追加到最后面（符合微信/网页端的习惯）
+        String updatedHistory = history.isEmpty() ? newRecord : history + "\n" + newRecord;
+        
+        // 控制长度
         String[] lines = updatedHistory.split("\n");
         if (lines.length > 100) {
             StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < 100; i++) sb.append(lines[i]).append("\n");
-            updatedHistory = sb.toString();
+            for (int i = lines.length - 100; i < lines.length; i++) {
+                sb.append(lines[i]).append("\n");
+            }
+            updatedHistory = sb.toString().trim();
         }
         sp.edit().putString("chat_history", updatedHistory).apply();
     }
@@ -1013,7 +1018,6 @@ public class TrackingService extends Service implements LocationListener {
                 byte[] buf = payload.getBytes("UTF-8");
                 java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length, java.net.InetAddress.getByName("255.255.255.255"), 8888);
                 socket.send(packet); socket.close();
-                // 注意：本地存储和广播已在 ChatActivity 完成，这里仅发送 UDP
             } catch (Exception e) { Log.e("TrackingService", "UDP 发送失败: " + e.toString()); }
         }).start();
     }
@@ -1074,6 +1078,17 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_CLEAR_HISTORY:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { clearMessageHistory(); }
+                    // 【新增】接收并执行云端清空聊天记录指令
+                    } else if (message.startsWith("FIND_ME_CLEAR_CHAT:")) {
+                        String[] parts = message.split(":", 2);
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            getSharedPreferences("device_finder_prefs", MODE_PRIVATE).edit().putString("chat_history", "").apply();
+                            if (ChatActivity.isForeground) {
+                                Intent updateIntent = new Intent("UPDATE_CHAT_UI");
+                                sendBroadcast(updateIntent);
+                            }
+                            FileLogger.log(TrackingService.this, "CHAT", "🧹 收到云端指令，已清空本地聊天记录");
+                        }
                     } else if (message.startsWith("FIND_ME_SET_SMS_NUM:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
