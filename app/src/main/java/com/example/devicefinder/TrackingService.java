@@ -126,6 +126,10 @@ public class TrackingService extends Service implements LocationListener {
     public void onCreate() {
         super.onCreate();
         serviceCreateTimeMs = SystemClock.elapsedRealtime();
+
+         // 【修复】先赋值 locationManager，再跑自检，否则自检块里 provider 状态误报 off
+        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+
         FileLogger.log(this, "SERVICE", "🚀 追踪服务已启动 (或复活)");
 
         // [L0] ===== 启动自检块：一次启动把环境全部快照，排查 90% 环境问题 =====
@@ -208,8 +212,10 @@ public class TrackingService extends Service implements LocationListener {
                 if (Build.VERSION.SDK_INT >= 33)
                     perm.append("NOTIF=").append(permStr(Manifest.permission.POST_NOTIFICATIONS)).append(", ");
                 perm.append("SMS=").append(permStr(Manifest.permission.RECEIVE_SMS)).append(", ");
+                // 【修复】SCHEDULE_EXACT_ALARM 是特殊权限(appop)，checkSelfPermission 永远返回 DENIED
+                // 正确判断方式是用 AlarmManager.canScheduleExactAlarms()
                 if (Build.VERSION.SDK_INT >= 31)
-                    perm.append("ALARM=").append(permStr(Manifest.permission.SCHEDULE_EXACT_ALARM)).append(", ");
+                    perm.append("ALARM=").append(canScheduleExactAlarmsStr()).append(", ");
                 perm.append("OVERLAY=").append(Settings.canDrawOverlays(this) ? "✅" : "❌").append(", ");
                 try {
                     DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
