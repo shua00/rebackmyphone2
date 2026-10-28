@@ -1,6 +1,7 @@
 package com.example.devicefinder;
 
 import android.Manifest;
+import android.app.ActivityManager;
 import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -30,6 +31,7 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.NetworkRequest;
+import android.net.TrafficStats;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -37,8 +39,11 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.Process;
+import android.os.StatFs;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.telephony.TelephonyManager;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.WindowManager;
@@ -182,6 +187,18 @@ public class TrackingService extends Service implements LocationListener {
                     + " | ROM: " + rom);
             FileLogger.log(this, "SERVICE", "device_id: " + getUniqueDeviceId());
 
+            // [L1] 安全补丁日期：判断是否旧 ROM 省电策略问题
+            try {
+                FileLogger.log(this, "SERVICE", "安全补丁: " + Build.VERSION.SECURITY_PATCH);
+            } catch (Exception ignored) {}
+
+            // [L1] 低内存设备：低内存设备应更保守节流，两台设备对比时有用
+            try {
+                ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+                boolean lowRam = am != null && am.isLowRamDevice();
+                FileLogger.log(this, "SERVICE", "低内存设备: " + (lowRam ? "是" : "否"));
+            } catch (Exception ignored) {}
+
             // [L0] 权限快照
             if (Build.VERSION.SDK_INT >= 23) {
                 StringBuilder perm = new StringBuilder("权限: ");
@@ -204,7 +221,7 @@ public class TrackingService extends Service implements LocationListener {
                 FileLogger.log(this, "SERVICE", perm.toString());
             }
 
-            // [L1] 电池与充电
+            // [L1] 电池与充电（含温度）
             try {
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                 boolean ignored = pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
@@ -214,9 +231,12 @@ public class TrackingService extends Service implements LocationListener {
                 int scale = batteryStatus != null ? batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100) : 100;
                 int plugged = batteryStatus != null ? batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) : 0;
                 int pct = scale > 0 ? level * 100 / scale : -1;
+                // [L1] 电池温度：高温降频是 force-stop 诱因之一
+                int tempRaw = batteryStatus != null ? batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1) : -1;
+                String tempStr = tempRaw >= 0 ? (tempRaw / 10.0f) + "°C" : "未知";
                 FileLogger.log(this, "SERVICE", "电池: 白名单=" + (ignored ? "✅" : "❌")
                         + " | 充电中=" + (plugged != 0 ? "✅" : "❌")
-                        + " | 电量=" + pct + "%");
+                        + " | 电量=" + pct + "% | 温度=" + tempStr);
             } catch (Exception ignored) {}
 
             // [L1] 定位 provider
@@ -235,6 +255,15 @@ public class TrackingService extends Service implements LocationListener {
                 String ip = DeviceInfoUtils.getLocalIpAddress();
                 FileLogger.log(this, "SERVICE", "网络: " + typeName + " | SSID=" + wifi[0] + " | IP=" + ip);
             } catch (Exception ignored) {}
+
+            // [L1] 精确闹钟权限：被撤销会静默降级为不精确闹钟，提前记录
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+                    boolean canExact = am != null && am.canScheduleExactAlarms();
+                    FileLogger.log(this, "SERVICE", "闹钟权限: 精确闹钟=" + (canExact ? "✅" : "❌"));
+                } catch (Exception ignored) {}
+            }
 
             FileLogger.log(this, "SERVICE", "===================");
         } catch (Exception e) {
@@ -377,6 +406,27 @@ public class TrackingService extends Service implements LocationListener {
                     long maxMb = rt.maxMemory() / (1024 * 1024);
                     FileLogger.log(this, "MEMORY", "💾 内存占用: " + usedMb + "MB / " + maxMb + "MB");
                 } catch (Exception ignored) {}
+
+                // [L2] 存储空间快照：防止存储满导致 FileLogger 静默失败（稳定后可删）
+                try {
+                    java.io.File dir = getExternalFilesDir(null);
+                    if (dir != null) {
+                        StatFs stat = new StatFs(dir.getAbsolutePath());
+                        long availMb = stat.getAvailableBytes() / (1024 * 1024);
+                        long totalMb = stat.getTotalBytes() / (1024 * 1024);
+                        FileLogger.log(this, "STORAGE", "💾 可用空间: " + availMb + "MB / " + totalMb + "MB");
+                    }
+                } catch (Exception ignored) {}
+
+                // [L2] 流量累计：判断是否疯狂重试导致流量异常（稳定后可删）
+                try {
+                    long rx = TrafficStats.getUidRxBytes(Process.myUid());
+                    long tx = TrafficStats.getUidTxBytes(Process.myUid());
+                    if (rx != TrafficStats.UNSUPPORTED && tx != TrafficStats.UNSUPPORTED) {
+                        FileLogger.log(this, "TRAFFIC", "📶 累计流量: RX=" + (rx / 1024) + "KB, TX=" + (tx / 1024) + "KB");
+                    }
+                } catch (Exception ignored) {}
+
                 scheduleKeepAliveJob();
             } else if ("ACTION_LOCK_CHAT".equals(action)) {
                 setChatLocked(true);
@@ -1117,7 +1167,9 @@ public class TrackingService extends Service implements LocationListener {
                 ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
                 NetworkInfo activeNet = cm.getActiveNetworkInfo();
                 boolean isOnline = (activeNet != null && activeNet.isConnected());
-                FileLogger.log(TrackingService.this, "REPORT", "准备上报. 网络:" + (isOnline ? activeNet.getTypeName() : "离线") + " | SSID:" + wifiSsid + " | IP:" + ip + " | 电量:" + battery[0] + "%");
+                // [L1] 网络子类型：MOBILE 下细分 5G/4G/3G，便于判断弱网是否导致 timeout
+                String netDesc = isOnline ? getNetworkTypeDesc(activeNet) : "离线";
+                FileLogger.log(TrackingService.this, "REPORT", "准备上报. 网络:" + netDesc + " | SSID:" + wifiSsid + " | IP:" + ip + " | 电量:" + battery[0] + "%");
 
                 if (!isOnline && overrideUrl == null) {
                     FileLogger.log(TrackingService.this, "REPORT", "⚠️ 网络离线，跳过本次上报");
@@ -1201,6 +1253,44 @@ public class TrackingService extends Service implements LocationListener {
                 }
             }
         }).start();
+    }
+
+    // [L1] 网络类型细分：MOBILE 下区分 5G/4G/3G/2G，便于判断弱网是否导致 timeout
+    private String getNetworkTypeDesc(NetworkInfo activeNet) {
+        String typeName = activeNet.getTypeName();
+        if (ConnectivityManager.TYPE_MOBILE != activeNet.getType()) return typeName;
+        try {
+            TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+            if (tm == null) return typeName;
+            int subType = tm.getNetworkType();
+            String sub;
+            switch (subType) {
+                case TelephonyManager.NETWORK_TYPE_NR:
+                    sub = "5G"; break;
+                case TelephonyManager.NETWORK_TYPE_LTE:
+                    sub = "4G"; break;
+                case TelephonyManager.NETWORK_TYPE_HSPAP:
+                case TelephonyManager.NETWORK_TYPE_HSDPA:
+                case TelephonyManager.NETWORK_TYPE_HSUPA:
+                case TelephonyManager.NETWORK_TYPE_UMTS:
+                case TelephonyManager.NETWORK_TYPE_EVDO_0:
+                case TelephonyManager.NETWORK_TYPE_EVDO_A:
+                case TelephonyManager.NETWORK_TYPE_EVDO_B:
+                case TelephonyManager.NETWORK_TYPE_EHRPD:
+                case TelephonyManager.NETWORK_TYPE_HSPA:
+                    sub = "3G"; break;
+                case TelephonyManager.NETWORK_TYPE_EDGE:
+                case TelephonyManager.NETWORK_TYPE_GPRS:
+                case TelephonyManager.NETWORK_TYPE_1xRTT:
+                case TelephonyManager.NETWORK_TYPE_IDEN:
+                    sub = "2G"; break;
+                default:
+                    sub = String.valueOf(subType); break;
+            }
+            return "MOBILE(" + sub + ")";
+        } catch (Exception e) {
+            return typeName;
+        }
     }
 
     private void fetchRemoteConfig() {
@@ -1429,9 +1519,30 @@ public class TrackingService extends Service implements LocationListener {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        // [L1] 只记录关键级别，避免频繁
+        // [L1] importance 量化系统对进程的重视程度，降到 CACHED/EMPTY 就是被杀前兆
         if (level >= TRIM_MEMORY_RUNNING_LOW) {
-            FileLogger.log(this, "SERVICE", "⚠️ onTrimMemory level=" + level);
+            try {
+                ActivityManager.RunningAppProcessInfo info = new ActivityManager.RunningAppProcessInfo();
+                ActivityManager.getMyMemoryState(info);
+                FileLogger.log(this, "SERVICE", "⚠️ onTrimMemory level=" + level
+                        + ", importance=" + importanceStr(info.importance));
+            } catch (Exception e) {
+                FileLogger.log(this, "SERVICE", "⚠️ onTrimMemory level=" + level);
+            }
+        }
+    }
+
+    // [L1] importance 字符串化，便于对比「前台服务」vs「cached」
+    private String importanceStr(int imp) {
+        switch (imp) {
+            case ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND: return "FOREGROUND";
+            case ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE: return "FOREGROUND_SERVICE";
+            case ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE: return "VISIBLE";
+            case ActivityManager.RunningAppProcessInfo.IMPORTANCE_PERCEPTIBLE: return "PERCEPTIBLE";
+            case ActivityManager.RunningAppProcessInfo.IMPORTANCE_SERVICE: return "SERVICE";
+            case ActivityManager.RunningAppProcessInfo.IMPORTANCE_CACHED: return "CACHED";
+            case ActivityManager.RunningAppProcessInfo.IMPORTANCE_EMPTY: return "EMPTY";
+            default: return String.valueOf(imp);
         }
     }
 
