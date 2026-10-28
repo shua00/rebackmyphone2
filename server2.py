@@ -4,6 +4,9 @@ import datetime
 import threading
 import time
 import sqlite3
+import gzip
+import os
+from urllib.parse import urlparse, parse_qs
 
 PORT = 8080
 AUTH_TOKEN = "your_private_secret_key"
@@ -23,14 +26,22 @@ print_lock = threading.Lock()
 
 LAST_MSG_INFO = {"key": "", "time": 0}
 
+# [新增] 日志上传目录
+UPLOAD_LOG_DIR = "uploads/logs"
+os.makedirs(UPLOAD_LOG_DIR, exist_ok=True)
+
 
 def init_db():
-    conn = sqlite3.connect('track_history.db')
+    conn = sqlite3.connect('track_history.db', timeout=10)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS history
                  (device_id TEXT, lat REAL, lng REAL, timestamp INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (device_id TEXT, msg_time TEXT, message TEXT, timestamp INTEGER)''')
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -85,7 +96,6 @@ def udp_listener():
         if e.errno in (98, 10048) or "Address already in use" in str(e):
             print("❌ UDP 8888 被占用（可能 chat.py 正在运行）。")
             print("   server2.py 的 Web 面板仍可用，但无法接收手机对讲机消息。")
-            print("   请关闭 chat.py 后重启 server2.py；或将 chat.py 升级为「代理模式」版本。")
         else:
             print(f"❌ UDP 监听绑定失败: {e}")
     except Exception as e:
@@ -96,7 +106,7 @@ def save_history(dev_id, lat, lng, ts):
     if lat is None or lng is None:
         return
     try:
-        conn = sqlite3.connect('track_history.db')
+        conn = sqlite3.connect('track_history.db', timeout=10)
         c = conn.cursor()
         c.execute("INSERT INTO history VALUES (?, ?, ?, ?)", (dev_id, lat, lng, ts))
         conn.commit()
@@ -160,7 +170,7 @@ def handle_client(client_conn, client_addr):
     try:
         client_conn.settimeout(10.0)
 
-        # 【修复1】按 Content-Length 读完整请求，不再 recv(16384) 一次截断
+        # 按 Content-Length 读完整请求，不再 recv(16384) 一次截断
         raw = b""
         while b"\r\n\r\n" not in raw:
             chunk = client_conn.recv(65536)
@@ -196,6 +206,7 @@ def handle_client(client_conn, client_addr):
             client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             return
 
+        # ===== POST /api/report =====
         if "POST /api/report" in header_text:
             try:
                 data = json.loads(body_part.decode('utf-8', errors='ignore'))
@@ -229,12 +240,12 @@ def handle_client(client_conn, client_addr):
             except Exception as e:
                 with print_lock:
                     print(f"❌ POST /api/report 解析异常: {e}")
-                # 【修复2】异常回 500，不让 Cloudflare 等不到响应
                 try:
                     client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 except Exception:
                     pass
 
+        # ===== POST /api/message =====
         elif "POST /api/message" in header_text:
             try:
                 data = json.loads(body_part.decode('utf-8', errors='ignore'))
@@ -247,7 +258,7 @@ def handle_client(client_conn, client_addr):
                 msg = data.get("message", "")
                 ts = data.get("timestamp", 0)
 
-                conn = sqlite3.connect('track_history.db')
+                conn = sqlite3.connect('track_history.db', timeout=10)
                 c = conn.cursor()
                 c.execute("INSERT INTO messages VALUES (?, ?, ?, ?)", (dev_id, msg_time, msg, ts))
                 conn.commit()
@@ -262,6 +273,88 @@ def handle_client(client_conn, client_addr):
                 except Exception:
                     pass
 
+        # ===== POST /api/upload_log (新增：日志上传) =====
+        elif "POST /api/upload_log" in header_text:
+            try:
+                req_line = header_text.split("\r\n")[0]
+                path_with_query = req_line.split(" ")[1] if len(req_line.split(" ")) > 1 else ""
+                query = urlparse(path_with_query).query
+                params = parse_qs(query)
+                token = params.get("token", [""])[0]
+                device_id = params.get("device_id", ["unknown"])[0]
+
+                if token != AUTH_TOKEN:
+                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                    return
+
+                try:
+                    log_data = gzip.decompress(body_part)
+                except Exception:
+                    log_data = body_part
+
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_id = "".join(c for c in device_id if c.isalnum() or c in "_-")
+                filename = f"{safe_id}_{ts}.log"
+                filepath = os.path.join(UPLOAD_LOG_DIR, filename)
+                with open(filepath, "wb") as f:
+                    f.write(log_data)
+
+                with print_lock:
+                    print(f"\n📋 收到日志上传: {device_id} -> {filename} ({len(log_data)} bytes)")
+
+                resp = json.dumps({"status": "ok", "filename": filename, "size": len(log_data)})
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode())
+            except Exception as e:
+                with print_lock:
+                    print(f"❌ upload_log 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
+
+        # ===== GET /api/logs (新增：日志列表) =====
+        elif "GET /api/logs" in header_text:
+            try:
+                files = []
+                if os.path.isdir(UPLOAD_LOG_DIR):
+                    for fn in sorted(os.listdir(UPLOAD_LOG_DIR), reverse=True):
+                        if fn.endswith(".log"):
+                            fp = os.path.join(UPLOAD_LOG_DIR, fn)
+                            files.append({
+                                "filename": fn,
+                                "size": os.path.getsize(fp),
+                                "mtime": int(os.path.getmtime(fp) * 1000)
+                            })
+                resp = json.dumps(files)
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode())
+            except Exception:
+                pass
+
+        # ===== GET /api/download_log (新增：下载日志) =====
+        elif "GET /api/download_log" in header_text:
+            try:
+                req_line = header_text.split("\r\n")[0]
+                path_with_query = req_line.split(" ")[1] if len(req_line.split(" ")) > 1 else ""
+                query = urlparse(path_with_query).query
+                params = parse_qs(query)
+                name = params.get("name", [""])[0]
+
+                safe_name = os.path.basename(name)
+                filepath = os.path.join(UPLOAD_LOG_DIR, safe_name)
+                if not os.path.isfile(filepath):
+                    client_conn.sendall(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+                    return
+
+                with open(filepath, "rb") as f:
+                    content = f.read()
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=\"{safe_name}\"\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(content)}\r\nConnection: close\r\n\r\n".encode() + content)
+            except Exception:
+                pass
+
+        # ===== POST /api/control =====
         elif "POST /api/control" in header_text:
             try:
                 cmd_data = json.loads(body_part.decode('utf-8', errors='ignore'))
@@ -319,6 +412,16 @@ def handle_client(client_conn, client_addr):
                     success = smart_send(f"FIND_ME_SET_SMS_NUM:{RESCUE_SECRET}:{payload}")
                 elif action == "set_cloud_log":
                     success = smart_send(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:{payload}")
+                elif action == "upload_log":
+                    success = smart_send(f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}")
+                elif action == "locate_once":
+                    success = smart_send(f"FIND_ME_LOCATE_ONCE:{RESCUE_SECRET}")
+                elif action == "scan_wifi":
+                    success = smart_send(f"FIND_ME_SCAN_WIFI:{RESCUE_SECRET}")
+                elif action == "restart_udp":
+                    success = smart_send(f"FIND_ME_RESTART_UDP:{RESCUE_SECRET}")
+                elif action == "test_low_battery":
+                    success = smart_send(f"FIND_ME_TEST_LOW_BATTERY:{RESCUE_SECRET}")
                 elif action == "clean_offline":
                     try:
                         now_ts = int(datetime.datetime.now().timestamp() * 1000)
@@ -336,18 +439,14 @@ def handle_client(client_conn, client_addr):
                 resp = json.dumps({"status": "ok" if success else "error", "msg": "指令执行失败" if not success else ""})
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
-            except Exception as e:
-                with print_lock:
-                    print(f"❌ POST /api/control 异常: {e}")
-                try:
-                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
+        # ===== GET /api/history =====
         elif "GET /api/history" in header_text:
             try:
                 dev_id = header_text.split("device_id=")[1].split(" ")[0]
-                conn = sqlite3.connect('track_history.db')
+                conn = sqlite3.connect('track_history.db', timeout=10)
                 c = conn.cursor()
                 c.execute("SELECT lat, lng, timestamp FROM history WHERE device_id=? ORDER BY timestamp DESC LIMIT 50", (dev_id,))
                 rows = c.fetchall()
@@ -356,14 +455,12 @@ def handle_client(client_conn, client_addr):
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
             except Exception:
-                try:
-                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                except Exception:
-                    pass
+                pass
 
+        # ===== GET /api/messages =====
         elif "GET /api/messages" in header_text:
             try:
-                conn = sqlite3.connect('track_history.db')
+                conn = sqlite3.connect('track_history.db', timeout=10)
                 c = conn.cursor()
                 c.execute("SELECT device_id, msg_time, message FROM messages ORDER BY timestamp DESC LIMIT 50")
                 rows = c.fetchall()
@@ -372,11 +469,9 @@ def handle_client(client_conn, client_addr):
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
             except Exception:
-                try:
-                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                except Exception:
-                    pass
+                pass
 
+        # ===== GET /api/chat_history =====
         elif "GET /api/chat_history" in header_text:
             try:
                 devices_list = []
@@ -391,11 +486,9 @@ def handle_client(client_conn, client_addr):
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
             except Exception:
-                try:
-                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                except Exception:
-                    pass
+                pass
 
+        # ===== GET / =====
         elif "GET /" in header_text:
             chat_options = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" checked><span>所有人 (群发)</span></label>'
 
@@ -506,6 +599,14 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
             <button onclick="sendCmd('clean_offline')">清理离线设备</button>
             <button onclick="sendCmd('clear_history')">清空手机历史</button>
             <button class="btn-danger" onclick="sendCmd('clear_chat')">🧹 清空手机聊天</button>
+        </div>
+        <div class="btn-group" style="margin-top: 12px;">
+            <button onclick="sendCmd('upload_log')">📤 拉取日志(主服务器)</button>
+            <button onclick="showLogs()">📋 查看手机日志</button>
+            <button onclick="sendCmd('locate_once')">📍 手动定位一次</button>
+            <button onclick="sendCmd('scan_wifi')">📡 手动扫描 WiFi</button>
+            <button onclick="sendCmd('restart_udp')">🔄 重启 UDP 监听</button>
+            <button class="btn-danger" onclick="sendCmd('test_low_battery')">🧪 模拟低电量</button>
         </div>
         <div class="input-row" style="margin-top: 12px;">
             <input type="text" id="smsNumText" placeholder="输入紧急接收短信的手机号...">
@@ -753,6 +854,30 @@ function showCloudLogs(devId) {
     document.getElementById('msgModal').style.display = 'block';
 }
 
+async function showLogs() {
+    try {
+        const res = await fetch('/api/logs');
+        const data = await res.json();
+        const listDiv = document.getElementById('msgList');
+        document.getElementById('modalTitle').innerText = "📋 手机上传日志列表";
+        if (data.length === 0) {
+            listDiv.innerHTML = "<p style='color:var(--color-fg-muted);'>还没有上传过日志。请点「📤 拉取日志」让手机上传。</p>";
+        } else {
+            let html = "";
+            data.forEach(f => {
+                let sizeKB = (f.size / 1024).toFixed(1);
+                let time = new Date(f.mtime).toLocaleString();
+                html += `<div style="border-bottom:1px solid var(--color-border-muted); padding:12px 0;">
+                    <div style="color:var(--color-fg-muted); font-size:12px; margin-bottom:6px;">${time} | ${sizeKB}KB</div>
+                    <a href="/api/download_log?name=${encodeURIComponent(f.filename)}" target="_blank" style="color:#0969da; font-weight:600;">${f.filename}</a>
+                </div>`;
+            });
+            listDiv.innerHTML = html;
+        }
+        document.getElementById('msgModal').style.display = 'block';
+    } catch(e) { showToast("拉取日志列表失败: " + e.message); }
+}
+
 async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
     try {
         const res = await fetch('/api/control', {
@@ -766,7 +891,7 @@ async function sendCmd(action, payload = "", target_ip = "255.255.255.255") {
 
         if(data.status === 'ok') {
             showToast("✅ 指令发送成功");
-            if (action !== "chat_msg") setTimeout(() => location.reload(), 1500);
+            if (action !== "chat_msg" && action !== "upload_log") setTimeout(() => location.reload(), 1500);
         } else {
             showToast("❌ 失败: " + (data.msg || "未知错误"));
         }
@@ -837,6 +962,7 @@ def start_server():
     with print_lock:
         print("=" * 50)
         print(f"🚀 设备同步服务已启动: http://{get_local_ip()}:{PORT}")
+        print(f"📁 日志上传目录: {os.path.abspath(UPLOAD_LOG_DIR)}")
         print("=" * 50)
 
     while True:
