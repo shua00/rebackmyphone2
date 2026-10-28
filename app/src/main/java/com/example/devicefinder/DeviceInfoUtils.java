@@ -8,6 +8,7 @@ import android.net.wifi.ScanResult;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -41,6 +42,8 @@ public class DeviceInfoUtils {
         Intent batteryStatus = context.registerReceiver(null, ifilter);
         int level = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) : -1;
         int scale = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1) : -1;
+        // [L1] scale 异常保护，防止除零/负数百分比
+        if (scale <= 0) scale = 100;
         int batteryPct = (int) ((level / (float) scale) * 100);
 
         int status = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, -1) : -1;
@@ -145,8 +148,15 @@ public class DeviceInfoUtils {
         };
 
         try {
-            context.registerReceiver(receiver, new IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION));
+            IntentFilter filter = new IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
+            // [L0] API 33+ 动态注册必须显式指定 exported 标志，否则抛 SecurityException
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, filter);
+            }
         } catch (Exception e) {
+            FileLogger.log(context, "WIFI", "❌ 注册扫描广播失败: " + e.getMessage()); // [L0]
             return result;
         }
 
@@ -154,11 +164,13 @@ public class DeviceInfoUtils {
         try {
             started = wifiManager.startScan();
         } catch (Exception e) {
+            FileLogger.log(context, "WIFI", "❌ startScan 抛异常: " + e.getMessage()); // [L0]
             started = false;
         }
 
         if (!started) {
-            // 系统拒绝扫描（后台节流/频率限制），直接放弃
+            // [L1] startScan 返回 false 通常是后台节流/频率限制，明确记录
+            FileLogger.log(context, "WIFI", "⚠️ startScan 返回 false（后台节流/频率限制）");
             try {
                 context.unregisterReceiver(receiver);
             } catch (Exception ignored) {}
@@ -189,6 +201,8 @@ public class DeviceInfoUtils {
             }
         });
 
+        // [L1] 记录扫描结果数，便于判断「无结果」vs「扫描失败」
+        FileLogger.log(context, "WIFI", "📡 扫描完成: " + result.size() + " 个热点");
         return result;
     }
 }
