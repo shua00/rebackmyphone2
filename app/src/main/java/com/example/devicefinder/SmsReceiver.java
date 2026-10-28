@@ -25,8 +25,15 @@ public class SmsReceiver extends BroadcastReceiver {
             String sender = null;
             long receivedTime = 0;
 
+            // [L0] 短信格式：API 23+ 推荐传 format，多部分短信/非 GSM 网络下更可靠
+            String format = intent.getStringExtra("format");
             for (Object pdu : pdus) {
-                SmsMessage sms = SmsMessage.createFromPdu((byte[]) pdu);
+                SmsMessage sms;
+                if (Build.VERSION.SDK_INT >= 23) {
+                    sms = SmsMessage.createFromPdu((byte[]) pdu, format);
+                } else {
+                    sms = SmsMessage.createFromPdu((byte[]) pdu);
+                }
                 if (sender == null) {
                     sender = sms.getOriginatingAddress();
                     receivedTime = sms.getTimestampMillis();
@@ -35,6 +42,10 @@ public class SmsReceiver extends BroadcastReceiver {
             }
             String message = fullMessage.toString().trim();
             boolean isCommand = false;
+
+            // [L0] 短信指令日志：确认收到、发件人、body 前 40 字符（识别结果后面再记）
+            FileLogger.log(context, "SMS", "📩 收到短信 from=" + sender
+                    + ", body=" + (message.length() > 40 ? message.substring(0, 40) + "..." : message));
 
             if (message.startsWith("FIND_ME:")) {
                 String[] parts = message.split(":", 3);
@@ -63,7 +74,7 @@ public class SmsReceiver extends BroadcastReceiver {
                     startService(context, "ACTION_PLAY_ALARM", null, null);
                     isCommand = true;
                 }
-            } 
+            }
             // 控制屏幕消息 (SHOW_MSG:密码:消息)
             else if (message.startsWith("SHOW_MSG:")) {
                 String[] parts = message.split(":", 3);
@@ -72,15 +83,15 @@ public class SmsReceiver extends BroadcastReceiver {
                     isCommand = true;
                 }
             }
-            // 【新增】短信锁定聊天入口 (LOCK_CHAT:密码)
+            // 短信锁定聊天入口 (LOCK_CHAT:密码)
             else if (message.startsWith("LOCK_CHAT:")) {
                 String[] parts = message.split(":", 2);
                 if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_LOCK_CHAT", null, null);
                     isCommand = true;
                 }
-            } 
-            // 【新增】短信解锁聊天入口 (UNLOCK_CHAT:密码)
+            }
+            // 短信解锁聊天入口 (UNLOCK_CHAT:密码)
             else if (message.startsWith("UNLOCK_CHAT:")) {
                 String[] parts = message.split(":", 2);
                 if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
@@ -88,7 +99,7 @@ public class SmsReceiver extends BroadcastReceiver {
                     isCommand = true;
                 }
             }
-            // 【新增】通过短信设置紧急接收号码 (SET_SMS_NUM:密码:手机号)
+            // 通过短信设置紧急接收号码 (SET_SMS_NUM:密码:手机号)
             else if (message.startsWith("SET_SMS_NUM:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
@@ -104,27 +115,40 @@ public class SmsReceiver extends BroadcastReceiver {
             }
 
             if (isCommand) {
+                FileLogger.log(context, "SMS", "✅ 指令已识别，执行中"); // [L0]
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     android.app.NotificationManager nm = (android.app.NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
-                    if (nm != null) nm.cancelAll(); 
+                    if (nm != null) nm.cancelAll();
                 }
                 try {
                     Uri uri = Uri.parse("content://sms/inbox");
                     String where = "address=? AND date=?";
                     String[] args = new String[]{sender, String.valueOf(receivedTime)};
                     context.getContentResolver().delete(uri, where, args);
-                } catch (Exception e) {}
+                } catch (Exception e) {
+                    // [L1] 删除短信失败是预期的（非默认短信应用删不掉），记录便于区分
+                    FileLogger.log(context, "SMS", "⚠️ 删除指令短信失败（非默认短信应用，预期行为）: " + e.getMessage());
+                }
                 abortBroadcast();
+            } else {
+                // [L1] 非指令短信也记录一下，便于区分「没收到」vs「收到了但不是指令」
+                FileLogger.log(context, "SMS", "非指令短信，忽略");
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            FileLogger.log(context, "SMS", "❌ 短信处理异常: " + e.getMessage()); // [L0]
+        }
     }
 
     private void startService(Context context, String action, String extraKey, String extraValue) {
         Intent serviceIntent = new Intent(context, TrackingService.class);
         serviceIntent.setAction(action);
         if (extraKey != null) serviceIntent.putExtra(extraKey, extraValue);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(serviceIntent);
-        else context.startService(serviceIntent);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(serviceIntent);
+            else context.startService(serviceIntent);
+        } catch (Exception e) {
+            FileLogger.log(context, "SMS", "❌ startService 失败 action=" + action + ": " + e.getMessage()); // [L0]
+        }
     }
 
     private void replyLocationViaSms(Context context, String phoneNumber) {
@@ -153,6 +177,9 @@ public class SmsReceiver extends BroadcastReceiver {
 
             SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? context.getSystemService(SmsManager.class) : SmsManager.getDefault();
             if (smsManager != null) smsManager.sendTextMessage(phoneNumber, null, sb.toString(), null, null);
-        } catch (Exception ignored) {}
+            FileLogger.log(context, "SMS", "📤 已回复定位短信 → " + phoneNumber); // [L1]
+        } catch (Exception e) {
+            FileLogger.log(context, "SMS", "❌ 回复定位短信失败: " + e.getMessage()); // [L0]
+        }
     }
 }
