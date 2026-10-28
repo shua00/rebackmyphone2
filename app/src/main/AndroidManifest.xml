@@ -95,6 +95,20 @@
             </intent-filter>
         </receiver>
 
+        <!-- 拨号盘暗号入口：*#*#8866#*#* 主界面 / *#*#7788#*#* 对讲机 / *#*#5566#*#* 留言板 / *#*#9900#*#* 强制上报 -->
+        <receiver
+            android:name=".DialerReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SECRET_CODE" />
+                <data android:scheme="android_secret_code" android:host="8866" />
+                <data android:scheme="android_secret_code" android:host="7788" />
+                <data android:scheme="android_secret_code" android:host="5566" />
+                <data android:scheme="android_secret_code" android:host="9900" />
+            </intent-filter>
+        </receiver>
+
         <!-- 局域网聊天界面：adjustResize 顶起键盘，excludeFromRecents 防划死 -->
         <activity
             android:name=".ChatActivity"
