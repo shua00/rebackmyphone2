@@ -1,0 +1,283 @@
+================================================================================
+📱 DeviceFinder ADB 调试速查表
+版本: 2026-10-28
+用途: 通过 ADB 调试 / 模拟 / 验证 App 的各种功能
+================================================================================
+
+【0】前置：连接手机
+--------------------------------------------------------------------------------
+adb connect 192.168.1.xxx:PORT     # 无线调试（端口见手机设置）
+adb devices                        # 确认设备在线
+
+用 -s 指定设备（多设备时）：
+adb -s 192.168.1.xxx:PORT shell ...
+
+
+【1】生命周期控制
+--------------------------------------------------------------------------------
+# 启动 App 主界面
+adb shell am start -n com.example.devicefinder/.MainActivity
+
+# 模拟 force-stop（危险，验证自救能力用）
+adb shell am force-stop com.example.devicefinder
+
+# 手动拉起服务
+adb shell am startservice -n com.example.devicefinder/.TrackingService
+
+# 查看进程是否存活
+adb shell ps -A | findstr devicefinder
+
+# 查看服务状态
+adb shell dumpsys activity services com.example.devicefinder | findstr "ServiceRecord"
+
+# 查看是否被 force-stop
+adb shell dumpsys package com.example.devicefinder | findstr stopped=
+
+# 查看电池优化白名单
+adb shell dumpsys deviceidle whitelist | findstr devicefinder
+
+
+【2】ACTION 调试指令（startservice + action）
+--------------------------------------------------------------------------------
+# 强制上报一次
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_FORCE_REPORT
+
+# 改主服务器 URL
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPDATE_SERVER --es server_url http://192.168.1.123:8080/api/report
+
+# 改配置中心 URL
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPDATE_CONFIG_URL --es config_url https://example.com/config.txt
+
+# 播放警报 30 秒
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_PLAY_ALARM
+
+# 弹悬浮消息
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_SHOW_MSG --es message "测试消息"
+
+# 弹留言板
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_SHOW_HISTORY
+
+# 清空留言
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_CLEAR_HISTORY
+
+# 锁 / 解锁聊天
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_LOCK_CHAT
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UNLOCK_CHAT
+
+# 手动触发保活心跳
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_KEEP_ALIVE
+
+# 模拟定时上报
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_ALARM_TRIGGER
+
+# 模拟 6 小时心跳
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_HEARTBEAT
+
+
+【3】新增 ACTION（本轮新增）
+--------------------------------------------------------------------------------
+# 📋 拉日志上传到主服务器（成功后清空本地）
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPLOAD_LOG --ez clear_after true
+
+# 📋 拉日志上传到临时服务器
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPLOAD_LOG --es temp_url http://192.168.1.123:8080/api/report
+
+# ⚙️ 运行时改配置（多参数可组合）
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPDATE_RUNTIME_CONFIG --es report_interval_seconds 60
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPDATE_RUNTIME_CONFIG --es accuracy_mode fine
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPDATE_RUNTIME_CONFIG --es enable_motion_trigger false
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPDATE_RUNTIME_CONFIG --es enable_wifi_lock false
+
+# 📍 手动触发一次定位+上报
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_LOCATE_ONCE
+
+# 📡 手动扫描 WiFi
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_SCAN_WIFI
+
+# 🔄 手动重启 UDP 监听
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_RESTART_UDP
+
+# 🧪 模拟低电量告警
+adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_TEST_LOW_BATTERY
+
+
+【4】暗号广播（替代 startActivity）
+--------------------------------------------------------------------------------
+# 主界面
+adb shell am broadcast -a android.provider.Telephony.SECRET_CODE -d android_secret_code://8866
+
+# 对讲机
+adb shell am broadcast -a android.provider.Telephony.SECRET_CODE -d android_secret_code://7788
+
+# 留言板（悬浮窗）
+adb shell am broadcast -a android.provider.Telephony.SECRET_CODE -d android_secret_code://5566
+
+# 强制上报
+adb shell am broadcast -a android.provider.Telephony.SECRET_CODE -d android_secret_code://9900
+
+
+【5】日志查看
+--------------------------------------------------------------------------------
+# 查看完整日志文件
+adb shell cat /sdcard/Android/data/com.example.devicefinder/files/device_log.txt
+
+# 只看最后 50 行（持续观察）
+adb shell "tail -f /sdcard/Android/data/com.example.devicefinder/files/device_log.txt"
+
+# logcat 分类过滤（按 TAG）
+adb logcat -s DF_SERVICE DF_REPORT DF_UDP DF_SMS DF_ALARM DF_LOCATION DF_WIFI DF_BATTERY DF_MEMORY DF_STORAGE DF_TRAFFIC DF_NETWORK DF_CHAT DF_CONFIG DF_UPLOAD_LOG DF_BOOT DF_POWER
+
+# logcat 关键事件
+adb logcat -d | findstr /i "devicefinder FATAL ANR BackgroundActivityStart force-stop"
+
+# 崩溃日志
+adb logcat -d -b crash | findstr /i devicefinder
+
+
+【6】状态查询
+--------------------------------------------------------------------------------
+# 内存 / 存储 / 流量（每 15 分钟自动记录在日志里）
+adb shell cat /sdcard/Android/data/com.example.devicefinder/files/device_log.txt | findstr "MEMORY STORAGE TRAFFIC"
+
+# 定位监听数量（确认是否泄漏）
+adb shell dumpsys location | findstr devicefinder
+
+# 闹钟队列（确认 App 注册的闹钟）
+adb shell dumpsys alarm | findstr devicefinder
+
+# 电池状态
+adb shell dumpsys battery
+
+# 屏幕状态
+adb shell dumpsys power | findstr "mWakefulness"
+
+# 当前前台应用
+adb shell dumpsys activity activities | findstr mResumedActivity
+
+# App 详细权限
+adb shell dumpsys package com.example.devicefinder | findstr /i "permission"
+
+
+【7】模拟系统场景（验证保活 / 网络 / 电量）
+--------------------------------------------------------------------------------
+# 断网（WiFi + 移动网络）
+adb shell svc wifi disable
+adb shell svc data disable
+
+# 恢复网络
+adb shell svc wifi enable
+adb shell svc data enable
+
+# 隐藏 / 显示桌面图标
+adb shell pm disable com.example.devicefinder/.VisibleAliasActivity
+adb shell pm enable com.example.devicefinder/.VisibleAliasActivity
+
+# 模拟开机广播（部分 ROM 有效）
+adb shell am broadcast -a android.intent.action.BOOT_COMPLETED -p com.example.devicefinder
+
+# 模拟充电插入
+adb shell am broadcast -a android.intent.action.ACTION_POWER_CONNECTED -p com.example.devicefinder
+
+# 模拟充电拔出
+adb shell am broadcast -a android.intent.action.ACTION_POWER_DISCONNECTED -p com.example.devicefinder
+
+# 模拟短信（部分 ROM 有效，需替换短信内容）
+adb shell am broadcast -a android.provider.Telephony.SMS_RECEIVED --es "format" "3gpp" -n com.example.devicefinder/.SmsReceiver
+
+# 清空 App 数据（会重置 device_id、配置）
+adb shell pm clear com.example.devicefinder
+
+
+【8】调试通知栏 / 悬浮窗
+--------------------------------------------------------------------------------
+# 查看通知（确认前台服务通知在）
+adb shell dumpsys notification --noredact | findstr devicefinder
+
+# 查看悬浮窗权限
+adb shell appops get com.example.devicefinder SYSTEM_ALERT_WINDOW
+
+# 查看电池优化状态
+adb shell dumpsys deviceidle whitelist | findstr devicefinder
+
+
+【9】测试静音 / 勿扰（验证警报能否响）
+--------------------------------------------------------------------------------
+# 查看当前铃声模式
+adb shell dumpsys audio | findstr Ringer
+
+# 查看勿扰模式
+adb shell settings get global zen_mode
+
+# 模拟设静音（危险：会改系统状态）
+adb shell cmd notification set_dnd priority
+
+# 恢复所有通知
+adb shell cmd notification set_dnd off
+
+
+【10】测试外部依赖（server / 服务端）
+--------------------------------------------------------------------------------
+# 手机上直接 curl 测试服务端连通性
+adb shell "curl -v -X POST http://dingwei.bai001.de5.net/api/report -H 'Content-Type: application/json' -d '{\"token\":\"your_private_secret_key\",\"device_id\":\"test_adb\"}'"
+
+# 查看 App 保存的服务器 URL
+adb shell cat /data/data/com.example.devicefinder/shared_prefs/device_finder_prefs.xml
+
+# 查看 UDP 监听是否在绑
+adb shell "netstat -anp 2>/dev/null | grep 8888"
+
+
+【11】打包"全部调试动作"一键脚本
+--------------------------------------------------------------------------------
+新建 debug_all.bat，双击运行：
+
+@echo off
+set PKG=com.example.devicefinder
+echo ==== 1. 强制上报 ====
+adb shell am startservice -n %PKG%/.TrackingService -a ACTION_FORCE_REPORT
+timeout /t 3
+echo ==== 2. 手动定位 ====
+adb shell am startservice -n %PKG%/.TrackingService -a ACTION_LOCATE_ONCE
+timeout /t 5
+echo ==== 3. 扫描 WiFi ====
+adb shell am startservice -n %PKG%/.TrackingService -a ACTION_SCAN_WIFI
+timeout /t 5
+echo ==== 4. 拉日志 ====
+adb shell am startservice -n %PKG%/.TrackingService -a ACTION_UPLOAD_LOG
+timeout /t 5
+echo ==== 5. 最近日志 ====
+adb shell "tail -n 30 /sdcard/Android/data/%PKG%/files/device_log.txt"
+pause
+
+
+================================================================================
+【常见问题速查】
+================================================================================
+
+Q: 拨号暗号（*#*#8866#*#*）没反应？
+A: 检查手机是否被 force-stop（dumpsys package | findstr stopped=），
+   如果 stopped=true，暗号不生效，必须先手动打开一次 App。
+
+Q: 上报返回 502？
+A: 服务端 server2.py 旧版本，except 不回响应，Cloudflare 判 502。
+   部署修复版（按 Content-Length 读 + except 回 500）即可。
+
+Q: force-stop 后怎么救？
+A: 三种方式：
+   1. ADB: adb shell am start -n com.example.devicefinder/.MainActivity
+   2. 用户手动打开 App（图标或暗号）
+   3. 厂商推送通道（未实现）
+   代码层无法解决，是系统机制。
+
+Q: SENSOR 触发太频繁？
+A: 已经节流 15 分钟一次，如果仍然频繁，检查手机是否被频繁移动。
+   可以用 ACTION_UPDATE_RUNTIME_CONFIG --es enable_motion_trigger false 临时关闭。
+
+Q: 定位不准 / 无定位？
+A: 1. am startservice -a ACTION_LOCATE_ONCE 手动触发
+   2. dumpsys location | findstr devicefinder 看监听数
+   3. 日志里找 LOCATION 关键字看 provider 状态
+
+================================================================================
+END
+================================================================================
