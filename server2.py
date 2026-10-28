@@ -21,7 +21,6 @@ ALL_DEVICES_STATUS = {}
 CHAT_MESSAGES = []
 print_lock = threading.Lock()
 
-# 【3连击去重】全局记录上一次收到的消息和时间
 LAST_MSG_INFO = {"key": "", "time": 0}
 
 
@@ -57,7 +56,6 @@ def udp_listener():
                     content = parts[3]
 
                     if sender not in ["Web_Console", "PC_Terminal"]:
-                        # 【3连击去重】拦截 3 秒内完全相同的重复包
                         dedup_key = sender + ":" + content
                         now_ts = time.time()
                         if dedup_key == LAST_MSG_INFO["key"] and (now_ts - LAST_MSG_INFO["time"] < 3.0):
@@ -84,11 +82,10 @@ def udp_listener():
                             if len(CHAT_MESSAGES) > 100:
                                 CHAT_MESSAGES.pop(0)
     except OSError as e:
-        # errno 98 = Linux EADDRINUSE，10048 = Windows WSAEADDRINUSE
         if e.errno in (98, 10048) or "Address already in use" in str(e):
             print("❌ UDP 8888 被占用（可能 chat.py 正在运行）。")
             print("   server2.py 的 Web 面板仍可用，但无法接收手机对讲机消息。")
-            print("   请关闭 chat.py 后重启 server2.py；或将 chat.py 升级为「代理模式」版本，二者即可共存。")
+            print("   请关闭 chat.py 后重启 server2.py；或将 chat.py 升级为「代理模式」版本。")
         else:
             print(f"❌ UDP 监听绑定失败: {e}")
     except Exception as e:
@@ -147,7 +144,6 @@ def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
         with print_lock:
             print(f"\n📡 [控制台] 发送至 {target_ip}: {command_str}")
 
-        # 【3连击去重】连发 3 次
         for _ in range(3):
             sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
             time.sleep(0.05)
@@ -162,27 +158,54 @@ def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
 
 def handle_client(client_conn, client_addr):
     try:
-        client_conn.settimeout(5.0)
-        request = client_conn.recv(16384).decode('utf-8', errors='ignore')
-        if not request:
+        client_conn.settimeout(10.0)
+
+        # 【修复1】按 Content-Length 读完整请求，不再 recv(16384) 一次截断
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = client_conn.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > 10 * 1024 * 1024:
+                break
+        header_part, _, body_part = raw.partition(b"\r\n\r\n")
+        header_text = header_part.decode('utf-8', errors='ignore')
+
+        content_length = 0
+        for line in header_text.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try:
+                    content_length = int(line.split(":", 1)[1].strip())
+                except Exception:
+                    pass
+                break
+
+        if content_length > 0:
+            while len(body_part) < content_length:
+                chunk = client_conn.recv(65536)
+                if not chunk:
+                    break
+                body_part += chunk
+            body_part = body_part[:content_length]
+
+        if not header_text:
             return
 
-        if request.startswith("OPTIONS"):
-            client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\n\r\n")
+        if header_text.startswith("OPTIONS"):
+            client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             return
 
-        if "POST /api/report" in request:
+        if "POST /api/report" in header_text:
             try:
-                body = request.split("\r\n\r\n", 1)[1]
-                data = json.loads(body)
+                data = json.loads(body_part.decode('utf-8', errors='ignore'))
                 if data.get("token") != AUTH_TOKEN:
-                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                     return
 
                 dev_id = data.get("device_id", "unknown_device")
                 data["received_at"] = int(datetime.datetime.now().timestamp() * 1000)
 
-                # 【修复 KeyError】先确保设备条目存在，再合并 cloud_logs
                 if dev_id not in ALL_DEVICES_STATUS:
                     ALL_DEVICES_STATUS[dev_id] = {}
 
@@ -190,7 +213,6 @@ def handle_client(client_conn, client_addr):
                     ALL_DEVICES_STATUS[dev_id]["cloud_logs"] = data["cloud_logs"]
                     ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"] = data["received_at"]
                 elif "cloud_logs" in ALL_DEVICES_STATUS[dev_id]:
-                    # 本次没带日志，沿用上一次的，避免面板日志闪没
                     data["cloud_logs"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs"]
                     data["cloud_logs_time"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"]
 
@@ -203,17 +225,21 @@ def handle_client(client_conn, client_addr):
 
                 response_body = json.dumps({"status": "success", "config": GLOBAL_DEFAULT_CONFIG})
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\nConnection: close\r\n\r\n{response_body}".encode('utf-8'))
             except Exception as e:
                 with print_lock:
-                    print(f"解析异常: {e}")
+                    print(f"❌ POST /api/report 解析异常: {e}")
+                # 【修复2】异常回 500，不让 Cloudflare 等不到响应
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
-        elif "POST /api/message" in request:
+        elif "POST /api/message" in header_text:
             try:
-                body = request.split("\r\n\r\n", 1)[1]
-                data = json.loads(body)
+                data = json.loads(body_part.decode('utf-8', errors='ignore'))
                 if data.get("token") != AUTH_TOKEN:
-                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                     return
 
                 dev_id = data.get("device_id", "unknown")
@@ -227,15 +253,18 @@ def handle_client(client_conn, client_addr):
                 conn.commit()
                 conn.close()
 
-                client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n")
+                client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             except Exception as e:
                 with print_lock:
-                    print(f"留言处理异常: {e}")
+                    print(f"❌ POST /api/message 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
-        elif "POST /api/control" in request:
+        elif "POST /api/control" in header_text:
             try:
-                body = request.split("\r\n\r\n", 1)[1]
-                cmd_data = json.loads(body)
+                cmd_data = json.loads(body_part.decode('utf-8', errors='ignore'))
                 action = cmd_data.get("action")
                 payload = cmd_data.get("payload", "")
                 target_ip = cmd_data.get("target_ip", "255.255.255.255")
@@ -250,7 +279,6 @@ def handle_client(client_conn, client_addr):
                                 send_udp_broadcast(cmd_prefix, ip)
                                 sent_any = True
                     elif target_ip == "all" or target_ip == "255.255.255.255":
-                        # 用 list() 快照，避免 UDP 线程并发修改 dict 时抛 RuntimeError
                         for dev_id, info in list(ALL_DEVICES_STATUS.items()):
                             ip = info.get('network', {}).get('local_ip')
                             if ip and ip != '0.0.0.0':
@@ -307,13 +335,18 @@ def handle_client(client_conn, client_addr):
 
                 resp = json.dumps({"status": "ok" if success else "error", "msg": "指令执行失败" if not success else ""})
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
-            except Exception:
-                pass
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
+            except Exception as e:
+                with print_lock:
+                    print(f"❌ POST /api/control 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
-        elif "GET /api/history" in request:
+        elif "GET /api/history" in header_text:
             try:
-                dev_id = request.split("device_id=")[1].split(" ")[0]
+                dev_id = header_text.split("device_id=")[1].split(" ")[0]
                 conn = sqlite3.connect('track_history.db')
                 c = conn.cursor()
                 c.execute("SELECT lat, lng, timestamp FROM history WHERE device_id=? ORDER BY timestamp DESC LIMIT 50", (dev_id,))
@@ -321,11 +354,14 @@ def handle_client(client_conn, client_addr):
                 conn.close()
                 resp = json.dumps(rows)
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
             except Exception:
-                pass
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
-        elif "GET /api/messages" in request:
+        elif "GET /api/messages" in header_text:
             try:
                 conn = sqlite3.connect('track_history.db')
                 c = conn.cursor()
@@ -334,11 +370,14 @@ def handle_client(client_conn, client_addr):
                 conn.close()
                 resp = json.dumps(rows)
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
             except Exception:
-                pass
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
-        elif "GET /api/chat_history" in request:
+        elif "GET /api/chat_history" in header_text:
             try:
                 devices_list = []
                 for dev_id, info in list(ALL_DEVICES_STATUS.items()):
@@ -346,18 +385,18 @@ def handle_client(client_conn, client_addr):
                     if ip and ip != '0.0.0.0':
                         devices_list.append({"id": dev_id, "ip": ip})
 
-                data_to_send = {
-                    "messages": CHAT_MESSAGES,
-                    "devices": devices_list
-                }
+                data_to_send = {"messages": CHAT_MESSAGES, "devices": devices_list}
                 with print_lock:
                     resp = json.dumps(data_to_send)
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
             except Exception:
-                pass
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
-        elif "GET /" in request:
+        elif "GET /" in header_text:
             chat_options = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" checked><span>所有人 (群发)</span></label>'
 
             html = """<!DOCTYPE html>
@@ -770,7 +809,11 @@ async function showServerMessages() {
 </script>
 </body></html>"""
             client_conn.sendall(
-                f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}".encode('utf-8'))
+                f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\nConnection: close\r\n\r\n{html}".encode('utf-8'))
+
+        else:
+            client_conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
     except Exception:
         pass
     finally:
@@ -802,6 +845,9 @@ def start_server():
             threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
         except KeyboardInterrupt:
             break
+        except Exception as e:
+            print(f"accept 异常: {e}")
+            time.sleep(1)
 
 
 if __name__ == "__main__":
