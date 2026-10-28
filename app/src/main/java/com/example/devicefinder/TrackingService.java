@@ -136,7 +136,6 @@ public class TrackingService extends Service implements LocationListener {
         logStartupSelfCheck();
         // [L0] ===== 自检块结束 =====
 
-        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
