@@ -284,6 +284,18 @@ public class TrackingService extends Service implements LocationListener {
             return "❓";
         }
     }
+    
+    // [L0] SCHEDULE_EXACT_ALARM 是特殊权限(appop)，checkSelfPermission 对它永远返回 DENIED
+    // 正确判断方式是用 AlarmManager.canScheduleExactAlarms()
+    private String canScheduleExactAlarmsStr() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return "N/A";
+        try {
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            return (am != null && am.canScheduleExactAlarms()) ? "✅" : "❌";
+        } catch (Exception e) {
+            return "❓";
+        }
+    }
 
     private void scheduleKeepAliveJob() {
         if (alarmManager == null) return;
