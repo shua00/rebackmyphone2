@@ -21,14 +21,22 @@ public class PowerConnectedReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         String action = intent.getAction();
+        // [L1] 充电插拔日志：确认广播是否收到（Android 8+ 隐式广播可能被拦，日志能区分"没收到"vs"收到了但没执行"）
+        FileLogger.log(context, "POWER", "🔌 " + action);
+
         if (Intent.ACTION_POWER_CONNECTED.equals(action)) {
             // 仅在广播未被系统拦截时执行（App 活跃状态）。
             // 进程被 force-stop / 长时间后台时此分支不会触发，属预期行为。
             Intent svc = new Intent(context, TrackingService.class);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(svc);
-            } else {
-                context.startService(svc);
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(svc);
+                } else {
+                    context.startService(svc);
+                }
+                FileLogger.log(context, "POWER", "✅ 已拉起 TrackingService"); // [L1]
+            } catch (Exception e) {
+                FileLogger.log(context, "POWER", "❌ 拉起服务失败: " + e.getMessage()); // [L0]
             }
         }
         // ACTION_POWER_DISCONNECTED 不需要动作，仅接收用于日志/未来扩展
