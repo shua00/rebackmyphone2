@@ -42,16 +42,24 @@ def main():
         print("11. ☁️ 开启云端日志（上传黑匣子到网页）")
         print("12. ☁️ 关闭云端日志")
         print("13. 🗣️ 向对讲机聊天室发送消息")
+        print("14. 📋 拉取手机日志（主服务器）")
+        print("15. 📋 拉取手机日志（临时服务器，无痕）")
+        print("16. ⏱️ 修改上报间隔（需 ADB，给出命令）")
+        print("17. 📍 手动触发一次定位+上报")
+        print("18. 📡 手动扫描周围 WiFi")
+        print("19. 🔄 重启 UDP 监听")
+        print("20. 🧪 模拟低电量告警（测试用）")
         print(" 0. 🚪 退出")
         print("="*45)
         
-        choice = input("请输入选项 (0-13): ").strip()
+        valid = ['1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20']
+        choice = input("请输入选项 (0-20): ").strip()
         
         if choice == '0':
             print("👋 退出。")
             break
             
-        if choice not in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']:
+        if choice not in valid:
             print("❌ 无效选项，请重新输入。\n")
             continue
 
@@ -97,6 +105,31 @@ def main():
             chat_text = input("请输入要发到对讲机聊天的文字: ").strip()
             if chat_text:
                 send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:PC_Terminal:{chat_text}", target_ip)
+        elif choice == '14':
+            clear = input("上传后清空本地日志？(y/N): ").strip().lower()
+            cmd = f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}:clear" if clear == 'y' else f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}"
+            send_udp(cmd, target_ip)
+        elif choice == '15':
+            temp_url = input(f"请输入临时 URL (回车默认使用 {DEFAULT_SERVER_URL}): ").strip()
+            if not temp_url: temp_url = DEFAULT_SERVER_URL
+            clear = input("上传后清空本地日志？(y/N): ").strip().lower()
+            cmd = f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}:{temp_url}:clear" if clear == 'y' else f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}:{temp_url}"
+            send_udp(cmd, target_ip)
+        elif choice == '16':
+            sec = input("请输入新的上报间隔（秒，默认 1800）: ").strip()
+            if sec.isdigit():
+                print(f"\n⚠️ 修改上报间隔需 ADB 执行（UDP 无法传多参数）：")
+                print(f'adb shell am startservice -n com.example.devicefinder/.TrackingService -a ACTION_UPDATE_RUNTIME_CONFIG --es report_interval_seconds {sec}')
+            else:
+                print("❌ 请输入数字")
+        elif choice == '17':
+            send_udp(f"FIND_ME_LOCATE_ONCE:{RESCUE_SECRET}", target_ip)
+        elif choice == '18':
+            send_udp(f"FIND_ME_SCAN_WIFI:{RESCUE_SECRET}", target_ip)
+        elif choice == '19':
+            send_udp(f"FIND_ME_RESTART_UDP:{RESCUE_SECRET}", target_ip)
+        elif choice == '20':
+            send_udp(f"FIND_ME_TEST_LOW_BATTERY:{RESCUE_SECRET}", target_ip)
 
 if __name__ == "__main__":
     try:
