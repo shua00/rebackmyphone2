@@ -8,15 +8,22 @@ import android.os.Build;
 public class BootReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
-        // 监听系统开机广播 (ACTION_BOOT_COMPLETED)
-        if (Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
+        String action = intent.getAction();
+        // [L0] 开机广播日志：确认开机自启是否真的收到
+        FileLogger.log(context, "BOOT", "📱 开机广播触发: " + action);
+
+        if (Intent.ACTION_BOOT_COMPLETED.equals(action)
+                || "android.intent.action.QUICKBOOT_POWERON".equals(action)) {
             Intent serviceIntent = new Intent(context, TrackingService.class);
-            
-            // 按照高低版本安全规范，开机后自动拉起前台守护服务
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent);
-            } else {
-                context.startService(serviceIntent);
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(serviceIntent);
+                } else {
+                    context.startService(serviceIntent);
+                }
+                FileLogger.log(context, "BOOT", "✅ 已拉起 TrackingService");
+            } catch (Exception e) {
+                FileLogger.log(context, "BOOT", "❌ 拉起失败: " + e.getMessage()); // [L0]
             }
         }
     }
