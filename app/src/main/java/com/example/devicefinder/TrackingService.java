@@ -1,11 +1,13 @@
 package com.example.devicefinder;
 
+import android.Manifest;
 import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.app.admin.DevicePolicyManager;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
@@ -35,6 +37,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
@@ -68,7 +71,7 @@ public class TrackingService extends Service implements LocationListener {
     private SensorManager sensorManager;
     private Sensor motionSensor;
 
-    private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
+    private long reportIntervalMs = 1800 * 1000L;
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
     private int reportCount = 0;
@@ -77,21 +80,17 @@ public class TrackingService extends Service implements LocationListener {
     private boolean enableMotionTrigger = true;
 
     private static long lastReportTime = 0;
-    private static final Object reportLock = new Object(); // 并发上报锁
+    private static final Object reportLock = new Object();
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
     private static long lastNotificationClickTime = 0;
     private static int notificationClickCount = 0;
-
-    // 记录上次传感器触发的时间，防止频繁唤醒导致耗电
     private static long lastSensorTriggerTime = 0;
 
-    // 【3连击去重】记录上次收到的消息，防止因为连发导致UI重复显示
     private static String lastReceivedMsg = "";
     private static long lastReceivedMsgTime = 0;
 
-    // ⚠️【基础配置区】请按需修改
     private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
@@ -102,18 +101,32 @@ public class TrackingService extends Service implements LocationListener {
 
     private BroadcastReceiver batteryMonitor;
 
-    // 【P1-4 修复】UDP 救援监听的实例级状态
-    private volatile boolean serviceDestroyed = false;      // onDestroy 时置 true，线程据此退出
-    private volatile boolean rescueRetryScheduled = false;  // 防重复排延迟重试
-    private DatagramSocket rescueSocketRef = null;          // 保存 socket 引用，供 onDestroy 关闭
+    private volatile boolean serviceDestroyed = false;
+    private volatile boolean rescueRetryScheduled = false;
+    private DatagramSocket rescueSocketRef = null;
 
-    // 用于管理当前的悬浮窗（单条覆盖）
     private final List<android.view.View> activeBubbles = new ArrayList<>();
+
+    // [L1] P3 闹钟偏差跟踪
+    private long lastAlarmExpectedAt = 0;
+    private long lastHeartbeatExpectedAt = 0;
+    // [L1] P3 服务运行时长起点
+    private long serviceCreateTimeMs = 0;
+    // [L1] UDP 连续 bind 失败计数，防止无限重试
+    private int udpBindFailCount = 0;
+    // [L2] 定位节流日志上次记录时间
+    private long lastLocationLogTime = 0;
 
     @Override
     public void onCreate() {
         super.onCreate();
+        serviceCreateTimeMs = SystemClock.elapsedRealtime();
         FileLogger.log(this, "SERVICE", "🚀 追踪服务已启动 (或复活)");
+
+        // [L0] ===== 启动自检块：一次启动把环境全部快照，排查 90% 环境问题 =====
+        logStartupSelfCheck();
+        // [L0] ===== 自检块结束 =====
+
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
 
@@ -153,18 +166,112 @@ public class TrackingService extends Service implements LocationListener {
         scheduleKeepAliveJob();
     }
 
+    /**
+     * [L0] 启动自检块：设备、权限、电池、定位、网络、UDP 一次性快照
+     * 排查问题时先看这里，90% 环境问题能直接定位
+     * 稳定后可精简为只保留关键行（设备 + 权限）
+     */
+    private void logStartupSelfCheck() {
+        try {
+            FileLogger.log(this, "SERVICE", "===== 启动自检 =====");
+
+            // [L0] 设备信息
+            String rom = Build.DISPLAY != null ? Build.DISPLAY : "unknown";
+            FileLogger.log(this, "SERVICE", "设备: " + Build.MANUFACTURER + " " + Build.MODEL
+                    + " | Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
+                    + " | ROM: " + rom);
+            FileLogger.log(this, "SERVICE", "device_id: " + getUniqueDeviceId());
+
+            // [L0] 权限快照
+            if (Build.VERSION.SDK_INT >= 23) {
+                StringBuilder perm = new StringBuilder("权限: ");
+                perm.append("LOC=").append(permStr(Manifest.permission.ACCESS_FINE_LOCATION)).append(", ");
+                if (Build.VERSION.SDK_INT >= 29)
+                    perm.append("BG_LOC=").append(permStr(Manifest.permission.ACCESS_BACKGROUND_LOCATION)).append(", ");
+                if (Build.VERSION.SDK_INT >= 33)
+                    perm.append("NOTIF=").append(permStr(Manifest.permission.POST_NOTIFICATIONS)).append(", ");
+                perm.append("SMS=").append(permStr(Manifest.permission.RECEIVE_SMS)).append(", ");
+                if (Build.VERSION.SDK_INT >= 31)
+                    perm.append("ALARM=").append(permStr(Manifest.permission.SCHEDULE_EXACT_ALARM)).append(", ");
+                perm.append("OVERLAY=").append(Settings.canDrawOverlays(this) ? "✅" : "❌").append(", ");
+                try {
+                    DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+                    ComponentName admin = new ComponentName(this, MyDeviceAdminReceiver.class);
+                    perm.append("ADMIN=").append(dpm != null && dpm.isAdminActive(admin) ? "✅" : "❌");
+                } catch (Exception ignored) {
+                    perm.append("ADMIN=❓");
+                }
+                FileLogger.log(this, "SERVICE", perm.toString());
+            }
+
+            // [L1] 电池与充电
+            try {
+                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                boolean ignored = pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
+                IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+                Intent batteryStatus = registerReceiver(null, ifilter);
+                int level = batteryStatus != null ? batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) : -1;
+                int scale = batteryStatus != null ? batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100) : 100;
+                int plugged = batteryStatus != null ? batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) : 0;
+                int pct = scale > 0 ? level * 100 / scale : -1;
+                FileLogger.log(this, "SERVICE", "电池: 白名单=" + (ignored ? "✅" : "❌")
+                        + " | 充电中=" + (plugged != 0 ? "✅" : "❌")
+                        + " | 电量=" + pct + "%");
+            } catch (Exception ignored) {}
+
+            // [L1] 定位 provider
+            try {
+                boolean gps = locationManager != null && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
+                boolean net = locationManager != null && locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+                FileLogger.log(this, "SERVICE", "定位 provider: GPS=" + (gps ? "on" : "off") + ", NETWORK=" + (net ? "on" : "off"));
+            } catch (Exception ignored) {}
+
+            // [L1] 网络
+            try {
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                NetworkInfo ni = cm != null ? cm.getActiveNetworkInfo() : null;
+                String typeName = (ni != null && ni.isConnected()) ? ni.getTypeName() : "离线";
+                String[] wifi = DeviceInfoUtils.getWifiInfo(this);
+                String ip = DeviceInfoUtils.getLocalIpAddress();
+                FileLogger.log(this, "SERVICE", "网络: " + typeName + " | SSID=" + wifi[0] + " | IP=" + ip);
+            } catch (Exception ignored) {}
+
+            FileLogger.log(this, "SERVICE", "===================");
+        } catch (Exception e) {
+            FileLogger.log(this, "SERVICE", "❌ 自检块异常: " + e.getMessage());
+        }
+    }
+
+    private String permStr(String perm) {
+        try {
+            return checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED ? "✅" : "❌";
+        } catch (Exception e) {
+            return "❓";
+        }
+    }
+
     private void scheduleKeepAliveJob() {
         if (alarmManager == null) return;
         Intent intent = new Intent(this, TrackingService.class);
         intent.setAction("ACTION_KEEP_ALIVE");
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         PendingIntent pi = PendingIntent.getService(this, 1002, intent, flags);
-        
+
         long triggerAt = System.currentTimeMillis() + 15 * 60 * 1000L;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
-        } else {
-            alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pi);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
+            } else {
+                alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pi);
+            }
+        } catch (SecurityException e) {
+            // [L0] 精确闹钟权限被拒，降级为不精确，并记录
+            FileLogger.log(this, "ALARM", "⚠️ 精确闹钟权限缺失，降级为不精确闹钟: " + e.getMessage());
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
+            } else {
+                alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pi);
+            }
         }
     }
 
@@ -181,17 +288,14 @@ public class TrackingService extends Service implements LocationListener {
         @Override
         public void onTrigger(TriggerEvent event) {
             long now = System.currentTimeMillis();
-            // 【P2 优化】3 分钟 → 15 分钟。TYPE_SIGNIFICANT_MOTION 在移动中每 3-5 分钟就会唤醒，
-            // 原 3 分钟节流等于没节流，导致密集上报和耗电。15 分钟仍远低于 30 分钟定时上报，
-            // 保留「移动兜底」能力，同时避免与定时上报重复。
             if (now - lastSensorTriggerTime < 15 * 60 * 1000L) {
-                toggleMotionSensor(true); 
-                return; 
+                toggleMotionSensor(true);
+                return;
             }
             lastSensorTriggerTime = now;
             FileLogger.log(TrackingService.this, "SENSOR", "检测到运动，触发强制上报");
             sendReport(true, true);
-            toggleMotionSensor(true); 
+            toggleMotionSensor(true);
         }
     };
 
@@ -199,7 +303,9 @@ public class TrackingService extends Service implements LocationListener {
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null) {
             String action = intent.getAction();
-            
+            // [L0] 每个 action 都记录，排查"某个功能没触发"时第一眼看到
+            if (action != null) FileLogger.log(this, "SERVICE", "📥 onStartCommand action=" + action);
+
             if ("ACTION_RESET_NOTIFICATION".equals(action)) {
                 notificationClickCount = 0;
                 startForegroundNotification();
@@ -212,7 +318,10 @@ public class TrackingService extends Service implements LocationListener {
                 String newConfigUrl = intent.getStringExtra("config_url");
                 handleUpdateConfigUrl(newConfigUrl);
             } else if ("ACTION_HEARTBEAT".equals(action)) {
-                FileLogger.log(this, "ALARM", "💓 6小时心跳闹钟被唤醒");
+                // [L1] P3 记录心跳偏差
+                long actual = System.currentTimeMillis();
+                long drift = lastHeartbeatExpectedAt > 0 ? actual - lastHeartbeatExpectedAt : -1;
+                FileLogger.log(this, "ALARM", "💓 6小时心跳被唤醒" + (drift >= 0 ? " (偏差 " + drift + "ms)" : ""));
                 triggerRescueListener();
                 fetchRemoteConfig();
                 scheduleHeartbeatAlarm();
@@ -226,8 +335,15 @@ public class TrackingService extends Service implements LocationListener {
             } else if ("ACTION_CLEAR_HISTORY".equals(action)) {
                 clearMessageHistory();
             } else if ("ACTION_ALARM_TRIGGER".equals(action)) {
-                FileLogger.log(this, "ALARM", "⏰ 定时上报闹钟被唤醒");
-                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire();
+                // [L1] P3 记录定时上报偏差（量化 Doze 延迟）
+                long actual = System.currentTimeMillis();
+                long drift = lastAlarmExpectedAt > 0 ? actual - lastAlarmExpectedAt : -1;
+                FileLogger.log(this, "ALARM", "⏰ 定时上报闹钟被唤醒" + (drift >= 0 ? " (偏差 " + drift + "ms)" : ""));
+                if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
+                    try { wifiLock.acquire(); } catch (Exception e) {
+                        FileLogger.log(this, "REPORT", "⚠️ WifiLock acquire 失败: " + e.getMessage()); // [L0]
+                    }
+                }
                 sendReport(true, true);
                 handler.postDelayed(() -> { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); }, 15000);
             } else if ("ACTION_SECRET_UNLOCK".equals(action)) {
@@ -238,7 +354,7 @@ public class TrackingService extends Service implements LocationListener {
                 if (notificationClickCount == 2) { startForegroundNotification(); }
                 else if (notificationClickCount >= 3) {
                     notificationClickCount = 0;
-                    startForegroundNotification(); 
+                    startForegroundNotification();
                     if (!isChatLocked()) {
                         Intent chatIntent = new Intent(this, ChatActivity.class);
                         chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -251,7 +367,16 @@ public class TrackingService extends Service implements LocationListener {
                 String msg = intent.getStringExtra("message");
                 if (msg != null) sendLocalUdpMessage(msg);
             } else if ("ACTION_KEEP_ALIVE".equals(action)) {
-                FileLogger.log(this, "ALARM", "💓 15分钟保活心跳被唤醒");
+                // [L1] P3 记录服务运行时长
+                long uptimeMin = (SystemClock.elapsedRealtime() - serviceCreateTimeMs) / 60000;
+                FileLogger.log(this, "ALARM", "💓 15分钟保活心跳被唤醒 (已运行 " + uptimeMin + " 分钟)");
+                // [L2] 内存占用快照（稳定后可删）
+                try {
+                    Runtime rt = Runtime.getRuntime();
+                    long usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+                    long maxMb = rt.maxMemory() / (1024 * 1024);
+                    FileLogger.log(this, "MEMORY", "💾 内存占用: " + usedMb + "MB / " + maxMb + "MB");
+                } catch (Exception ignored) {}
                 scheduleKeepAliveJob();
             } else if ("ACTION_LOCK_CHAT".equals(action)) {
                 setChatLocked(true);
@@ -300,13 +425,11 @@ public class TrackingService extends Service implements LocationListener {
         String newRecord = timeStr + " | " + message;
 
         String updatedHistory = history.isEmpty() ? newRecord : history + "\n" + newRecord;
-        
+
         String[] lines = updatedHistory.split("\n");
         if (lines.length > 100) {
             StringBuilder sb = new StringBuilder();
-            for (int i = lines.length - 100; i < lines.length; i++) {
-                sb.append(lines[i]).append("\n");
-            }
+            for (int i = lines.length - 100; i < lines.length; i++) sb.append(lines[i]).append("\n");
             updatedHistory = sb.toString().trim();
         }
         sp.edit().putString("chat_history", updatedHistory).apply();
@@ -454,7 +577,9 @@ public class TrackingService extends Service implements LocationListener {
                         () -> { try { wm.removeView(layoutRef); } catch (Exception ignored) {} },
                         null);
 
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                FileLogger.log(this, "UI", "❌ showMessageHistory 失败: " + e.getMessage()); // [L0]
+            }
         });
     }
 
@@ -466,7 +591,7 @@ public class TrackingService extends Service implements LocationListener {
             try {
                 WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
                 if (wm == null) return;
-                
+
                 for (android.view.View oldBubble : activeBubbles) {
                     try { wm.removeView(oldBubble); } catch (Exception ignored) {}
                 }
@@ -482,18 +607,18 @@ public class TrackingService extends Service implements LocationListener {
 
                 TextView textView = new TextView(this);
                 textView.setText(message);
-                textView.setTextSize(20f); 
-                textView.setTypeface(null, android.graphics.Typeface.NORMAL); 
+                textView.setTextSize(20f);
+                textView.setTypeface(null, android.graphics.Typeface.NORMAL);
                 textView.setTextColor(Color.WHITE);
                 textView.setShadowLayer(8f, 3f, 3f, Color.parseColor("#99000000"));
                 textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-                
+
                 textView.setPadding(dpToPx(10), dpToPx(15), dpToPx(20), dpToPx(15));
                 textView.setMaxWidth(msgMaxW);
                 textView.setLineSpacing(15f, 1f);
                 textView.setHorizontallyScrolling(false);
                 textView.setSingleLine(false);
-                
+
                 android.widget.LinearLayout.LayoutParams tvParams = new android.widget.LinearLayout.LayoutParams(
                         android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
                         android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
@@ -519,7 +644,7 @@ public class TrackingService extends Service implements LocationListener {
                         PixelFormat.TRANSLUCENT);
 
                 params.gravity = Gravity.TOP | Gravity.START;
-                params.x = 20; 
+                params.x = 20;
                 params.y = 450;
 
                 wm.addView(layout, params);
@@ -545,7 +670,9 @@ public class TrackingService extends Service implements LocationListener {
                     activeBubbles.remove(layoutRef);
                 }, 24 * 60 * 60 * 1000L);
 
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                FileLogger.log(this, "UI", "❌ showFloatingMessage 失败: " + e.getMessage()); // [L0]
+            }
         });
     }
 
@@ -586,7 +713,7 @@ public class TrackingService extends Service implements LocationListener {
         final float[] downRaw = new float[2];
         final int[] startPos = new int[2];
         final boolean[] dragging = {false};
-        
+
         final Runnable[] pendingSingleTap = new Runnable[1];
         final Handler gestureHandler = new Handler(Looper.getMainLooper());
 
@@ -691,22 +818,32 @@ public class TrackingService extends Service implements LocationListener {
                 }
             }
         };
-        IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-        registerReceiver(batteryMonitor, filter);
+        try {
+            IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+            registerReceiver(batteryMonitor, filter);
+        } catch (Exception e) {
+            FileLogger.log(this, "BATTERY", "❌ 注册电池监听失败: " + e.getMessage()); // [L0]
+        }
     }
 
     private void sendLowBatterySms(int percent) {
         try {
             SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
             String myPhoneNumber = sp.getString("emergency_sms_number", "");
-            if (myPhoneNumber == null || myPhoneNumber.trim().isEmpty()) { return; }
+            if (myPhoneNumber == null || myPhoneNumber.trim().isEmpty()) {
+                FileLogger.log(this, "BATTERY", "⚠️ 低电量告警但未设置紧急号码"); // [L0]
+                return;
+            }
 
             android.telephony.SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                     ? getSystemService(android.telephony.SmsManager.class) : android.telephony.SmsManager.getDefault();
             if (smsManager != null) {
                 smsManager.sendTextMessage(myPhoneNumber, null, "【紧急警告】备用机电量 " + percent + "% 即将关机，请立刻查看服务器最后定位！", null, null);
+                FileLogger.log(this, "BATTERY", "📩 低电量短信已发送 → " + myPhoneNumber); // [L1]
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            FileLogger.log(this, "BATTERY", "❌ 低电量短信发送失败: " + e.getMessage()); // [L0]
+        }
     }
 
     private void playAlarm() {
@@ -716,9 +853,12 @@ public class TrackingService extends Service implements LocationListener {
                 android.media.AudioManager audioManager = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
                 if (audioManager != null) { audioManager.setStreamVolume(android.media.AudioManager.STREAM_ALARM, audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_ALARM), 0); }
                 ringtone.play();
+                FileLogger.log(this, "ALARM", "🔊 警报已播放"); // [L0]
                 handler.postDelayed(() -> { if (ringtone.isPlaying()) ringtone.stop(); }, 30000);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            FileLogger.log(this, "ALARM", "❌ 播放警报失败: " + e.getMessage()); // [L0]
+        }
     }
 
     private void startForegroundNotification() {
@@ -737,7 +877,7 @@ public class TrackingService extends Service implements LocationListener {
 
         int iconRes = android.R.drawable.stat_notify_sync;
         int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
-        
+
         PendingIntent chatPi;
         if (notificationClickCount >= 2 && !isChatLocked()) {
             Intent chatIntent = new Intent(this, ChatActivity.class);
@@ -752,12 +892,22 @@ public class TrackingService extends Service implements LocationListener {
         Notification notification = builder.setContentTitle("系统同步").setContentText("正在运行...").setSmallIcon(iconRes).setContentIntent(chatPi).setOngoing(true).build();
         notification.priority = Notification.PRIORITY_MIN;
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
-        } else {
-            startForeground(1001, notification);
+        // [L0] startForeground 加 try-catch：权限被拒时降级而非崩溃
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+            } else {
+                startForeground(1001, notification);
+            }
+        } catch (Exception e) {
+            FileLogger.log(this, "SERVICE", "❌ 带 location type 的 startForeground 失败，降级为无 type: " + e.getMessage());
+            try {
+                startForeground(1001, notification);
+            } catch (Exception e2) {
+                FileLogger.log(this, "SERVICE", "❌❌ startForeground 彻底失败: " + e2.getMessage());
+            }
         }
     }
 
@@ -768,6 +918,7 @@ public class TrackingService extends Service implements LocationListener {
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         PendingIntent pi = PendingIntent.getService(this, 9999, intent, flags);
         long triggerAt = System.currentTimeMillis() + 6 * 60 * 60 * 1000L;
+        lastHeartbeatExpectedAt = triggerAt; // [L1]
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
         else alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pi);
     }
@@ -814,12 +965,16 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void handleIconVisibility(boolean hideIcon) {
+        // 【架构调整】忽略 hideIcon 参数，永远保持 alias 启用（C 方案配套）
         try {
             PackageManager p = getPackageManager();
             ComponentName componentName = new ComponentName(this, "com.example.devicefinder.VisibleAliasActivity");
-            int newState = hideIcon ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
-            if (p.getComponentEnabledSetting(componentName) != newState) p.setComponentEnabledSetting(componentName, newState, PackageManager.DONT_KILL_APP);
-        } catch (Exception ignored) {}
+            if (p.getComponentEnabledSetting(componentName) != PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
+                p.setComponentEnabledSetting(componentName, PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP);
+            }
+        } catch (Exception e) {
+            FileLogger.log(this, "SERVICE", "⚠️ 修改 alias 状态失败: " + e.getMessage()); // [L1]
+        }
     }
 
     private void registerNetworkCallback() {
@@ -835,23 +990,60 @@ public class TrackingService extends Service implements LocationListener {
                         String[] wifiInfo = DeviceInfoUtils.getWifiInfo(TrackingService.this);
                         String newSsid = wifiInfo[0];
                         if (newSsid.equals("UNKNOWN") || newSsid.equals("<unknown ssid>")) return;
-                        if (!oldSsid.equals(newSsid) && !oldSsid.equals("UNKNOWN")) { sendReport(true, false); triggerRescueListener(); }
+                        if (!oldSsid.equals(newSsid) && !oldSsid.equals("UNKNOWN")) {
+                            // [L1] 网络切换日志
+                            FileLogger.log(TrackingService.this, "NETWORK", "✅ WiFi 连接: SSID=" + newSsid + ", IP=" + DeviceInfoUtils.getLocalIpAddress());
+                            sendReport(true, false);
+                            triggerRescueListener();
+                        }
                     }
                     @Override
-                    public void onLost(Network network) { super.onLost(network); sendReport(true, false); }
+                    public void onLost(Network network) {
+                        super.onLost(network);
+                        FileLogger.log(TrackingService.this, "NETWORK", "❌ WiFi 断开"); // [L1]
+                        sendReport(true, false);
+                    }
                 };
                 cm.registerNetworkCallback(request, networkCallback);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            FileLogger.log(this, "NETWORK", "❌ 注册网络回调失败: " + e.getMessage()); // [L0]
+        }
     }
 
     private void startLocationUpdates() {
         try {
             locationManager.removeUpdates(this);
+            // [L1] provider 状态快照
+            boolean gpsOn = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
+            boolean netOn = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+            FileLogger.log(this, "LOCATION", "provider 状态: GPS=" + (gpsOn ? "on" : "off")
+                    + ", NETWORK=" + (netOn ? "on" : "off") + ", 模式=" + accuracyMode);
+
             long minTime = 60000L;
-            if ("fine".equals(accuracyMode) && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) { locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, 0f, this); }
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) { locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this); }
-        } catch (SecurityException ignored) {}
+            if ("fine".equals(accuracyMode) && gpsOn) { locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, 0f, this); }
+            if (netOn) { locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this); }
+        } catch (SecurityException e) {
+            FileLogger.log(this, "LOCATION", "❌ 定位权限缺失，无法注册 provider: " + e.getMessage()); // [L0]
+        } catch (Exception e) {
+            FileLogger.log(this, "LOCATION", "❌ 注册定位监听失败: " + e.getMessage()); // [L0]
+        }
+    }
+
+    @Override
+    public void onLocationChanged(Location location) {
+        if (location != null) {
+            lastLocation = location;
+            // [L2] 节流：每 5 分钟最多记一次（否则 GPS 每秒回调刷爆）
+            long now = System.currentTimeMillis();
+            if (now - lastLocationLogTime > 5 * 60 * 1000L) {
+                lastLocationLogTime = now;
+                FileLogger.log(this, "LOCATION", "📍 lat=" + location.getLatitude()
+                        + ", lng=" + location.getLongitude()
+                        + ", acc=" + location.getAccuracy() + "m"
+                        + ", provider=" + location.getProvider());
+            }
+        }
     }
 
     private void requestSingleLocationAndReport() {
@@ -880,10 +1072,12 @@ public class TrackingService extends Service implements LocationListener {
         if (alarmManager == null || alarmPendingIntent == null) return;
         long delay = (reportCount == 1 || reportCount == 2) ? 3 * 60 * 1000L : reportIntervalMs;
         long triggerAtMillis = System.currentTimeMillis() + delay;
+        lastAlarmExpectedAt = triggerAtMillis; // [L1] P3 记录预期时间
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) { alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent); }
             else { alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent); }
         } catch (SecurityException e) {
+            FileLogger.log(this, "ALARM", "⚠️ 精确闹钟权限缺失，降级: " + e.getMessage()); // [L1]
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) { alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent); }
             else { alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent); }
         }
@@ -893,10 +1087,10 @@ public class TrackingService extends Service implements LocationListener {
 
     private void sendReport(final boolean withNearbyWifi, boolean force, final String overrideUrl) {
         long currentTime = System.currentTimeMillis();
-        
+
         synchronized (reportLock) {
             if (!force && currentTime - lastReportTime < 5000) return;
-            if (force && currentTime - lastReportTime < 2000) return; 
+            if (force && currentTime - lastReportTime < 2000) return;
             lastReportTime = currentTime;
         }
 
@@ -904,22 +1098,27 @@ public class TrackingService extends Service implements LocationListener {
 
         new Thread(() -> {
             boolean success = false;
-            if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) { wifiLock.acquire(); }
+            if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
+                try { wifiLock.acquire(); } catch (Exception e) {
+                    FileLogger.log(TrackingService.this, "REPORT", "⚠️ WifiLock acquire 失败: " + e.getMessage()); // [L0]
+                }
+            }
             try {
-                if (wakeLock != null) wakeLock.acquire(10000);
+                if (wakeLock != null) {
+                    try { wakeLock.acquire(10000); } catch (Exception e) {
+                        FileLogger.log(TrackingService.this, "REPORT", "⚠️ WakeLock acquire 失败: " + e.getMessage()); // [L0]
+                    }
+                }
                 int[] battery = DeviceInfoUtils.getBatteryInfo(TrackingService.this);
                 String[] wifi = DeviceInfoUtils.getWifiInfo(TrackingService.this);
                 String wifiSsid = wifi[0];
                 String ip = DeviceInfoUtils.getLocalIpAddress();
-                
+
                 ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
                 NetworkInfo activeNet = cm.getActiveNetworkInfo();
                 boolean isOnline = (activeNet != null && activeNet.isConnected());
                 FileLogger.log(TrackingService.this, "REPORT", "准备上报. 网络:" + (isOnline ? activeNet.getTypeName() : "离线") + " | SSID:" + wifiSsid + " | IP:" + ip + " | 电量:" + battery[0] + "%");
 
-                // 【P3 优化】离线且非显式临时上报（FIND_ME_REPORT_TEMP）时，跳过本次请求，
-                // 省掉 15 秒的无效 timeout 与耗电。return 后走 finally：release 锁 + reportCount++ + scheduleNextReport，
-                // 上报链不断，下次闹钟照常触发。
                 if (!isOnline && overrideUrl == null) {
                     FileLogger.log(TrackingService.this, "REPORT", "⚠️ 网络离线，跳过本次上报");
                     return;
@@ -932,19 +1131,17 @@ public class TrackingService extends Service implements LocationListener {
                 JSONObject json = new JSONObject();
                 json.put("device_id", getUniqueDeviceId()); json.put("token", AUTH_TOKEN); json.put("timestamp", System.currentTimeMillis());
                 json.put("os_version", "Android " + Build.VERSION.RELEASE); json.put("chat_locked", isChatLocked());
-                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE); json.put("is_screen_on", pm != null && pm.isInteractive()); json.put("uptime_ms", android.os.SystemClock.elapsedRealtime());
+                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE); json.put("is_screen_on", pm != null && pm.isInteractive()); json.put("uptime_ms", SystemClock.elapsedRealtime());
                 JSONObject battObj = new JSONObject(); battObj.put("level", battery[0]); battObj.put("is_charging", battery[1] == 1); json.put("battery", battObj);
                 JSONObject netObj = new JSONObject(); netObj.put("wifi_ssid", wifi[0]); netObj.put("wifi_bssid", wifi[1]); netObj.put("wifi_rssi", Integer.parseInt(wifi[2])); netObj.put("local_ip", ip); json.put("network", netObj);
                 JSONObject locObj = new JSONObject();
                 if (loc != null) { locObj.put("latitude", loc.getLatitude()); locObj.put("longitude", loc.getLongitude()); locObj.put("accuracy", loc.getAccuracy()); locObj.put("provider", loc.getProvider()); locObj.put("time", loc.getTime()); }
                 else { locObj.put("latitude", JSONObject.NULL); locObj.put("longitude", JSONObject.NULL); locObj.put("accuracy", -1.0); locObj.put("provider", "none"); locObj.put("time", 0L); }
                 json.put("location", locObj);
-                
+
                 if (isCloudLogEnabled()) {
                     String memoryLogs = FileLogger.getMemoryLogs();
-                    if (!memoryLogs.isEmpty()) {
-                        json.put("cloud_logs", memoryLogs);
-                    }
+                    if (!memoryLogs.isEmpty()) json.put("cloud_logs", memoryLogs);
                 }
 
                 if (withNearbyWifi) {
@@ -952,45 +1149,56 @@ public class TrackingService extends Service implements LocationListener {
                 }
                 URL url = new URL(activeUrl);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                // 【P4 优化】弱网下 10 秒偏紧，放宽到 15 秒，减少 timeout
                 conn.setRequestMethod("POST"); conn.setRequestProperty("Content-Type", "application/json"); conn.setConnectTimeout(15000); conn.setReadTimeout(15000); conn.setDoOutput(true);
+
+                long httpStart = System.currentTimeMillis(); // [L1] 记录 HTTP 耗时
                 OutputStream os = conn.getOutputStream(); os.write(json.toString().getBytes("UTF-8")); os.flush(); os.close();
-                // 【P1 优化】提前取 code，非 200 时记录日志，不再静默
                 int httpCode = conn.getResponseCode();
+                long httpCost = System.currentTimeMillis() - httpStart;
+
                 if (httpCode == 200) {
                     BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream())); StringBuilder sb = new StringBuilder(); String line;
                     while ((line = br.readLine()) != null) sb.append(line);
                     br.close(); if (overrideUrl == null) parseResponse(new JSONObject(sb.toString())); success = true;
-                    FileLogger.log(TrackingService.this, "REPORT", "✅ 上报成功");
+                    FileLogger.log(TrackingService.this, "REPORT", "✅ 上报成功 (耗时 " + httpCost + "ms)");
                 } else {
-                    // 【P1 优化】非 200（403/500/502/504 等）不再静默，记录状态码便于排查
-                    FileLogger.log(TrackingService.this, "REPORT", "⚠️ 上报返回非200: HTTP " + httpCode + " | " + activeUrl);
+                    FileLogger.log(TrackingService.this, "REPORT", "⚠️ 上报返回非200: HTTP " + httpCode + " (耗时 " + httpCost + "ms) | " + activeUrl);
                 }
                 conn.disconnect();
             } catch (Exception e) {
-                FileLogger.log(TrackingService.this, "REPORT", "❌ 上报异常: " + e.getMessage());
-                Log.e("TrackingService", "===== 上报失败啦 ====="); Log.e("TrackingService", "目标URL: " + activeUrl); Log.e("TrackingService", "报错原因: " + e.toString());
-            } finally { 
-                if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); 
-                if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); 
-                
+                String errMsg = e.getMessage();
+                // [L0] DNS 失败单独记录，附网络类型，便于区分"网络问题"vs"服务端问题"
+                if (errMsg != null && errMsg.contains("Unable to resolve host")) {
+                    FileLogger.log(TrackingService.this, "REPORT", "❌ DNS 解析失败: " + errMsg);
+                } else {
+                    FileLogger.log(TrackingService.this, "REPORT", "❌ 上报异常: " + errMsg);
+                }
+                Log.e("TrackingService", "===== 上报失败啦 =====");
+                Log.e("TrackingService", "目标URL: " + activeUrl);
+                Log.e("TrackingService", "报错原因: " + e.toString());
+            } finally {
+                try {
+                    if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                    if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+                } catch (Exception ignored) {}
+
                 if (overrideUrl == null) {
                     reportCount++;
                     scheduleNextReport();
                 }
             }
-            
-            if (success) { 
-                consecutiveFailures = 0; 
-                fetchRemoteConfig(); 
-            } else { 
-                if (overrideUrl == null) { 
-                    consecutiveFailures++; 
-                    if (consecutiveFailures >= 1) { 
-                        triggerRescueListener(); 
-                        fetchRemoteConfig(); 
-                    } 
-                } 
+
+            if (success) {
+                consecutiveFailures = 0;
+                fetchRemoteConfig();
+            } else {
+                if (overrideUrl == null) {
+                    consecutiveFailures++;
+                    if (consecutiveFailures >= 1) {
+                        triggerRescueListener();
+                        fetchRemoteConfig();
+                    }
+                }
             }
         }).start();
     }
@@ -1024,8 +1232,6 @@ public class TrackingService extends Service implements LocationListener {
         return l1;
     }
 
-    // 【P1-4 修复】原版「flag=true 就什么都不做」改为「flag=true 排 8 秒后检查」
-    // 8 秒 > 旧实例 onDestroy 后 close socket + 3 秒 soTimeout 的退出窗口
     private void triggerRescueListener() {
         if (serviceDestroyed) return;
         if (isListeningForRescue) {
@@ -1043,44 +1249,45 @@ public class TrackingService extends Service implements LocationListener {
         startRescueListener();
     }
 
-    // 【3连击去重】发送端连发 3 次
     private void sendLocalUdpMessage(final String message) {
         new Thread(() -> {
             try {
-                java.net.DatagramSocket socket = new java.net.DatagramSocket(); 
+                java.net.DatagramSocket socket = new java.net.DatagramSocket();
                 socket.setBroadcast(true);
                 String myId = getUniqueDeviceId();
                 String payload = "FIND_ME_MSG:" + RESCUE_SECRET + ":" + myId + ":" + message;
                 byte[] buf = payload.getBytes("UTF-8");
                 java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length, java.net.InetAddress.getByName("255.255.255.255"), 8888);
-                
+
                 for (int i = 0; i < 3; i++) {
                     socket.send(packet);
                     try { Thread.sleep(50); } catch (InterruptedException ignored) {}
                 }
                 socket.close();
-            } catch (Exception e) { Log.e("TrackingService", "UDP 发送失败: " + e.toString()); }
+            } catch (Exception e) {
+                Log.e("TrackingService", "UDP 发送失败: " + e.toString());
+                FileLogger.log(TrackingService.this, "UDP", "❌ 发送失败: " + e.getMessage()); // [L1]
+            }
         }).start();
     }
 
-    // 【P1-4 修复】setSoTimeout(0)→3000、while(true)→while(!serviceDestroyed)、保存 socket 引用
-    // 内部所有 FIND_ME_* 分支与原版一字不差
     private void startRescueListener() {
         isListeningForRescue = true;
         new Thread(() -> {
             DatagramSocket rescueSocket = null;
             try {
                 rescueSocket = new DatagramSocket(8888); rescueSocket.setBroadcast(true);
-                // 【P1-4 修复】3 秒超时，让线程每 3 秒检查 serviceDestroyed
                 rescueSocket.setSoTimeout(3000);
-                // 【P1-4 修复】保存引用，供 onDestroy 主动 close
                 rescueSocketRef = rescueSocket;
+                udpBindFailCount = 0;
+                // [L0] bind 成功日志（之前只有失败有日志，成功没记录）
+                FileLogger.log(this, "UDP", "✅ 监听已绑定 8888");
+
                 byte[] buffer = new byte[512]; DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 while (!serviceDestroyed) {
                     try {
                         rescueSocket.receive(packet);
                     } catch (java.net.SocketTimeoutException te) {
-                        // 3 秒无包，回到 while 检查 serviceDestroyed，继续等
                         continue;
                     }
                     String message = new String(packet.getData(), 0, packet.getLength());
@@ -1101,32 +1308,31 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { playAlarm(); }
                     } else if (message.startsWith("FIND_ME_MSG:")) {
                         String[] parts = message.split(":", 4);
-                        
+
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String msgContent = parts[2].trim();
                             showFloatingMessage(msgContent);
-                        } 
+                        }
                         else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
-                            
+
                             if (senderId.equals(getUniqueDeviceId())) { continue; }
 
-                            // 【3连击去重】接收端拦截 3 秒内的重复包
                             String dedupKey = senderId + ":" + msgContent;
                             long now = System.currentTimeMillis();
                             if (dedupKey.equals(lastReceivedMsg) && (now - lastReceivedMsgTime < 3000)) {
-                                continue; 
+                                continue;
                             }
                             lastReceivedMsg = dedupKey;
                             lastReceivedMsgTime = now;
-                            
+
                             String shortName = senderId;
                             if (shortName.contains("_")) { shortName = shortName.substring(0, shortName.lastIndexOf("_")); }
-                            
+
                             saveChatToHistory("[" + shortName + "] " + msgContent);
                             FileLogger.log(TrackingService.this, "CHAT", "收到来自 " + shortName + " 的消息: " + msgContent);
-                            
+
                             if (ChatActivity.isForeground) {
                                 Intent updateIntent = new Intent("UPDATE_CHAT_UI"); sendBroadcast(updateIntent);
                             }
@@ -1174,21 +1380,29 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { setChatLocked(true); handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔒 聊天功能已锁定", android.widget.Toast.LENGTH_SHORT).show()); }
                     }
                 }
-            } catch (Exception e) { 
-                Log.e("TrackingService", "UDP 监听异常: " + e.toString()); 
-            } finally { 
-                if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close(); 
+            } catch (java.net.BindException be) {
+                udpBindFailCount++;
+                FileLogger.log(this, "UDP", "❌ bind 失败 (第 " + udpBindFailCount + " 次): " + be.getMessage()); // [L0]
+            } catch (Exception e) {
+                Log.e("TrackingService", "UDP 监听异常: " + e.toString());
+                FileLogger.log(this, "UDP", "❌ 监听异常: " + e.getMessage()); // [L0]
+            } finally {
+                if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close();
                 rescueSocketRef = null;
                 isListeningForRescue = false;
-                
-                // 【P1-4 修复】主动销毁时不重试，让新实例接管
+
                 if (!serviceDestroyed) {
-                    handler.postDelayed(() -> {
-                        if (!isListeningForRescue && !serviceDestroyed) {
-                            FileLogger.log(TrackingService.this, "UDP", "监听断开，5秒后尝试重连...");
-                            triggerRescueListener();
-                        }
-                    }, 5000);
+                    // [L1] 连续 bind 失败 >= 5 次就放弃，防止无限重试
+                    if (udpBindFailCount >= 5) {
+                        FileLogger.log(this, "UDP", "⚠️ 连续 " + udpBindFailCount + " 次 bind 失败，停止重试直到下次手动触发");
+                    } else {
+                        handler.postDelayed(() -> {
+                            if (!isListeningForRescue && !serviceDestroyed) {
+                                FileLogger.log(TrackingService.this, "UDP", "监听断开，5秒后尝试重连...");
+                                triggerRescueListener();
+                            }
+                        }, 5000);
+                    }
                 }
             }
         }).start();
@@ -1205,29 +1419,44 @@ public class TrackingService extends Service implements LocationListener {
         handleIconVisibility(cfg.optBoolean("hide_icon", true));
     }
 
-    @Override public void onLocationChanged(Location location) { if (location != null) lastLocation = location; }
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        // [L1] 系统内存压力信号，杀进程前的预警
+        FileLogger.log(this, "SERVICE", "⚠️ onLowMemory: 系统内存压力");
+    }
 
-    // 【P1-4 + P2-3 修复】补全资源清理，顺序：置标志 → 关 socket → 定位/悬浮窗 → 原有清理 → handler
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        // [L1] 只记录关键级别，避免频繁
+        if (level >= TRIM_MEMORY_RUNNING_LOW) {
+            FileLogger.log(this, "SERVICE", "⚠️ onTrimMemory level=" + level);
+        }
+    }
+
     @Override
     public void onDestroy() {
         super.onDestroy();
 
-        // 【P1-4 修复】置销毁标志，让 UDP 线程的 while 循环退出
+        // [L0] 记录销毁（能区分"正常退出"vs"系统杀"）
+        FileLogger.log(this, "SERVICE", "🛑 服务销毁");
+
         serviceDestroyed = true;
 
-        // 【P1-4 修复】关闭救援 socket，唤醒阻塞在 receive() 的线程
-        // 线程收到 SocketException 后走 finally，因为 serviceDestroyed=true 不再重试
         if (rescueSocketRef != null) {
-            try { rescueSocketRef.close(); } catch (Exception ignored) {}
+            try { rescueSocketRef.close(); } catch (Exception e) {
+                FileLogger.log(this, "SERVICE", "⚠️ close rescueSocket 失败: " + e.getMessage()); // [L1]
+            }
             rescueSocketRef = null;
         }
 
-        // 【P2-3① 修复】移除定位监听，防止多实例叠加导致息屏耗电上升
         if (locationManager != null) {
-            try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
+            try { locationManager.removeUpdates(this); } catch (Exception e) {
+                FileLogger.log(this, "SERVICE", "⚠️ removeUpdates 失败: " + e.getMessage()); // [L1]
+            }
         }
 
-        // 【P2-3② 修复】移除残留的悬浮窗气泡，否则服务死后气泡还挂在屏幕上
         try {
             WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
             if (wm != null) {
@@ -1238,15 +1467,12 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
         activeBubbles.clear();
 
-        // 原有清理
         if (batteryMonitor != null) { try { unregisterReceiver(batteryMonitor); } catch (Exception ignored) {} }
         if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
-        // 【P2-3⑤ 修复】顺手补 wakeLock 释放
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         if (sensorManager != null && motionListener != null) sensorManager.cancelTriggerSensor(motionListener, motionSensor);
         try { ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE); if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) cm.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
 
-        // 【P2-3④ 修复】清理所有 delayed 任务，防止 24 小时后的 removeView / 5 秒重试持有已销毁的 this
         handler.removeCallbacksAndMessages(null);
     }
 
