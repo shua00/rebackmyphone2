@@ -189,4 +189,39 @@ public class DeviceInfoUtils {
         }
         return result;
     }
+
+    /**
+     * 把 List<ScanResult> 转成按信号强度降序的 JSONObject 列表，最多 MAX_NEARBY_WIFI 个。
+     * 抽成辅助方法，供「正常扫描」和「缓存降级」复用。
+     */
+    private static List<JSONObject> buildResultFromScanResults(Context context, List<ScanResult> scanResults, String source) {
+        List<JSONObject> out = new ArrayList<>();
+        if (scanResults == null || scanResults.isEmpty()) {
+            FileLogger.log(context, "WIFI", "📡 " + source + ": 0 个热点");
+            return out;
+        }
+        List<ScanResult> filtered = new ArrayList<>();
+        for (ScanResult r : scanResults) {
+            if (r.SSID != null && !r.SSID.isEmpty()) filtered.add(r);
+        }
+        Collections.sort(filtered, new Comparator<ScanResult>() {
+            @Override
+            public int compare(ScanResult a, ScanResult b) {
+                return b.level - a.level;
+            }
+        });
+        int count = Math.min(filtered.size(), MAX_NEARBY_WIFI);
+        for (int i = 0; i < count; i++) {
+            ScanResult r = filtered.get(i);
+            try {
+                JSONObject obj = new JSONObject();
+                obj.put("ssid", r.SSID);
+                obj.put("bssid", r.BSSID != null ? r.BSSID : "");
+                obj.put("rssi", r.level);
+                out.add(obj);
+            } catch (Exception ignored) {}
+        }
+        FileLogger.log(context, "WIFI", "📡 " + source + ": " + out.size() + " 个热点");
+        return out;
+    }
 }
