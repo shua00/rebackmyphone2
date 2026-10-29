@@ -117,7 +117,8 @@
             android:name=".ChatActivity"
             android:exported="true"
             android:windowSoftInputMode="adjustResize"
-            android:excludeFromRecents="true" />
+            android:excludeFromRecents="true" 
+            android:taskAffinity="com.example.devicefinder.chat" />
 
         <!-- 权限引导主界面 -->
         <activity
