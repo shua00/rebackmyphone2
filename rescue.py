@@ -6,13 +6,14 @@ RESCUE_SECRET = "your_private_secret_key"  # ⚠️ 必须与手机端一致
 DEFAULT_SERVER_URL = "http://dingwei.bai001.de5.net/api/report"
 DEFAULT_CONFIG_URL = "https://your-config-url.com/config.txt"
 
+
 def send_udp(command_str, target_ip="255.255.255.255"):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    
+
     print(f"\n📡 发送指令至 {target_ip}: {command_str}")
     send_times = 3 if target_ip == "255.255.255.255" else 1
-    
+
     for i in range(send_times):
         sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
         if send_times > 1:
@@ -20,15 +21,29 @@ def send_udp(command_str, target_ip="255.255.255.255"):
             time.sleep(1)
         else:
             print(f"   [1/1] 发送成功 (单播模式)")
-            
+
     sock.close()
     print("✅ 发送完毕。请查看手机响应。\n")
 
+
+def is_valid_url(url):
+    """[新增] URL 合法性校验：必须含 ://，长度 ≥ 10。
+    与手机端 TrackingService.isValidUrl() 保持一致，
+    避免非法输入（如 "http"）浪费 UDP 广播，且用户能立即看到错误提示。"""
+    if not url:
+        return False
+    if "://" not in url:
+        return False
+    if len(url) < 10:
+        return False
+    return True
+
+
 def main():
     while True:
-        print("="*45)
+        print("=" * 45)
         print("🛠️  局域网轻量级救援/调试终端")
-        print("="*45)
+        print("=" * 45)
         print(" 1. 📍 强制向【当前主服务器】上报一次")
         print(" 2. 🕵️ 强制向【临时服务器】上报一次 (无痕调试)")
         print(" 3. 🌐 更换手机的主服务器地址")
@@ -50,35 +65,50 @@ def main():
         print("19. 🔄 重启 UDP 监听")
         print("20. 🧪 模拟低电量告警（测试用）")
         print(" 0. 🚪 退出")
-        print("="*45)
-        
-        valid = ['1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20']
+        print("=" * 45)
+
+        valid = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20']
         choice = input("请输入选项 (0-20): ").strip()
-        
+
         if choice == '0':
             print("👋 退出。")
             break
-            
+
         if choice not in valid:
             print("❌ 无效选项，请重新输入。\n")
             continue
 
         ip_input = input("🎯 目标手机 IP (回车直接发全局广播): ").strip()
         target_ip = ip_input if ip_input else "255.255.255.255"
-        
+
         if choice == '1':
             send_udp(f"FIND_ME_REPORT:{RESCUE_SECRET}", target_ip)
         elif choice == '2':
             temp_url = input(f"请输入临时 URL (回车默认使用 {DEFAULT_SERVER_URL}): ").strip()
-            if not temp_url: temp_url = DEFAULT_SERVER_URL
+            if not temp_url:
+                temp_url = DEFAULT_SERVER_URL
+            # [修复] 校验 URL 合法性，避免 "http" 这种不完整输入发到手机
+            if not is_valid_url(temp_url):
+                print(f"❌ 临时 URL 非法（必须含 ://，如 http://xxx:8080/api/report）: {temp_url}")
+                continue
             send_udp(f"FIND_ME_REPORT_TEMP:{RESCUE_SECRET}:{temp_url}", target_ip)
         elif choice == '3':
             new_server = input(f"请输入新的主服务器 URL (回车默认 {DEFAULT_SERVER_URL}): ").strip()
-            if not new_server: new_server = DEFAULT_SERVER_URL
+            if not new_server:
+                new_server = DEFAULT_SERVER_URL
+            # [修复] 校验 URL 合法性，防止把非法值存进手机 SharedPreferences，锁死所有上报
+            if not is_valid_url(new_server):
+                print(f"❌ 主服务器 URL 非法（必须含 ://）: {new_server}")
+                continue
             send_udp(f"FIND_ME_SERVER:{RESCUE_SECRET}:{new_server}", target_ip)
         elif choice == '4':
             new_config = input(f"请输入新的配置中心 URL (回车默认 {DEFAULT_CONFIG_URL}): ").strip()
-            if not new_config: new_config = DEFAULT_CONFIG_URL
+            if not new_config:
+                new_config = DEFAULT_CONFIG_URL
+            # [修复] 校验 URL 合法性
+            if not is_valid_url(new_config):
+                print(f"❌ 配置中心 URL 非法（必须含 ://）: {new_config}")
+                continue
             send_udp(f"FIND_ME_CONFIG:{RESCUE_SECRET}:{new_config}", target_ip)
         elif choice == '5':
             print("\n⚠️ 警告: 手机将以最大音量播放 30 秒警报！")
@@ -111,7 +141,12 @@ def main():
             send_udp(cmd, target_ip)
         elif choice == '15':
             temp_url = input(f"请输入临时 URL (回车默认使用 {DEFAULT_SERVER_URL}): ").strip()
-            if not temp_url: temp_url = DEFAULT_SERVER_URL
+            if not temp_url:
+                temp_url = DEFAULT_SERVER_URL
+            # [修复] 校验 URL 合法性
+            if not is_valid_url(temp_url):
+                print(f"❌ 临时 URL 非法（必须含 ://）: {temp_url}")
+                continue
             clear = input("上传后清空本地日志？(y/N): ").strip().lower()
             cmd = f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}:{temp_url}:clear" if clear == 'y' else f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}:{temp_url}"
             send_udp(cmd, target_ip)
@@ -130,6 +165,7 @@ def main():
             send_udp(f"FIND_ME_RESTART_UDP:{RESCUE_SECRET}", target_ip)
         elif choice == '20':
             send_udp(f"FIND_ME_TEST_LOW_BATTERY:{RESCUE_SECRET}", target_ip)
+
 
 if __name__ == "__main__":
     try:
