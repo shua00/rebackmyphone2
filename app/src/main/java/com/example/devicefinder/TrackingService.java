@@ -563,7 +563,13 @@ public class TrackingService extends Service implements LocationListener {
                 json.put("time_str", timeStr);
                 json.put("timestamp", System.currentTimeMillis());
 
-                URL url = new URL(getCurrentServerUrl().replace("/api/report", "/api/message"));
+                // [修复] 用 buildApiUrl 健壮拼接，URL 非法时直接返回
+                String msgUrl = buildApiUrl(getCurrentServerUrl(), "message");
+                if (msgUrl == null) {
+                    Log.e("TrackingService", "syncMessageToServer: server_url 非法，跳过");
+                    return;
+                }
+                URL url = new URL(msgUrl);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json");
@@ -1054,26 +1060,47 @@ public class TrackingService extends Service implements LocationListener {
 
     private String getCurrentServerUrl() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-        return sp.getString("saved_server_url", defaultServerUrl);
+        String saved = sp.getString("saved_server_url", defaultServerUrl);
+        // [修复] 校验已存值是否合法（防止之前测试时存进了 "http" 这类非法值，锁死所有上报）
+        if (!isValidUrl(saved)) {
+            FileLogger.log(this, "CONFIG", "⚠️ saved_server_url 非法: [" + saved + "]，回退默认值");
+            sp.edit().putString("saved_server_url", defaultServerUrl).apply();
+            return defaultServerUrl;
+        }
+        return saved;
     }
 
     private void saveNewServerUrl(String newUrl) {
-        if (newUrl != null && !newUrl.isEmpty()) {
-            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-            sp.edit().putString("saved_server_url", newUrl).apply();
+        // [修复] 校验 URL 合法性，拒绝 "http" 这种非法值（rescue.py 直接 UDP 绕过 server2.py 的情况）
+        if (!isValidUrl(newUrl)) {
+            FileLogger.log(this, "CONFIG", "⚠️ 拒绝保存非法 server_url: [" + newUrl + "]");
+            return;
         }
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        sp.edit().putString("saved_server_url", newUrl).apply();
+        FileLogger.log(this, "CONFIG", "📝 server_url 已更新: " + newUrl);
     }
 
     private String getRemoteConfigUrl() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-        return sp.getString("saved_config_url", DEFAULT_REMOTE_CONFIG_URL);
+        String saved = sp.getString("saved_config_url", DEFAULT_REMOTE_CONFIG_URL);
+        // [修复] 校验已存值是否合法
+        if (!isValidUrl(saved)) {
+            FileLogger.log(this, "CONFIG", "⚠️ saved_config_url 非法: [" + saved + "]，回退默认值");
+            return DEFAULT_REMOTE_CONFIG_URL;
+        }
+        return saved;
     }
 
     private void saveRemoteConfigUrl(String url) {
-        if (url != null && !url.isEmpty()) {
-            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-            sp.edit().putString("saved_config_url", url).apply();
+        // [修复] 校验 URL 合法性
+        if (!isValidUrl(url)) {
+            FileLogger.log(this, "CONFIG", "⚠️ 拒绝保存非法 config_url: [" + url + "]");
+            return;
         }
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        sp.edit().putString("saved_config_url", url).apply();
+        FileLogger.log(this, "CONFIG", "📝 config_url 已更新: " + url);
     }
 
     private void handleUpdateConfigUrl(String newConfigUrl) {
@@ -1289,7 +1316,15 @@ public class TrackingService extends Service implements LocationListener {
 
                 Location loc = lastLocation;
                 if (loc == null) {
-                    try { loc = getBetterLocation(locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER), locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)); loc = getBetterLocation(loc, locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER)); } catch (SecurityException ignored) {}
+                    // [修复] 每个 getLastKnownLocation 单独 try-catch
+                    // 红米 Android 15 上 getLastKnownLocation(NETWORK_PROVIDER) 会抛
+                    // IllegalArgumentException（provider 不存在），旧代码只 catch SecurityException 会漏
+                    Location netLoc = null, gpsLoc = null, passiveLoc = null;
+                    try { netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
+                    try { gpsLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER); } catch (Exception ignored) {}
+                    try { passiveLoc = locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER); } catch (Exception ignored) {}
+                    loc = getBetterLocation(netLoc, gpsLoc);
+                    loc = getBetterLocation(loc, passiveLoc);
                 }
                 JSONObject json = new JSONObject();
                 json.put("device_id", getUniqueDeviceId()); json.put("token", AUTH_TOKEN); json.put("timestamp", System.currentTimeMillis());
@@ -1392,7 +1427,15 @@ public class TrackingService extends Service implements LocationListener {
                 long originalSize = logFile.length();
 
                 String baseUrl = (tempUrl != null && !tempUrl.isEmpty()) ? tempUrl : getCurrentServerUrl();
-                String uploadUrl = baseUrl.replace("/api/report", "/api/upload_log");
+                FileLogger.log(this, "UPLOAD_LOG", "📤 baseUrl=[" + baseUrl + "] (tempUrl=[" + tempUrl + "])");
+
+                // [修复] 用 buildApiUrl 健壮拼接，非法 baseUrl 时明确拒绝，不再抛 "no protocol"
+                String uploadUrl = buildApiUrl(baseUrl, "upload_log");
+                if (uploadUrl == null) {
+                    FileLogger.log(this, "UPLOAD_LOG", "❌ baseUrl 非法，无法拼接上传 URL: [" + baseUrl + "]");
+                    return;
+                }
+
                 String deviceId = getUniqueDeviceId();
                 String fullUrl = uploadUrl
                         + (uploadUrl.contains("?") ? "&" : "?")
@@ -1509,6 +1552,37 @@ public class TrackingService extends Service implements LocationListener {
         return l1;
     }
 
+    /**
+     * [修复] URL 合法性校验：必须含 ://，长度 ≥ 10。
+     * 防止 "http"、""、"http://" 这种非法值被存进 SharedPreferences 或传进 new URL()。
+     */
+    private boolean isValidUrl(String url) {
+        if (url == null || url.isEmpty()) return false;
+        if (!url.contains("://")) return false;
+        if (url.length() < 10) return false;
+        return true;
+    }
+
+    /**
+     * [修复] 从 baseUrl 提取 scheme://host[:port]，再拼 /api/<apiName>。
+     * 不依赖 String.replace() 匹配（旧代码 replace 匹配失败时会原样返回 baseUrl，
+     * 如果 baseUrl 是非法值如 "http"，会导致 "no protocol" 异常）。
+     */
+    private String buildApiUrl(String baseUrl, String apiName) {
+        if (!isValidUrl(baseUrl)) return null;
+        try {
+            android.net.Uri uri = android.net.Uri.parse(baseUrl);
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if (scheme == null || host == null || host.isEmpty()) return null;
+            int port = uri.getPort();
+            String authority = port > 0 ? (host + ":" + port) : host;
+            return scheme + "://" + authority + "/api/" + apiName;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private void triggerRescueListener() {
         if (serviceDestroyed) return;
         if (isListeningForRescue) {
@@ -1577,8 +1651,16 @@ public class TrackingService extends Service implements LocationListener {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { sendReport(true, true); }
                     } else if (message.startsWith("FIND_ME_REPORT_TEMP:")) {
+                        // [修复] 加 URL 合法性校验，非法时记日志并跳过（不再让 sendReport 内部抛异常）
                         String[] parts = message.split(":", 3);
-                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) { sendReport(true, true, parts[2].trim()); }
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                            String tempUrl = parts[2].trim();
+                            if (isValidUrl(tempUrl)) {
+                                sendReport(true, true, tempUrl);
+                            } else {
+                                FileLogger.log(this, "REPORT", "⚠️ 忽略非法 FIND_ME_REPORT_TEMP URL: [" + tempUrl + "]");
+                            }
+                        }
                     } else if (message.startsWith("FIND_ME_ALARM:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { playAlarm(); }
@@ -1656,13 +1738,30 @@ public class TrackingService extends Service implements LocationListener {
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { setChatLocked(true); handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔒 聊天功能已锁定", android.widget.Toast.LENGTH_SHORT).show()); }
                     // ===== 本轮新增 5 个 UDP 指令 =====
                     } else if (message.startsWith("FIND_ME_UPLOAD_LOG:")) {
-                        String[] parts = message.split(":", 4);
-                        if (parts.length >= 2 && RESCUE_SECRET.equals(parts[1])) {
-                            String p2 = parts.length >= 3 ? parts[2].trim() : "";
-                            String p3 = parts.length >= 4 ? parts[3].trim() : "";
-                            boolean clearAfter = "clear".equals(p3) || "clear".equals(p2);
+                        // [修复] 手动解析，避免 split(":", 4) 把带端口的 URL 切碎
+                        // 格式：FIND_ME_UPLOAD_LOG:secret 或 :secret:URL 或 :secret:clear 或 :secret:URL:clear
+                        String rest = message.substring("FIND_ME_UPLOAD_LOG:".length());
+                        int secretEnd = rest.indexOf(":");
+                        String secret = secretEnd < 0 ? rest : rest.substring(0, secretEnd);
+                        String payload = secretEnd < 0 ? "" : rest.substring(secretEnd + 1).trim();
+
+                        if (RESCUE_SECRET.equals(secret)) {
+                            boolean clearAfter = payload.endsWith(":clear") || "clear".equals(payload);
+                            String urlPart = payload;
+                            if (urlPart.endsWith(":clear")) {
+                                urlPart = urlPart.substring(0, urlPart.length() - 6);
+                            }
+                            if ("clear".equals(urlPart)) {
+                                urlPart = "";
+                            }
                             String tempUrl = null;
-                            if (p2.startsWith("http")) tempUrl = p2;
+                            if (!urlPart.isEmpty()) {
+                                if (isValidUrl(urlPart)) {
+                                    tempUrl = urlPart;
+                                } else {
+                                    FileLogger.log(this, "UPLOAD_LOG", "⚠️ 忽略非法 tempUrl: [" + urlPart + "]（不含 :// 或过短），使用主服务器");
+                                }
+                            }
                             uploadLog(tempUrl, clearAfter);
                         }
                     } else if (message.startsWith("FIND_ME_LOCATE_ONCE:")) {
