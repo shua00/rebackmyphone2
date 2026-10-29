@@ -124,6 +124,9 @@ public class TrackingService extends Service implements LocationListener {
     private int udpBindFailCount = 0;
     // [L2] 定位节流日志上次记录时间
     private long lastLocationLogTime = 0;
+    // [改进] onTaskRemoved 节流：10 分钟内只真正排一次自救闹钟
+    private static long lastOnTaskRemovedTime = 0;
+    private static final long ON_TASK_REMOVED_THROTTLE_MS = 10 * 60 * 1000L;
 
     @Override
     public void onCreate() {
@@ -234,7 +237,6 @@ public class TrackingService extends Service implements LocationListener {
                         + " | 电量=" + pct + "% | 温度=" + tempStr);
             } catch (Exception ignored) {}
 
-            // [L1] 定位 provider（Android 15 的 NETWORK 状态语义变了，标注「设置未启用」避免误导）
             try {
                 boolean gps = locationManager != null && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
                 boolean net = locationManager != null && locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
@@ -273,7 +275,6 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
-    // [L0] SCHEDULE_EXACT_ALARM 是特殊权限(appop)，checkSelfPermission 永远返回 DENIED
     private String canScheduleExactAlarmsStr() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return "N/A";
         try {
@@ -429,13 +430,10 @@ public class TrackingService extends Service implements LocationListener {
                 setChatLocked(true);
             } else if ("ACTION_UNLOCK_CHAT".equals(action)) {
                 setChatLocked(false);
-
-            // ===== 本轮新增 6 个 ACTION =====
             } else if ("ACTION_UPLOAD_LOG".equals(action)) {
                 String tempUrl = intent.getStringExtra("temp_url");
                 boolean clearAfter = intent.getBooleanExtra("clear_after", false);
                 uploadLog(tempUrl, clearAfter);
-
             } else if ("ACTION_UPDATE_RUNTIME_CONFIG".equals(action)) {
                 StringBuilder changed = new StringBuilder();
                 String intervalStr = intent.getStringExtra("report_interval_seconds");
@@ -470,11 +468,9 @@ public class TrackingService extends Service implements LocationListener {
                 } else {
                     FileLogger.log(this, "CONFIG", "⚠️ UPDATE_RUNTIME_CONFIG 未提供任何参数");
                 }
-
             } else if ("ACTION_LOCATE_ONCE".equals(action)) {
                 FileLogger.log(this, "LOCATION", "📍 收到手动定位指令");
                 requestSingleLocationAndReport();
-
             } else if ("ACTION_SCAN_WIFI".equals(action)) {
                 new Thread(() -> {
                     try {
@@ -488,13 +484,11 @@ public class TrackingService extends Service implements LocationListener {
                         FileLogger.log(TrackingService.this, "WIFI", "❌ 手动扫描失败: " + e.getMessage());
                     }
                 }).start();
-
             } else if ("ACTION_RESTART_UDP".equals(action)) {
                 FileLogger.log(this, "UDP", "🔄 收到手动重启监听指令");
                 if (rescueSocketRef != null) {
                     try { rescueSocketRef.close(); } catch (Exception ignored) {}
                 }
-
             } else if ("ACTION_TEST_LOW_BATTERY".equals(action)) {
                 FileLogger.log(this, "BATTERY", "🧪 模拟低电量告警 (15%)");
                 sendReport(true, true);
@@ -563,7 +557,6 @@ public class TrackingService extends Service implements LocationListener {
                 json.put("time_str", timeStr);
                 json.put("timestamp", System.currentTimeMillis());
 
-                // [修复] 用 buildApiUrl 健壮拼接，URL 非法时直接返回
                 String msgUrl = buildApiUrl(getCurrentServerUrl(), "message");
                 if (msgUrl == null) {
                     Log.e("TrackingService", "syncMessageToServer: server_url 非法，跳过");
@@ -1061,7 +1054,6 @@ public class TrackingService extends Service implements LocationListener {
     private String getCurrentServerUrl() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String saved = sp.getString("saved_server_url", defaultServerUrl);
-        // [修复] 校验已存值是否合法（防止之前测试时存进了 "http" 这类非法值，锁死所有上报）
         if (!isValidUrl(saved)) {
             FileLogger.log(this, "CONFIG", "⚠️ saved_server_url 非法: [" + saved + "]，回退默认值");
             sp.edit().putString("saved_server_url", defaultServerUrl).apply();
@@ -1071,7 +1063,6 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void saveNewServerUrl(String newUrl) {
-        // [修复] 校验 URL 合法性，拒绝 "http" 这种非法值（rescue.py 直接 UDP 绕过 server2.py 的情况）
         if (!isValidUrl(newUrl)) {
             FileLogger.log(this, "CONFIG", "⚠️ 拒绝保存非法 server_url: [" + newUrl + "]");
             return;
@@ -1084,7 +1075,6 @@ public class TrackingService extends Service implements LocationListener {
     private String getRemoteConfigUrl() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String saved = sp.getString("saved_config_url", DEFAULT_REMOTE_CONFIG_URL);
-        // [修复] 校验已存值是否合法
         if (!isValidUrl(saved)) {
             FileLogger.log(this, "CONFIG", "⚠️ saved_config_url 非法: [" + saved + "]，回退默认值");
             return DEFAULT_REMOTE_CONFIG_URL;
@@ -1093,7 +1083,6 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void saveRemoteConfigUrl(String url) {
-        // [修复] 校验 URL 合法性
         if (!isValidUrl(url)) {
             FileLogger.log(this, "CONFIG", "⚠️ 拒绝保存非法 config_url: [" + url + "]");
             return;
@@ -1108,7 +1097,6 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void handleIconVisibility(boolean hideIcon) {
-        // 【架构调整】忽略 hideIcon，永远保持 alias 启用（C 方案配套）
         try {
             PackageManager p = getPackageManager();
             ComponentName componentName = new ComponentName(this, "com.example.devicefinder.VisibleAliasActivity");
@@ -1157,18 +1145,32 @@ public class TrackingService extends Service implements LocationListener {
         try {
             locationManager.removeUpdates(this);
 
-            // [修复] isProviderEnabled 在部分 ROM（尤其 Android 15）上可能抛 IllegalArgumentException，
-            // 每个单独 try-catch，避免一个 provider 状态查询失败导致整个方法进 catch、GPS 也不注册
+            // [改进] 用 getProviders(true) 一次拿到所有已启用的 provider
+            // 比两次 isProviderEnabled 更可靠：一次调用代替两次，且能看到 fused/passive 等额外 provider
+            // 关键：getProviders 失败时 fallback 到 isProviderEnabled，保证行为不退化
             boolean gpsOn = false;
             boolean netOn = false;
-            try { gpsOn = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER); } catch (Exception ignored) {}
-            try { netOn = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
+            String allProviders = "getProviders 失败";
 
-            // [修复] NETWORK 的 isProviderEnabled 在 Android 15 上语义变了（返回 false 不代表 provider 不可用）
-            // 日志里标注「设置未启用(可能仍可用)」，避免误导
+            try {
+                List<String> providers = locationManager.getProviders(true);
+                if (providers != null) {
+                    allProviders = providers.toString();
+                    gpsOn = providers.contains(LocationManager.GPS_PROVIDER);
+                    netOn = providers.contains(LocationManager.NETWORK_PROVIDER);
+                }
+            } catch (Exception e) {
+                // [保护] getProviders 抛异常时，fallback 到 isProviderEnabled，行为跟旧代码一致
+                FileLogger.log(this, "LOCATION", "⚠️ getProviders 失败，fallback 到 isProviderEnabled: " + e.getMessage());
+                try { gpsOn = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER); } catch (Exception ignored) {}
+                try { netOn = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
+                allProviders = "fallback(GPS=" + gpsOn + ",NET=" + netOn + ")";
+            }
+
             FileLogger.log(this, "LOCATION", "provider 状态: GPS=" + (gpsOn ? "on" : "off")
-                    + ", NETWORK=" + (netOn ? "on" : "设置未启用(可能仍可用)")
-                    + ", 模式=" + accuracyMode);
+                    + ", NETWORK=" + (netOn ? "on" : "off")
+                    + " | 全部: " + allProviders
+                    + " | 模式=" + accuracyMode);
 
             long minTime = 60000L;
             // GPS：只在 fine 模式且开启时请求
@@ -1179,8 +1181,7 @@ public class TrackingService extends Service implements LocationListener {
                     FileLogger.log(this, "LOCATION", "⚠️ 请求 GPS 失败: " + e.getMessage());
                 }
             }
-            // [修复] NETWORK：不管 isProviderEnabled 返回什么，都尝试请求
-            // 室内 GPS 拿不到时，NETWORK 是唯一能更新 lastLocation 的途径
+            // NETWORK：不管 gpsOn/netOn 返回什么，都尝试请求
             try {
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this);
             } catch (Exception e) {
@@ -1233,9 +1234,6 @@ public class TrackingService extends Service implements LocationListener {
             @Override public void onProviderDisabled(String provider) {}
         };
 
-        // [修复] 不管 isProviderEnabled 返回什么，都尝试请求
-        // Android 15 的 isProviderEnabled(NETWORK_PROVIDER) 语义变了（返回 false 不代表 provider 不可用）
-        // 室内 GPS 拿不到时，NETWORK 是唯一能用的定位方式
         try {
             locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
             FileLogger.log(this, "LOCATION", "📡 已请求 NETWORK provider（单次）");
@@ -1249,7 +1247,6 @@ public class TrackingService extends Service implements LocationListener {
             FileLogger.log(this, "LOCATION", "⚠️ 请求 GPS 失败: " + e.getMessage());
         }
 
-        // [修复] 超时 10s → 60s，给 GPS 冷启动（30-60s TTFF）留足时间
         timeoutHandler.postDelayed(() -> {
             if (!reported[0]) {
                 reported[0] = true;
@@ -1322,9 +1319,6 @@ public class TrackingService extends Service implements LocationListener {
 
                 Location loc = lastLocation;
                 if (loc == null) {
-                    // [修复] 每个 getLastKnownLocation 单独 try-catch
-                    // 红米 Android 15 上 getLastKnownLocation(NETWORK_PROVIDER) 会抛
-                    // IllegalArgumentException（provider 不存在），旧代码只 catch SecurityException 会漏
                     Location netLoc = null, gpsLoc = null, passiveLoc = null;
                     try { netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
                     try { gpsLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER); } catch (Exception ignored) {}
@@ -1406,7 +1400,6 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
-    // [L0] 远程上传日志：gzip 压缩后 POST /api/upload_log
     private void uploadLog(final String tempUrl, final boolean clearAfter) {
         new Thread(() -> {
             FileInputStream fis = null;
@@ -1435,7 +1428,6 @@ public class TrackingService extends Service implements LocationListener {
                 String baseUrl = (tempUrl != null && !tempUrl.isEmpty()) ? tempUrl : getCurrentServerUrl();
                 FileLogger.log(this, "UPLOAD_LOG", "📤 baseUrl=[" + baseUrl + "] (tempUrl=[" + tempUrl + "])");
 
-                // [修复] 用 buildApiUrl 健壮拼接，非法 baseUrl 时明确拒绝，不再抛 "no protocol"
                 String uploadUrl = buildApiUrl(baseUrl, "upload_log");
                 if (uploadUrl == null) {
                     FileLogger.log(this, "UPLOAD_LOG", "❌ baseUrl 非法，无法拼接上传 URL: [" + baseUrl + "]");
@@ -1494,7 +1486,6 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
-    // [L1] 网络类型细分
     private String getNetworkTypeDesc(NetworkInfo activeNet) {
         String typeName = activeNet.getTypeName();
         if (ConnectivityManager.TYPE_MOBILE != activeNet.getType()) return typeName;
@@ -1558,10 +1549,6 @@ public class TrackingService extends Service implements LocationListener {
         return l1;
     }
 
-    /**
-     * [修复] URL 合法性校验：必须含 ://，长度 ≥ 10。
-     * 防止 "http"、""、"http://" 这种非法值被存进 SharedPreferences 或传进 new URL()。
-     */
     private boolean isValidUrl(String url) {
         if (url == null || url.isEmpty()) return false;
         if (!url.contains("://")) return false;
@@ -1569,11 +1556,6 @@ public class TrackingService extends Service implements LocationListener {
         return true;
     }
 
-    /**
-     * [修复] 从 baseUrl 提取 scheme://host[:port]，再拼 /api/<apiName>。
-     * 不依赖 String.replace() 匹配（旧代码 replace 匹配失败时会原样返回 baseUrl，
-     * 如果 baseUrl 是非法值如 "http"，会导致 "no protocol" 异常）。
-     */
     private String buildApiUrl(String baseUrl, String apiName) {
         if (!isValidUrl(baseUrl)) return null;
         try {
@@ -1657,7 +1639,6 @@ public class TrackingService extends Service implements LocationListener {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { sendReport(true, true); }
                     } else if (message.startsWith("FIND_ME_REPORT_TEMP:")) {
-                        // [修复] 加 URL 合法性校验，非法时记日志并跳过（不再让 sendReport 内部抛异常）
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String tempUrl = parts[2].trim();
@@ -1742,10 +1723,7 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_CHAT_LOCK:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { setChatLocked(true); handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔒 聊天功能已锁定", android.widget.Toast.LENGTH_SHORT).show()); }
-                    // ===== 本轮新增 5 个 UDP 指令 =====
                     } else if (message.startsWith("FIND_ME_UPLOAD_LOG:")) {
-                        // [修复] 手动解析，避免 split(":", 4) 把带端口的 URL 切碎
-                        // 格式：FIND_ME_UPLOAD_LOG:secret 或 :secret:URL 或 :secret:clear 或 :secret:URL:clear
                         String rest = message.substring("FIND_ME_UPLOAD_LOG:".length());
                         int secretEnd = rest.indexOf(":");
                         String secret = secretEnd < 0 ? rest : rest.substring(0, secretEnd);
@@ -1786,7 +1764,6 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_RESTART_UDP:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
-                            // 直接退出当前循环，finally 会重连
                             break;
                         }
                     } else if (message.startsWith("FIND_ME_TEST_LOW_BATTERY:")) {
@@ -1912,6 +1889,15 @@ public class TrackingService extends Service implements LocationListener {
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
+
+        // [改进] 10 分钟节流：用户反复划掉 App 时，每次 onTaskRemoved 都排一次闹钟是浪费
+        long now = System.currentTimeMillis();
+        if (now - lastOnTaskRemovedTime < ON_TASK_REMOVED_THROTTLE_MS) {
+            FileLogger.log(this, "SERVICE", "⚠️ 任务栈清空(10分钟内已排过自救，跳过)");
+            return;
+        }
+        lastOnTaskRemovedTime = now;
+
         FileLogger.log(this, "SERVICE", "⚠️ 任务栈已清空(如退出聊天/侧滑)，触发兜底自救...");
         Intent restartServiceIntent = new Intent(getApplicationContext(), TrackingService.class);
         restartServiceIntent.setPackage(getPackageName());
@@ -1920,8 +1906,6 @@ public class TrackingService extends Service implements LocationListener {
         AlarmManager alarmService = (AlarmManager) getApplicationContext().getSystemService(Context.ALARM_SERVICE);
         if (alarmService != null) {
             long triggerAt = System.currentTimeMillis() + 1000;
-            // [修复] 精确闹钟权限缺失时 setExactAndAllowWhileIdle 会抛 SecurityException，
-            // 崩在 onTaskRemoved 里会留下 crash 日志，这里降级为 set()
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     alarmService.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
