@@ -95,25 +95,14 @@ public class DeviceInfoUtils {
      * 异步扫描周围 Wi-Fi 热点，最多等待 3 秒。
      * 返回按信号强度降序排列的前 15 个热点，每项为 {"ssid","bssid","rssi"}。
      *
-     * Android 11+ 增加 isScanThrottled 检查，被限流时不 startScan，直接读缓存；
      * Android 13+ 需要 NEARBY_WIFI_DEVICES 权限，否则 startScan 永远返回 false；
      * startScan 失败时降级读 getScanResults() 缓存，尽量拿点数据。
+     * 不使用 isScanThrottled()（部分 SDK 中为 @hide，普通 App 编译报错）。
      */
     public static List<JSONObject> scanNearbyWifi(Context context) {
         final List<JSONObject> result = new ArrayList<>();
         final WifiManager wifiManager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wifiManager == null) return result;
-
-        // [L1] Android 11+ 先检查是否被限流，被限流时直接读缓存，避免 startScan 白跑
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            try {
-                if (wifiManager.isScanThrottled()) {
-                    FileLogger.log(context, "WIFI", "⚠️ 扫描被系统限流，尝试读缓存");
-                    List<ScanResult> cached = wifiManager.getScanResults();
-                    return buildResultFromScanResults(context, cached, "缓存");
-                }
-            } catch (Exception ignored) {}
-        }
 
         final Object lock = new Object();
         final boolean[] done = new boolean[]{false};
@@ -199,40 +188,5 @@ public class DeviceInfoUtils {
             FileLogger.log(context, "WIFI", "📡 扫描完成: " + result.size() + " 个热点");
         }
         return result;
-    }
-
-    /**
-     * 把 List<ScanResult> 转成按信号强度降序的 JSONObject 列表，最多 MAX_NEARBY_WIFI 个。
-     * 抽成辅助方法，供「正常扫描」和「缓存降级」复用。
-     */
-    private static List<JSONObject> buildResultFromScanResults(Context context, List<ScanResult> scanResults, String source) {
-        List<JSONObject> out = new ArrayList<>();
-        if (scanResults == null || scanResults.isEmpty()) {
-            FileLogger.log(context, "WIFI", "📡 " + source + ": 0 个热点");
-            return out;
-        }
-        List<ScanResult> filtered = new ArrayList<>();
-        for (ScanResult r : scanResults) {
-            if (r.SSID != null && !r.SSID.isEmpty()) filtered.add(r);
-        }
-        Collections.sort(filtered, new Comparator<ScanResult>() {
-            @Override
-            public int compare(ScanResult a, ScanResult b) {
-                return b.level - a.level;
-            }
-        });
-        int count = Math.min(filtered.size(), MAX_NEARBY_WIFI);
-        for (int i = 0; i < count; i++) {
-            ScanResult r = filtered.get(i);
-            try {
-                JSONObject obj = new JSONObject();
-                obj.put("ssid", r.SSID);
-                obj.put("bssid", r.BSSID != null ? r.BSSID : "");
-                obj.put("rssi", r.level);
-                out.add(obj);
-            } catch (Exception ignored) {}
-        }
-        FileLogger.log(context, "WIFI", "📡 " + source + ": " + out.size() + " 个热点");
-        return out;
     }
 }
