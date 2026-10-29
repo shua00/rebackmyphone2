@@ -1156,8 +1156,14 @@ public class TrackingService extends Service implements LocationListener {
     private void startLocationUpdates() {
         try {
             locationManager.removeUpdates(this);
-            boolean gpsOn = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
-            boolean netOn = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+
+            // [修复] isProviderEnabled 在部分 ROM（尤其 Android 15）上可能抛 IllegalArgumentException，
+            // 每个单独 try-catch，避免一个 provider 状态查询失败导致整个方法进 catch、GPS 也不注册
+            boolean gpsOn = false;
+            boolean netOn = false;
+            try { gpsOn = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER); } catch (Exception ignored) {}
+            try { netOn = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
+
             // [修复] NETWORK 的 isProviderEnabled 在 Android 15 上语义变了（返回 false 不代表 provider 不可用）
             // 日志里标注「设置未启用(可能仍可用)」，避免误导
             FileLogger.log(this, "LOCATION", "provider 状态: GPS=" + (gpsOn ? "on" : "off")
@@ -1914,8 +1920,18 @@ public class TrackingService extends Service implements LocationListener {
         AlarmManager alarmService = (AlarmManager) getApplicationContext().getSystemService(Context.ALARM_SERVICE);
         if (alarmService != null) {
             long triggerAt = System.currentTimeMillis() + 1000;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) { alarmService.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent); }
-            else { alarmService.setExact(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent); }
+            // [修复] 精确闹钟权限缺失时 setExactAndAllowWhileIdle 会抛 SecurityException，
+            // 崩在 onTaskRemoved 里会留下 crash 日志，这里降级为 set()
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarmService.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
+                } else {
+                    alarmService.setExact(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
+                }
+            } catch (SecurityException e) {
+                FileLogger.log(this, "SERVICE", "⚠️ onTaskRemoved 精确闹钟权限缺失，降级为不精确: " + e.getMessage());
+                alarmService.set(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
+            }
         }
     }
 
