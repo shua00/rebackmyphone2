@@ -234,10 +234,12 @@ public class TrackingService extends Service implements LocationListener {
                         + " | 电量=" + pct + "% | 温度=" + tempStr);
             } catch (Exception ignored) {}
 
+            // [L1] 定位 provider（Android 15 的 NETWORK 状态语义变了，标注「设置未启用」避免误导）
             try {
                 boolean gps = locationManager != null && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
                 boolean net = locationManager != null && locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
-                FileLogger.log(this, "SERVICE", "定位 provider: GPS=" + (gps ? "on" : "off") + ", NETWORK=" + (net ? "on" : "off"));
+                FileLogger.log(this, "SERVICE", "定位 provider: GPS=" + (gps ? "on" : "off")
+                        + ", NETWORK=" + (net ? "on" : "设置未启用(可能仍可用)"));
             } catch (Exception ignored) {}
 
             try {
@@ -1129,12 +1131,28 @@ public class TrackingService extends Service implements LocationListener {
             locationManager.removeUpdates(this);
             boolean gpsOn = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
             boolean netOn = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+            // [修复] NETWORK 的 isProviderEnabled 在 Android 15 上语义变了（返回 false 不代表 provider 不可用）
+            // 日志里标注「设置未启用(可能仍可用)」，避免误导
             FileLogger.log(this, "LOCATION", "provider 状态: GPS=" + (gpsOn ? "on" : "off")
-                    + ", NETWORK=" + (netOn ? "on" : "off") + ", 模式=" + accuracyMode);
+                    + ", NETWORK=" + (netOn ? "on" : "设置未启用(可能仍可用)")
+                    + ", 模式=" + accuracyMode);
 
             long minTime = 60000L;
-            if ("fine".equals(accuracyMode) && gpsOn) { locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, 0f, this); }
-            if (netOn) { locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this); }
+            // GPS：只在 fine 模式且开启时请求
+            if ("fine".equals(accuracyMode) && gpsOn) {
+                try {
+                    locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, 0f, this);
+                } catch (Exception e) {
+                    FileLogger.log(this, "LOCATION", "⚠️ 请求 GPS 失败: " + e.getMessage());
+                }
+            }
+            // [修复] NETWORK：不管 isProviderEnabled 返回什么，都尝试请求
+            // 室内 GPS 拿不到时，NETWORK 是唯一能更新 lastLocation 的途径
+            try {
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this);
+            } catch (Exception e) {
+                FileLogger.log(this, "LOCATION", "⚠️ 请求 NETWORK 失败: " + e.getMessage());
+            }
         } catch (SecurityException e) {
             FileLogger.log(this, "LOCATION", "❌ 定位权限缺失，无法注册 provider: " + e.getMessage());
         } catch (Exception e) {
@@ -1163,20 +1181,53 @@ public class TrackingService extends Service implements LocationListener {
         final LocationListener singleListener = new LocationListener() {
             @Override
             public void onLocationChanged(Location location) {
-                if (location != null) lastLocation = location;
-                if (!reported[0]) { reported[0] = true; timeoutHandler.removeCallbacksAndMessages(null); try { locationManager.removeUpdates(this); } catch (Exception ignored) {} sendReport(true, false); reportCount = 1; scheduleNextReport(); }
+                if (location != null) {
+                    lastLocation = location;
+                    FileLogger.log(TrackingService.this, "LOCATION", "📍 单次定位成功: provider="
+                            + location.getProvider() + ", acc=" + location.getAccuracy() + "m");
+                }
+                if (!reported[0]) {
+                    reported[0] = true;
+                    timeoutHandler.removeCallbacksAndMessages(null);
+                    try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
+                    sendReport(true, false);
+                    reportCount = 1;
+                    scheduleNextReport();
+                }
             }
             @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
             @Override public void onProviderEnabled(String provider) {}
             @Override public void onProviderDisabled(String provider) {}
         };
+
+        // [修复] 不管 isProviderEnabled 返回什么，都尝试请求
+        // Android 15 的 isProviderEnabled(NETWORK_PROVIDER) 语义变了（返回 false 不代表 provider 不可用）
+        // 室内 GPS 拿不到时，NETWORK 是唯一能用的定位方式
         try {
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
-            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
-        } catch (SecurityException ignored) {}
+            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
+            FileLogger.log(this, "LOCATION", "📡 已请求 NETWORK provider（单次）");
+        } catch (Exception e) {
+            FileLogger.log(this, "LOCATION", "⚠️ 请求 NETWORK 失败: " + e.getMessage());
+        }
+        try {
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
+            FileLogger.log(this, "LOCATION", "📡 已请求 GPS provider（单次）");
+        } catch (Exception e) {
+            FileLogger.log(this, "LOCATION", "⚠️ 请求 GPS 失败: " + e.getMessage());
+        }
+
+        // [修复] 超时 10s → 60s，给 GPS 冷启动（30-60s TTFF）留足时间
         timeoutHandler.postDelayed(() -> {
-            if (!reported[0]) { reported[0] = true; try { locationManager.removeUpdates(singleListener); } catch (Exception ignored) {} sendReport(true, false); reportCount = 1; scheduleNextReport(); }
-        }, 10000);
+            if (!reported[0]) {
+                reported[0] = true;
+                try { locationManager.removeUpdates(singleListener); } catch (Exception ignored) {}
+                FileLogger.log(this, "LOCATION", "⚠️ 60 秒内未获取到新定位，lastLocation="
+                        + (lastLocation != null ? ("旧值(lat=" + lastLocation.getLatitude() + ")") : "无"));
+                sendReport(true, false);
+                reportCount = 1;
+                scheduleNextReport();
+            }
+        }, 60000);
     }
 
     private void scheduleNextReport() {
