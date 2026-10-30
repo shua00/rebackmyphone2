@@ -127,13 +127,19 @@ public class TrackingService extends Service implements LocationListener {
     // [改进] onTaskRemoved 节流：10 分钟内只真正排一次自救闹钟
     private static long lastOnTaskRemovedTime = 0;
     private static final long ON_TASK_REMOVED_THROTTLE_MS = 10 * 60 * 1000L;
+    // [P0] 自愈心跳：最近一次成功上报到服务器的时间（仅 sendReport success / postReportDirectly success 时更新）
+    private static long lastSuccessReportTime = 0;
+    // [P0] 离线队列文件名
+    private static final String PENDING_REPORTS_FILE = "pending_reports.jsonl";
+    // [P0] 离线队列最大字节数（1MB，约 500-1000 条）
+    private static final long PENDING_QUEUE_MAX_BYTES = 1024 * 1024;
 
     @Override
     public void onCreate() {
         super.onCreate();
         serviceCreateTimeMs = SystemClock.elapsedRealtime();
 
-        // 【修复】先赋值 locationManager，再跑自检，否则自检块里 provider 状态误报 off
+        // 【修复】先赋值 locationManager，再跑自检
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
 
         FileLogger.log(this, "SERVICE", "🚀 追踪服务已启动 (或复活)");
@@ -178,6 +184,9 @@ public class TrackingService extends Service implements LocationListener {
         scheduleHeartbeatAlarm();
         registerBatteryMonitor();
         scheduleKeepAliveJob();
+
+        // [P0] 服务启动时也尝试补发一次离线队列（可能是上次关机前排队的）
+        handler.postDelayed(this::flushPendingReports, 5000);
     }
 
     private void logStartupSelfCheck() {
@@ -260,6 +269,14 @@ public class TrackingService extends Service implements LocationListener {
                     FileLogger.log(this, "SERVICE", "闹钟权限: 精确闹钟=" + (canExact ? "✅" : "❌"));
                 } catch (Exception ignored) {}
             }
+
+            // [P0] 离线队列长度快照
+            try {
+                java.io.File qf = new java.io.File(getExternalFilesDir(null), PENDING_REPORTS_FILE);
+                if (qf.exists() && qf.length() > 0) {
+                    FileLogger.log(this, "SERVICE", "离线队列: " + (qf.length() / 1024) + "KB");
+                }
+            } catch (Exception ignored) {}
 
             FileLogger.log(this, "SERVICE", "===================");
         } catch (Exception e) {
@@ -425,6 +442,9 @@ public class TrackingService extends Service implements LocationListener {
                     }
                 } catch (Exception ignored) {}
 
+                // [P0] 自愈心跳：每次心跳都让服务“回一次血”
+                selfHeal();
+
                 scheduleKeepAliveJob();
             } else if ("ACTION_LOCK_CHAT".equals(action)) {
                 setChatLocked(true);
@@ -496,6 +516,50 @@ public class TrackingService extends Service implements LocationListener {
             }
         }
         return START_STICKY;
+    }
+
+    /**
+     * [P0] 自愈心跳：每次 15 分钟心跳触发时检查关键组件是否还活着，不活就修复
+     * 这是把“心跳只写日志”升级为“心跳主动修复”的关键
+     */
+    private void selfHeal() {
+        try {
+            // 1. 检查并重新 startForeground（防止被系统降级为后台服务）
+            try { startForegroundNotification(); } catch (Exception ignored) {}
+
+            // 2. UDP 监听线程是否还活着
+            if (!isListeningForRescue && !serviceDestroyed) {
+                FileLogger.log(this, "SERVICE", "⚠️ 自愈: UDP 监听已死，重新拉起");
+                triggerRescueListener();
+            }
+
+            // 3. 定位 listener 是否还在（用 getProviders 检查，为空才重注册，避免频繁 removeUpdates）
+            try {
+                List<String> providers = locationManager.getProviders(true);
+                if (providers == null || providers.isEmpty()) {
+                    FileLogger.log(this, "SERVICE", "⚠️ 自愈: 无可用 provider，重新注册定位监听");
+                    startLocationUpdates();
+                }
+            } catch (Exception e) {
+                FileLogger.log(this, "SERVICE", "⚠️ 自愈: 检查定位失败，尝试重注册: " + e.getMessage());
+                try { startLocationUpdates(); } catch (Exception ignored) {}
+            }
+
+            // 4. 网络回调是否还活着？无 API 可查，只在 null 时重注册（避免无谓抖动）
+            if (networkCallback == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                FileLogger.log(this, "SERVICE", "⚠️ 自愈: networkCallback 为空，重新注册");
+                registerNetworkCallback();
+            }
+
+            // 5. 距上次成功上报超过 1 小时，强制触发一次（防止定时闹钟被 Doze 完全吞掉）
+            if (lastSuccessReportTime > 0 && System.currentTimeMillis() - lastSuccessReportTime > 60 * 60 * 1000L) {
+                long gapMin = (System.currentTimeMillis() - lastSuccessReportTime) / 60000;
+                FileLogger.log(this, "SERVICE", "⚠️ 自愈: 距上次成功上报 " + gapMin + " 分钟，强制触发一次");
+                sendReport(true, false);
+            }
+        } catch (Exception e) {
+            FileLogger.log(this, "SERVICE", "❌ 自愈心跳异常: " + e.getMessage());
+        }
     }
 
     private boolean isChatLocked() {
@@ -1068,7 +1132,7 @@ public class TrackingService extends Service implements LocationListener {
             return;
         }
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-        sp.edit().putString("saved_server_url", newUrl).apply();
+        sp.edit().putString("saved_server_url", newUrl).commit();
         FileLogger.log(this, "CONFIG", "📝 server_url 已更新: " + newUrl);
     }
 
@@ -1088,7 +1152,7 @@ public class TrackingService extends Service implements LocationListener {
             return;
         }
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-        sp.edit().putString("saved_config_url", url).apply();
+        sp.edit().putString("saved_config_url", url).commit();
         FileLogger.log(this, "CONFIG", "📝 config_url 已更新: " + url);
     }
 
@@ -1126,6 +1190,8 @@ public class TrackingService extends Service implements LocationListener {
                             sendReport(true, false);
                             triggerRescueListener();
                         }
+                        // [P0] 网络恢复时补发离线队列
+                        flushPendingReports();
                     }
                     @Override
                     public void onLost(Network network) {
@@ -1146,8 +1212,6 @@ public class TrackingService extends Service implements LocationListener {
             locationManager.removeUpdates(this);
 
             // [改进] 用 getProviders(true) 一次拿到所有已启用的 provider
-            // 比两次 isProviderEnabled 更可靠：一次调用代替两次，且能看到 fused/passive 等额外 provider
-            // 关键：getProviders 失败时 fallback 到 isProviderEnabled，保证行为不退化
             boolean gpsOn = false;
             boolean netOn = false;
             String allProviders = "getProviders 失败";
@@ -1160,7 +1224,6 @@ public class TrackingService extends Service implements LocationListener {
                     netOn = providers.contains(LocationManager.NETWORK_PROVIDER);
                 }
             } catch (Exception e) {
-                // [保护] getProviders 抛异常时，fallback 到 isProviderEnabled，行为跟旧代码一致
                 FileLogger.log(this, "LOCATION", "⚠️ getProviders 失败，fallback 到 isProviderEnabled: " + e.getMessage());
                 try { gpsOn = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER); } catch (Exception ignored) {}
                 try { netOn = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
@@ -1181,6 +1244,18 @@ public class TrackingService extends Service implements LocationListener {
                     FileLogger.log(this, "LOCATION", "⚠️ 请求 GPS 失败: " + e.getMessage());
                 }
             }
+
+            // [P0] Android 12+ 尝试 FUSED_PROVIDER（部分无 GMS ROM 也可能可用）
+            // 失败静默降级，不影响 GPS/NETWORK 请求
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    locationManager.requestLocationUpdates(LocationManager.FUSED_PROVIDER, minTime, 0f, this);
+                    FileLogger.log(this, "LOCATION", "📡 已请求 FUSED_PROVIDER");
+                } catch (Exception e) {
+                    FileLogger.log(this, "LOCATION", "⚠️ FUSED_PROVIDER 不可用（忽略）: " + e.getMessage());
+                }
+            }
+
             // NETWORK：不管 gpsOn/netOn 返回什么，都尝试请求
             try {
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this);
@@ -1234,6 +1309,15 @@ public class TrackingService extends Service implements LocationListener {
             @Override public void onProviderDisabled(String provider) {}
         };
 
+        // [P0] 先尝试 FUSED_PROVIDER（API 31+，可能更快拿到 fix）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                locationManager.requestLocationUpdates(LocationManager.FUSED_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
+                FileLogger.log(this, "LOCATION", "📡 已请求 FUSED_PROVIDER（单次）");
+            } catch (Exception e) {
+                FileLogger.log(this, "LOCATION", "⚠️ 请求 FUSED_PROVIDER 失败（忽略）: " + e.getMessage());
+            }
+        }
         try {
             locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
             FileLogger.log(this, "LOCATION", "📡 已请求 NETWORK provider（单次）");
@@ -1312,11 +1396,7 @@ public class TrackingService extends Service implements LocationListener {
                 String netDesc = isOnline ? getNetworkTypeDesc(activeNet) : "离线";
                 FileLogger.log(TrackingService.this, "REPORT", "准备上报. 网络:" + netDesc + " | SSID:" + wifiSsid + " | IP:" + ip + " | 电量:" + battery[0] + "%");
 
-                if (!isOnline && overrideUrl == null) {
-                    FileLogger.log(TrackingService.this, "REPORT", "⚠️ 网络离线，跳过本次上报");
-                    return;
-                }
-
+                // 构造基础 JSON（不管在线离线都构造，离线时排队）
                 Location loc = lastLocation;
                 if (loc == null) {
                     Location netLoc = null, gpsLoc = null, passiveLoc = null;
@@ -1342,6 +1422,14 @@ public class TrackingService extends Service implements LocationListener {
                     if (!memoryLogs.isEmpty()) json.put("cloud_logs", memoryLogs);
                 }
 
+                // [P0] 离线时排队到本地，网络恢复后补发（不再丢弃）
+                if (!isOnline && overrideUrl == null) {
+                    FileLogger.log(TrackingService.this, "REPORT", "⚠️ 网络离线，排队等待网络恢复后补发");
+                    queuePendingReport(json);
+                    return;
+                }
+
+                // 在线才扫描 nearby_wifi（离线扫描无意义）
                 if (withNearbyWifi) {
                     try { List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(TrackingService.this); if (nearby != null && !nearby.isEmpty()) { JSONArray arr = new JSONArray(); for (JSONObject obj : nearby) arr.put(obj); json.put("nearby_wifi", arr); } } catch (Exception ignored) {}
                 }
@@ -1387,6 +1475,7 @@ public class TrackingService extends Service implements LocationListener {
 
             if (success) {
                 consecutiveFailures = 0;
+                lastSuccessReportTime = System.currentTimeMillis();
                 fetchRemoteConfig();
             } else {
                 if (overrideUrl == null) {
@@ -1398,6 +1487,119 @@ public class TrackingService extends Service implements LocationListener {
                 }
             }
         }).start();
+    }
+
+    /**
+     * [P0] 离线排队：把上报 JSON 追加到本地队列，网络恢复后补发
+     */
+    private void queuePendingReport(JSONObject json) {
+        try {
+            java.io.File dir = getExternalFilesDir(null);
+            if (dir == null) return;
+            java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
+            // 超过 1MB 裁剪保留最近 100 条
+            if (queueFile.exists() && queueFile.length() > PENDING_QUEUE_MAX_BYTES) {
+                FileLogger.log(this, "REPORT", "⚠️ 离线队列已满，裁剪保留最近 100 条");
+                truncateQueueFile(queueFile, 100);
+            }
+            java.io.FileWriter fw = new java.io.FileWriter(queueFile, true);
+            fw.write(json.toString() + "\n");
+            fw.close();
+            FileLogger.log(this, "REPORT", "📥 离线排队一条上报（队列 " + (queueFile.length() / 1024) + "KB）");
+        } catch (Exception e) {
+            FileLogger.log(this, "REPORT", "❌ 离线排队失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * [P0] 裁剪离线队列：只保留最近 keepLines 条
+     */
+    private void truncateQueueFile(java.io.File queueFile, int keepLines) {
+        try {
+            java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(queueFile));
+            java.util.List<String> lines = new java.util.ArrayList<>();
+            String line;
+            while ((line = br.readLine()) != null) lines.add(line);
+            br.close();
+            int start = Math.max(0, lines.size() - keepLines);
+            java.io.FileWriter fw = new java.io.FileWriter(queueFile, false);
+            for (int i = start; i < lines.size(); i++) fw.write(lines.get(i) + "\n");
+            fw.close();
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * [P0] 网络恢复时补发离线队列
+     */
+    private void flushPendingReports() {
+        new Thread(() -> {
+            java.io.BufferedReader br = null;
+            try {
+                java.io.File dir = getExternalFilesDir(null);
+                if (dir == null) return;
+                java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
+                if (!queueFile.exists() || queueFile.length() == 0) return;
+                br = new java.io.BufferedReader(new java.io.FileReader(queueFile));
+                String line;
+                int sent = 0, failed = 0;
+                String serverUrl = getCurrentServerUrl();
+                while ((line = br.readLine()) != null) {
+                    try {
+                        JSONObject json = new JSONObject(line);
+                        if (postReportDirectly(json, serverUrl)) {
+                            sent++;
+                        } else {
+                            failed++;
+                            break;  // 一次失败就停，保留剩余到下次
+                        }
+                    } catch (Exception ignored) {}
+                }
+                br.close();
+                br = null;
+                if (failed == 0) {
+                    queueFile.delete();
+                } else {
+                    truncateQueueFile(queueFile, 50);
+                }
+                if (sent > 0 || failed > 0) {
+                    FileLogger.log(this, "REPORT", "📤 离线队列补发: 成功 " + sent + " 条，失败 " + failed + " 条");
+                }
+            } catch (Exception e) {
+                FileLogger.log(this, "REPORT", "⚠️ 离线队列补发异常: " + e.getMessage());
+            } finally {
+                if (br != null) { try { br.close(); } catch (Exception ignored) {} }
+            }
+        }).start();
+    }
+
+    /**
+     * [P0] 直接 POST 一个 JSON 到服务器，返回是否成功
+     */
+    private boolean postReportDirectly(JSONObject json, String serverUrl) {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(serverUrl);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(15000);
+            conn.setDoOutput(true);
+            OutputStream os = conn.getOutputStream();
+            os.write(json.toString().getBytes("UTF-8"));
+            os.flush();
+            os.close();
+            int code = conn.getResponseCode();
+            if (code == 200) {
+                lastSuccessReportTime = System.currentTimeMillis();
+                return true;
+            }
+            return false;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (conn != null) { try { conn.disconnect(); } catch (Exception ignored) {} }
+        }
     }
 
     private void uploadLog(final String tempUrl, final boolean clearAfter) {
