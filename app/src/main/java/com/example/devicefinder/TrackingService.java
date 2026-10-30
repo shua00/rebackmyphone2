@@ -107,6 +107,14 @@ public class TrackingService extends Service implements LocationListener {
     private static long lastConfigFetchTime = 0;
     private static final String PREF_BUBBLE = "bubble_pos_prefs";
 
+    // [A+D] 老人模式相关
+    private static final String CHANNEL_ID_MESSAGE = "message_channel";
+    private static final int NOTIF_ID_MESSAGE = 2001;
+    private static final String PREF_ELDER_MODE = "elder_mode";
+    // [4321] 自检通知相关
+    private static final String CHANNEL_ID_SELF_CHECK = "self_check_channel";
+    private static final int NOTIF_ID_SELF_CHECK = 3001;
+
     private BroadcastReceiver batteryMonitor;
 
     private volatile boolean serviceDestroyed = false;
@@ -115,23 +123,15 @@ public class TrackingService extends Service implements LocationListener {
 
     private final List<android.view.View> activeBubbles = new ArrayList<>();
 
-    // [L1] P3 闹钟偏差跟踪
     private long lastAlarmExpectedAt = 0;
     private long lastHeartbeatExpectedAt = 0;
-    // [L1] P3 服务运行时长起点
     private long serviceCreateTimeMs = 0;
-    // [L1] UDP 连续 bind 失败计数，防止无限重试
     private int udpBindFailCount = 0;
-    // [L2] 定位节流日志上次记录时间
     private long lastLocationLogTime = 0;
-    // [改进] onTaskRemoved 节流：10 分钟内只真正排一次自救闹钟
     private static long lastOnTaskRemovedTime = 0;
     private static final long ON_TASK_REMOVED_THROTTLE_MS = 10 * 60 * 1000L;
-    // [P0] 自愈心跳：最近一次成功上报到服务器的时间（仅 sendReport success / postReportDirectly success 时更新）
     private static long lastSuccessReportTime = 0;
-    // [P0] 离线队列文件名
     private static final String PENDING_REPORTS_FILE = "pending_reports.jsonl";
-    // [P0] 离线队列最大字节数（1MB，约 500-1000 条）
     private static final long PENDING_QUEUE_MAX_BYTES = 1024 * 1024;
 
     @Override
@@ -139,14 +139,11 @@ public class TrackingService extends Service implements LocationListener {
         super.onCreate();
         serviceCreateTimeMs = SystemClock.elapsedRealtime();
 
-        // 【修复】先赋值 locationManager，再跑自检
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
 
         FileLogger.log(this, "SERVICE", "🚀 追踪服务已启动 (或复活)");
 
-        // [L0] ===== 启动自检块 =====
         logStartupSelfCheck();
-        // [L0] ===== 自检块结束 =====
 
         startForegroundNotification();
 
@@ -185,7 +182,6 @@ public class TrackingService extends Service implements LocationListener {
         registerBatteryMonitor();
         scheduleKeepAliveJob();
 
-        // [P0] 服务启动时也尝试补发一次离线队列（可能是上次关机前排队的）
         handler.postDelayed(this::flushPendingReports, 5000);
     }
 
@@ -270,7 +266,10 @@ public class TrackingService extends Service implements LocationListener {
                 } catch (Exception ignored) {}
             }
 
-            // [P0] 离线队列长度快照
+            try {
+                FileLogger.log(this, "SERVICE", "老人模式: " + (isElderMode() ? "👴 开启" : "🕶️ 无痕"));
+            } catch (Exception ignored) {}
+
             try {
                 java.io.File qf = new java.io.File(getExternalFilesDir(null), PENDING_REPORTS_FILE);
                 if (qf.exists() && qf.length() > 0) {
@@ -442,7 +441,6 @@ public class TrackingService extends Service implements LocationListener {
                     }
                 } catch (Exception ignored) {}
 
-                // [P0] 自愈心跳：每次心跳都让服务“回一次血”
                 selfHeal();
 
                 scheduleKeepAliveJob();
@@ -513,27 +511,35 @@ public class TrackingService extends Service implements LocationListener {
                 FileLogger.log(this, "BATTERY", "🧪 模拟低电量告警 (15%)");
                 sendReport(true, true);
                 sendLowBatterySms(15);
+            } else if ("ACTION_TOGGLE_ELDER_MODE".equals(action)) {
+                String val = intent.getStringExtra("elder_mode");
+                boolean target;
+                if (val != null) {
+                    target = "1".equals(val) || "true".equalsIgnoreCase(val);
+                } else {
+                    target = !isElderMode();
+                }
+                setElderMode(target);
+                handler.post(() -> android.widget.Toast.makeText(this,
+                        target ? "👴 老人模式已开启（脱敏通知）" : "🕶️ 无痕模式已开启（仅悬浮窗）",
+                        android.widget.Toast.LENGTH_LONG).show());
+            } else if ("ACTION_SELF_CHECK".equals(action)) {
+                FileLogger.log(this, "SELF_CHECK", "📋 收到自检指令");
+                showSelfCheckNotification();
             }
         }
         return START_STICKY;
     }
 
-    /**
-     * [P0] 自愈心跳：每次 15 分钟心跳触发时检查关键组件是否还活着，不活就修复
-     * 这是把“心跳只写日志”升级为“心跳主动修复”的关键
-     */
     private void selfHeal() {
         try {
-            // 1. 检查并重新 startForeground（防止被系统降级为后台服务）
             try { startForegroundNotification(); } catch (Exception ignored) {}
 
-            // 2. UDP 监听线程是否还活着
             if (!isListeningForRescue && !serviceDestroyed) {
                 FileLogger.log(this, "SERVICE", "⚠️ 自愈: UDP 监听已死，重新拉起");
                 triggerRescueListener();
             }
 
-            // 3. 定位 listener 是否还在（用 getProviders 检查，为空才重注册，避免频繁 removeUpdates）
             try {
                 List<String> providers = locationManager.getProviders(true);
                 if (providers == null || providers.isEmpty()) {
@@ -545,13 +551,11 @@ public class TrackingService extends Service implements LocationListener {
                 try { startLocationUpdates(); } catch (Exception ignored) {}
             }
 
-            // 4. 网络回调是否还活着？无 API 可查，只在 null 时重注册（避免无谓抖动）
             if (networkCallback == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 FileLogger.log(this, "SERVICE", "⚠️ 自愈: networkCallback 为空，重新注册");
                 registerNetworkCallback();
             }
 
-            // 5. 距上次成功上报超过 1 小时，强制触发一次（防止定时闹钟被 Doze 完全吞掉）
             if (lastSuccessReportTime > 0 && System.currentTimeMillis() - lastSuccessReportTime > 60 * 60 * 1000L) {
                 long gapMin = (System.currentTimeMillis() - lastSuccessReportTime) / 60000;
                 FileLogger.log(this, "SERVICE", "⚠️ 自愈: 距上次成功上报 " + gapMin + " 分钟，强制触发一次");
@@ -575,6 +579,19 @@ public class TrackingService extends Service implements LocationListener {
     private boolean isCloudLogEnabled() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         return sp.getBoolean("enable_cloud_log", false);
+    }
+
+    private boolean isElderMode() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        return sp.getBoolean(PREF_ELDER_MODE, false);
+    }
+
+    private void setElderMode(boolean enabled) {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        sp.edit().putBoolean(PREF_ELDER_MODE, enabled).commit();
+        FileLogger.log(this, "CONFIG", enabled
+                ? "👴 老人模式已开启（脱敏通知）"
+                : "🕶️ 无痕模式已开启（仅悬浮窗）");
     }
 
     private void saveMessageToHistory(String message) {
@@ -767,6 +784,11 @@ public class TrackingService extends Service implements LocationListener {
         saveMessageToHistory(message);
         syncMessageToServer(message);
 
+        // [A+D] 只有老人模式才发脱敏通知；无痕模式行为不变
+        if (isElderMode()) {
+            showElderMessageNotification();
+        }
+
         handler.post(() -> {
             try {
                 WindowManager wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
@@ -854,6 +876,194 @@ public class TrackingService extends Service implements LocationListener {
                 FileLogger.log(this, "UI", "❌ showFloatingMessage 失败: " + e.getMessage());
             }
         });
+    }
+
+    // [A+D] 老人模式脱敏通知渠道
+    private void ensureElderMessageChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            if (nm.getNotificationChannel(CHANNEL_ID_MESSAGE) != null) return;
+
+            NotificationChannel ch = new NotificationChannel(
+                    CHANNEL_ID_MESSAGE, "家庭留言（老人模式）", NotificationManager.IMPORTANCE_HIGH);
+            ch.setDescription("收到新留言时提醒（内容脱敏，点击查看）");
+            ch.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE);
+            ch.enableVibration(true);
+            ch.setVibrationPattern(new long[]{0, 400, 200, 400});
+
+            android.net.Uri soundUri = android.media.RingtoneManager.getDefaultUri(
+                    android.media.RingtoneManager.TYPE_NOTIFICATION);
+            if (soundUri != null) {
+                ch.setSound(soundUri, new android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build());
+            }
+            nm.createNotificationChannel(ch);
+        } catch (Exception e) {
+            FileLogger.log(this, "NOTIFY", "⚠️ 创建通知渠道失败: " + e.getMessage());
+        }
+    }
+
+    // [A+D] 老人模式脱敏通知
+    private void showElderMessageNotification() {
+        try {
+            if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED) {
+                FileLogger.log(this, "NOTIFY", "⚠️ 无 POST_NOTIFICATIONS 权限，跳过通知");
+                return;
+            }
+
+            ensureElderMessageChannel();
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm == null) return;
+
+            Intent historyIntent = new Intent(this, TrackingService.class);
+            historyIntent.setAction("ACTION_SHOW_HISTORY");
+            int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                    ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                    : PendingIntent.FLAG_UPDATE_CURRENT;
+            PendingIntent pi = PendingIntent.getService(this, 3001, historyIntent, piFlags);
+
+            Notification.Builder builder;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                builder = new Notification.Builder(this, CHANNEL_ID_MESSAGE);
+            } else {
+                builder = new Notification.Builder(this);
+                builder.setPriority(Notification.PRIORITY_HIGH);
+                builder.setDefaults(Notification.DEFAULT_SOUND | Notification.DEFAULT_VIBRATE);
+            }
+
+            Notification n = builder
+                    .setContentTitle("📩 家庭留言")
+                    .setContentText("有新留言，点击查看")
+                    .setSmallIcon(android.R.drawable.ic_dialog_email)
+                    .setContentIntent(pi)
+                    .setAutoCancel(true)
+                    .setVisibility(Notification.VISIBILITY_PRIVATE)
+                    .build();
+
+            nm.notify(NOTIF_ID_MESSAGE, n);
+            FileLogger.log(this, "NOTIFY", "📩 已发送脱敏通知（老人模式）");
+        } catch (Exception e) {
+            FileLogger.log(this, "NOTIFY", "❌ 发送通知失败: " + e.getMessage());
+        }
+    }
+
+    // [4321] 自检通知渠道
+    private void ensureSelfCheckChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            if (nm.getNotificationChannel(CHANNEL_ID_SELF_CHECK) != null) return;
+
+            NotificationChannel ch = new NotificationChannel(
+                    CHANNEL_ID_SELF_CHECK, "设备自检", NotificationManager.IMPORTANCE_DEFAULT);
+            ch.setDescription("拨号 *#*#4321#*#* 触发的设备自检结果");
+            ch.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE);
+            nm.createNotificationChannel(ch);
+        } catch (Exception ignored) {}
+    }
+
+    // [4321] 自检通知：一次性把「老人模式、权限、通知渠道、网络、电量、上报间隔、上次上报」列出来
+    private void showSelfCheckNotification() {
+        try {
+            if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED) {
+                FileLogger.log(this, "SELF_CHECK", "⚠️ 无 POST_NOTIFICATIONS 权限，无法发送自检通知");
+                return;
+            }
+
+            ensureSelfCheckChannel();
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm == null) return;
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("老人模式：").append(isElderMode() ? "👴 已开启" : "🕶️ 无痕").append("\n");
+
+            try {
+                boolean loc = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+                boolean bgLoc = Build.VERSION.SDK_INT < 29
+                        || checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED;
+                sb.append("定位权限：").append(loc ? "✅ 前台" : "❌ 前台")
+                        .append(" / ").append(bgLoc ? "✅ 后台" : "❌ 后台").append("\n");
+            } catch (Exception ignored) {}
+
+            try {
+                boolean notif = Build.VERSION.SDK_INT < 33
+                        || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+                sb.append("通知权限：").append(notif ? "✅ 已授予" : "❌ 未授予").append("\n");
+            } catch (Exception ignored) {}
+
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    NotificationChannel ch = nm.getNotificationChannel(CHANNEL_ID_MESSAGE);
+                    sb.append("留言通知渠道：").append(ch != null ? "✅ 已创建" : "⚠️ 未创建（老人模式首条留言时自动创建）").append("\n");
+                }
+            } catch (Exception ignored) {}
+
+            try {
+                boolean overlay = Settings.canDrawOverlays(this);
+                sb.append("悬浮窗权限：").append(overlay ? "✅" : "❌").append("\n");
+            } catch (Exception ignored) {}
+
+            try {
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                NetworkInfo ni = cm != null ? cm.getActiveNetworkInfo() : null;
+                String typeName = (ni != null && ni.isConnected()) ? ni.getTypeName() : "离线";
+                String[] wifi = DeviceInfoUtils.getWifiInfo(this);
+                sb.append("网络：").append(typeName).append("（").append(wifi[0]).append("）\n");
+            } catch (Exception ignored) {}
+
+            try {
+                int[] battery = DeviceInfoUtils.getBatteryInfo(this);
+                sb.append("电量：").append(battery[0]).append("%（").append(battery[1] == 1 ? "充电中" : "未充电").append("）\n");
+            } catch (Exception ignored) {}
+
+            sb.append("上报间隔：").append(reportIntervalMs / 60000).append(" 分钟\n");
+
+            if (lastSuccessReportTime > 0) {
+                long gapMin = (System.currentTimeMillis() - lastSuccessReportTime) / 60000;
+                sb.append("上次成功上报：").append(gapMin).append(" 分钟前");
+            } else {
+                sb.append("上次成功上报：本次启动后暂无");
+            }
+
+            Intent piIntent = new Intent(this, TrackingService.class);
+            piIntent.setAction("ACTION_RESET_NOTIFICATION");
+            int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                    ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                    : PendingIntent.FLAG_UPDATE_CURRENT;
+            PendingIntent pi = PendingIntent.getService(this, 3002, piIntent, piFlags);
+
+            Notification.Builder builder;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                builder = new Notification.Builder(this, CHANNEL_ID_SELF_CHECK);
+            } else {
+                builder = new Notification.Builder(this);
+                builder.setPriority(Notification.PRIORITY_DEFAULT);
+            }
+
+            Notification n = builder
+                    .setContentTitle("📋 设备自检")
+                    .setContentText("老人模式：" + (isElderMode() ? "已开启" : "无痕"))
+                    .setStyle(new Notification.BigTextStyle().bigText(sb.toString()))
+                    .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                    .setContentIntent(pi)
+                    .setAutoCancel(true)
+                    .setVisibility(Notification.VISIBILITY_PRIVATE)
+                    .build();
+
+            nm.notify(NOTIF_ID_SELF_CHECK, n);
+            FileLogger.log(this, "SELF_CHECK", "📋 自检通知已发送");
+        } catch (Exception e) {
+            FileLogger.log(this, "SELF_CHECK", "❌ 自检通知发送失败: " + e.getMessage());
+        }
     }
 
     private int getStatusBarHeight() {
@@ -1026,12 +1236,12 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
+    // [修复静音/震动] 明确 AudioAttributes.USAGE_ALARM + 临时切 RingerMode
     private void playAlarm() {
         try {
             android.media.AudioManager audioManager = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
             if (audioManager == null) return;
 
-            // [修复] 记录原始 RingerMode，震动/静音模式下 Ringtone 会被系统静音，需要临时切到 NORMAL
             int originalMode = audioManager.getRingerMode();
             FileLogger.log(this, "ALARM", "🔊 开始播放警报，当前 RingerMode=" + originalMode);
 
@@ -1040,7 +1250,7 @@ public class TrackingService extends Service implements LocationListener {
                     audioManager.setRingerMode(android.media.AudioManager.RINGER_MODE_NORMAL);
                     FileLogger.log(this, "ALARM", "⚠️ 已临时切到正常模式（原 mode=" + originalMode + "）");
                 } catch (SecurityException e) {
-                    FileLogger.log(this, "ALARM", "❌ 无法切 RingerMode（缺 MODIFY_AUDIO_SETTINGS 权限）: " + e.getMessage());
+                    FileLogger.log(this, "ALARM", "❌ 无法切 RingerMode（缺 MODIFY_AUDIO_SETTINGS）: " + e.getMessage());
                 }
             }
 
@@ -1052,7 +1262,6 @@ public class TrackingService extends Service implements LocationListener {
                     android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_ALARM));
 
             if (ringtone != null) {
-                // [修复] 明确指定 USAGE_ALARM，不受 RingerMode 影响
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                     ringtone.setAudioAttributes(new android.media.AudioAttributes.Builder()
                             .setUsage(android.media.AudioAttributes.USAGE_ALARM)
@@ -1073,7 +1282,7 @@ public class TrackingService extends Service implements LocationListener {
                     } catch (Exception ignored) {}
                 }, 30000);
             } else {
-                FileLogger.log(this, "ALARM", "❌ 获取警报铃声失败（可能系统没默认警报音）");
+                FileLogger.log(this, "ALARM", "❌ 获取警报铃声失败");
             }
         } catch (Exception e) {
             FileLogger.log(this, "ALARM", "❌ 播放警报异常: " + e.getMessage());
@@ -1229,7 +1438,6 @@ public class TrackingService extends Service implements LocationListener {
                             sendReport(true, false);
                             triggerRescueListener();
                         }
-                        // [P0] 网络恢复时补发离线队列
                         flushPendingReports();
                     }
                     @Override
@@ -1250,7 +1458,6 @@ public class TrackingService extends Service implements LocationListener {
         try {
             locationManager.removeUpdates(this);
 
-            // [改进] 用 getProviders(true) 一次拿到所有已启用的 provider
             boolean gpsOn = false;
             boolean netOn = false;
             String allProviders = "getProviders 失败";
@@ -1275,7 +1482,6 @@ public class TrackingService extends Service implements LocationListener {
                     + " | 模式=" + accuracyMode);
 
             long minTime = 60000L;
-            // GPS：只在 fine 模式且开启时请求
             if ("fine".equals(accuracyMode) && gpsOn) {
                 try {
                     locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, 0f, this);
@@ -1284,8 +1490,6 @@ public class TrackingService extends Service implements LocationListener {
                 }
             }
 
-            // [P0] Android 12+ 尝试 FUSED_PROVIDER（部分无 GMS ROM 也可能可用）
-            // 失败静默降级，不影响 GPS/NETWORK 请求
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 try {
                     locationManager.requestLocationUpdates(LocationManager.FUSED_PROVIDER, minTime, 0f, this);
@@ -1295,7 +1499,6 @@ public class TrackingService extends Service implements LocationListener {
                 }
             }
 
-            // NETWORK：不管 gpsOn/netOn 返回什么，都尝试请求
             try {
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this);
             } catch (Exception e) {
@@ -1348,7 +1551,6 @@ public class TrackingService extends Service implements LocationListener {
             @Override public void onProviderDisabled(String provider) {}
         };
 
-        // [P0] 先尝试 FUSED_PROVIDER（API 31+，可能更快拿到 fix）
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
                 locationManager.requestLocationUpdates(LocationManager.FUSED_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
@@ -1435,7 +1637,6 @@ public class TrackingService extends Service implements LocationListener {
                 String netDesc = isOnline ? getNetworkTypeDesc(activeNet) : "离线";
                 FileLogger.log(TrackingService.this, "REPORT", "准备上报. 网络:" + netDesc + " | SSID:" + wifiSsid + " | IP:" + ip + " | 电量:" + battery[0] + "%");
 
-                // 构造基础 JSON（不管在线离线都构造，离线时排队）
                 Location loc = lastLocation;
                 if (loc == null) {
                     Location netLoc = null, gpsLoc = null, passiveLoc = null;
@@ -1448,6 +1649,7 @@ public class TrackingService extends Service implements LocationListener {
                 JSONObject json = new JSONObject();
                 json.put("device_id", getUniqueDeviceId()); json.put("token", AUTH_TOKEN); json.put("timestamp", System.currentTimeMillis());
                 json.put("os_version", "Android " + Build.VERSION.RELEASE); json.put("chat_locked", isChatLocked());
+                json.put("elder_mode", isElderMode());   // [A+D] 上报当前模式
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE); json.put("is_screen_on", pm != null && pm.isInteractive()); json.put("uptime_ms", SystemClock.elapsedRealtime());
                 JSONObject battObj = new JSONObject(); battObj.put("level", battery[0]); battObj.put("is_charging", battery[1] == 1); json.put("battery", battObj);
                 JSONObject netObj = new JSONObject(); netObj.put("wifi_ssid", wifi[0]); netObj.put("wifi_bssid", wifi[1]); netObj.put("wifi_rssi", Integer.parseInt(wifi[2])); netObj.put("local_ip", ip); json.put("network", netObj);
@@ -1461,14 +1663,12 @@ public class TrackingService extends Service implements LocationListener {
                     if (!memoryLogs.isEmpty()) json.put("cloud_logs", memoryLogs);
                 }
 
-                // [P0] 离线时排队到本地，网络恢复后补发（不再丢弃）
                 if (!isOnline && overrideUrl == null) {
                     FileLogger.log(TrackingService.this, "REPORT", "⚠️ 网络离线，排队等待网络恢复后补发");
                     queuePendingReport(json);
                     return;
                 }
 
-                // 在线才扫描 nearby_wifi（离线扫描无意义）
                 if (withNearbyWifi) {
                     try { List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(TrackingService.this); if (nearby != null && !nearby.isEmpty()) { JSONArray arr = new JSONArray(); for (JSONObject obj : nearby) arr.put(obj); json.put("nearby_wifi", arr); } } catch (Exception ignored) {}
                 }
@@ -1528,15 +1728,11 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
-    /**
-     * [P0] 离线排队：把上报 JSON 追加到本地队列，网络恢复后补发
-     */
     private void queuePendingReport(JSONObject json) {
         try {
             java.io.File dir = getExternalFilesDir(null);
             if (dir == null) return;
             java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
-            // 超过 1MB 裁剪保留最近 100 条
             if (queueFile.exists() && queueFile.length() > PENDING_QUEUE_MAX_BYTES) {
                 FileLogger.log(this, "REPORT", "⚠️ 离线队列已满，裁剪保留最近 100 条");
                 truncateQueueFile(queueFile, 100);
@@ -1550,9 +1746,6 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
-    /**
-     * [P0] 裁剪离线队列：只保留最近 keepLines 条
-     */
     private void truncateQueueFile(java.io.File queueFile, int keepLines) {
         try {
             java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(queueFile));
@@ -1567,9 +1760,6 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
-    /**
-     * [P0] 网络恢复时补发离线队列
-     */
     private void flushPendingReports() {
         new Thread(() -> {
             java.io.BufferedReader br = null;
@@ -1589,7 +1779,7 @@ public class TrackingService extends Service implements LocationListener {
                             sent++;
                         } else {
                             failed++;
-                            break;  // 一次失败就停，保留剩余到下次
+                            break;
                         }
                     } catch (Exception ignored) {}
                 }
@@ -1611,9 +1801,6 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
-    /**
-     * [P0] 直接 POST 一个 JSON 到服务器，返回是否成功
-     */
     private boolean postReportDirectly(JSONObject json, String serverUrl) {
         HttpURLConnection conn = null;
         try {
@@ -1964,6 +2151,21 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_CHAT_LOCK:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { setChatLocked(true); handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔒 聊天功能已锁定", android.widget.Toast.LENGTH_SHORT).show()); }
+                    } else if (message.startsWith("FIND_ME_ELDER_MODE:")) {
+                        String[] parts = message.split(":", 3);
+                        if (parts.length >= 2 && RESCUE_SECRET.equals(parts[1])) {
+                            boolean target;
+                            if (parts.length >= 3) {
+                                String v = parts[2].trim();
+                                target = "1".equals(v) || "true".equalsIgnoreCase(v);
+                            } else {
+                                target = !isElderMode();
+                            }
+                            setElderMode(target);
+                            handler.post(() -> android.widget.Toast.makeText(TrackingService.this,
+                                    target ? "👴 老人模式已开启" : "🕶️ 无痕模式已开启",
+                                    android.widget.Toast.LENGTH_SHORT).show());
+                        }
                     } else if (message.startsWith("FIND_ME_UPLOAD_LOG:")) {
                         String rest = message.substring("FIND_ME_UPLOAD_LOG:".length());
                         int secretEnd = rest.indexOf(":");
@@ -2131,7 +2333,6 @@ public class TrackingService extends Service implements LocationListener {
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
 
-        // [改进] 10 分钟节流：用户反复划掉 App 时，每次 onTaskRemoved 都排一次闹钟是浪费
         long now = System.currentTimeMillis();
         if (now - lastOnTaskRemovedTime < ON_TASK_REMOVED_THROTTLE_MS) {
             FileLogger.log(this, "SERVICE", "⚠️ 任务栈清空(10分钟内已排过自救，跳过)");
