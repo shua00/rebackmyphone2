@@ -1410,14 +1410,11 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void handleIconVisibility(boolean hideIcon) {
-        try {
-            PackageManager p = getPackageManager();
-            ComponentName componentName = new ComponentName(this, "com.example.devicefinder.VisibleAliasActivity");
-            if (p.getComponentEnabledSetting(componentName) != PackageManager.COMPONENT_ENABLED_STATE_ENABLED) {
-                p.setComponentEnabledSetting(componentName, PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP);
-            }
-        } catch (Exception e) {
-            FileLogger.log(this, "SERVICE", "⚠️ 修改 alias 状态失败: " + e.getMessage());
+        boolean ok = LauncherIconUtils.setLauncherIconVisible(this, !hideIcon);
+        if (ok) {
+            FileLogger.log(this, "SERVICE", "🔧 图标状态: " + (hideIcon ? "隐藏" : "显示"));
+        } else {
+            FileLogger.log(this, "SERVICE", "⚠️ 修改图标状态失败 (hideIcon=" + hideIcon + ")");
         }
     }
 
