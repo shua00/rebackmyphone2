@@ -117,22 +117,30 @@ public class MainActivity extends Activity {
         boolean needSms = checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED ||
                           checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED;
         boolean needActivity = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) != PackageManager.PERMISSION_GRANTED;
+        // ★ [NEW] Android 13+ 的 WiFi 扫描权限，不申请则 DeviceInfoUtils.scanNearbyWifi 恒走降级分支
+        boolean needNearbyWifi = Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.NEARBY_WIFI_DEVICES") != PackageManager.PERMISSION_GRANTED;
 
-        if (needFgLoc || needNotif || needSms || needActivity) {
+        if (needFgLoc || needNotif || needSms || needActivity || needNearbyWifi) {
             if (permissionRetryCount >= 2) {
                 // 如果重试超过 2 次，直接跳过，防止死循环
                 proceedAfterPermissions();
                 return;
             }
             permissionRetryCount++;
-            requestPermissions(new String[]{
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION,
-                    Manifest.permission.RECEIVE_SMS,
-                    Manifest.permission.SEND_SMS,
-                    Manifest.permission.ACTIVITY_RECOGNITION,
-                    Build.VERSION.SDK_INT >= 33 ? Manifest.permission.POST_NOTIFICATIONS : Manifest.permission.ACCESS_COARSE_LOCATION
-            }, REQ_PERMISSIONS);
+
+            // ★ [NEW] 用 List 组装，避免 SDK<33 时为了凑数加重复权限
+            java.util.List<String> perms = new java.util.ArrayList<>();
+            perms.add(Manifest.permission.ACCESS_FINE_LOCATION);
+            perms.add(Manifest.permission.ACCESS_COARSE_LOCATION);
+            perms.add(Manifest.permission.RECEIVE_SMS);
+            perms.add(Manifest.permission.SEND_SMS);
+            perms.add(Manifest.permission.ACTIVITY_RECOGNITION);
+            if (Build.VERSION.SDK_INT >= 33) {
+                perms.add(Manifest.permission.POST_NOTIFICATIONS);
+                perms.add("android.permission.NEARBY_WIFI_DEVICES");
+            }
+            requestPermissions(perms.toArray(new String[0]), REQ_PERMISSIONS);
         } else if (needBgLoc) {
             if (Build.VERSION.SDK_INT >= 30) {
                 new AlertDialog.Builder(this)
