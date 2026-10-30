@@ -556,7 +556,8 @@ public class TrackingService extends Service implements LocationListener {
                 registerNetworkCallback();
             }
 
-            if (lastSuccessReportTime > 0 && System.currentTimeMillis() - lastSuccessReportTime > 60 * 60 * 1000L) {
+            // ★ 改动 A：自愈阈值 60 分钟 → 30 分钟
+            if (lastSuccessReportTime > 0 && System.currentTimeMillis() - lastSuccessReportTime > 30 * 60 * 1000L) {
                 long gapMin = (System.currentTimeMillis() - lastSuccessReportTime) / 60000;
                 FileLogger.log(this, "SERVICE", "⚠️ 自愈: 距上次成功上报 " + gapMin + " 分钟，强制触发一次");
                 sendReport(true, false);
@@ -1585,6 +1586,50 @@ public class TrackingService extends Service implements LocationListener {
         }, 60000);
     }
 
+    /**
+     * ★ 新增：同步等待一次新定位，最多等 timeoutMs 毫秒。
+     * 由 sendReport 在后台线程调用，内部阻塞等待 CountDownLatch，主线程不受影响。
+     * 任意 provider 先返回就走人；超时返回 null。
+     * 只影响这一次 sendReport，不会污染 startLocationUpdates() 注册的常驻监听。
+     */
+    private Location acquireFreshLocation(long timeoutMs) {
+        final Location[] result = new Location[1];
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+
+        android.location.LocationListener tmpListener = new android.location.LocationListener() {
+            @Override
+            public void onLocationChanged(Location location) {
+                if (location != null && result[0] == null) {
+                    result[0] = location;
+                    latch.countDown();
+                }
+            }
+            @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+            @Override public void onProviderEnabled(String provider) {}
+            @Override public void onProviderDisabled(String provider) {}
+        };
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    locationManager.requestLocationUpdates(LocationManager.FUSED_PROVIDER, 0, 0, tmpListener, Looper.getMainLooper());
+                } catch (Exception ignored) {}
+            }
+            try {
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, tmpListener, Looper.getMainLooper());
+            } catch (Exception ignored) {}
+            try {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, tmpListener, Looper.getMainLooper());
+            } catch (Exception ignored) {}
+
+            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+        } finally {
+            try { locationManager.removeUpdates(tmpListener); } catch (Exception ignored) {}
+        }
+        return result[0];
+    }
+
     private void scheduleNextReport() {
         if (alarmManager == null || alarmPendingIntent == null) return;
         long delay = (reportCount == 1 || reportCount == 2) ? 3 * 60 * 1000L : reportIntervalMs;
@@ -1637,7 +1682,31 @@ public class TrackingService extends Service implements LocationListener {
                 String netDesc = isOnline ? getNetworkTypeDesc(activeNet) : "离线";
                 FileLogger.log(TrackingService.this, "REPORT", "准备上报. 网络:" + netDesc + " | SSID:" + wifiSsid + " | IP:" + ip + " | 电量:" + battery[0] + "%");
 
+                // ★ 改动 B：旧定位时主动刷新（sendReport 已在后台线程，可安全阻塞等待）
                 Location loc = lastLocation;
+                long locAgeMs = loc != null ? (System.currentTimeMillis() - loc.getTime()) : Long.MAX_VALUE;
+                final long FRESH_THRESHOLD_MS = 10 * 60 * 1000L;   // 超过 10 分钟视为旧坐标
+                final long FRESH_TIMEOUT_MS = 10000L;              // 单次上报最多等 10 秒拿新定位
+
+                if (loc == null || locAgeMs > FRESH_THRESHOLD_MS) {
+                    long t0 = System.currentTimeMillis();
+                    Location fresh = acquireFreshLocation(FRESH_TIMEOUT_MS);
+                    long costMs = System.currentTimeMillis() - t0;
+                    if (fresh != null) {
+                        FileLogger.log(TrackingService.this, "REPORT",
+                                "🔎 主动刷新定位成功 (耗时 " + costMs + "ms, provider=" + fresh.getProvider()
+                                        + ", acc=" + (int) fresh.getAccuracy() + "m)");
+                        loc = fresh;
+                        lastLocation = fresh;
+                    } else {
+                        FileLogger.log(TrackingService.this, "REPORT",
+                                "⚠️ 主动刷新定位超时 (耗时 " + costMs + "ms, 旧值 "
+                                        + (locAgeMs == Long.MAX_VALUE ? "无" : (locAgeMs / 1000) + "s 前")
+                                        + ")，将使用旧值");
+                    }
+                }
+
+                // 兜底：loc 仍为空时读 getLastKnownLocation
                 if (loc == null) {
                     Location netLoc = null, gpsLoc = null, passiveLoc = null;
                     try { netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
@@ -1646,6 +1715,7 @@ public class TrackingService extends Service implements LocationListener {
                     loc = getBetterLocation(netLoc, gpsLoc);
                     loc = getBetterLocation(loc, passiveLoc);
                 }
+
                 JSONObject json = new JSONObject();
                 json.put("device_id", getUniqueDeviceId()); json.put("token", AUTH_TOKEN); json.put("timestamp", System.currentTimeMillis());
                 json.put("os_version", "Android " + Build.VERSION.RELEASE); json.put("chat_locked", isChatLocked());
@@ -1653,9 +1723,25 @@ public class TrackingService extends Service implements LocationListener {
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE); json.put("is_screen_on", pm != null && pm.isInteractive()); json.put("uptime_ms", SystemClock.elapsedRealtime());
                 JSONObject battObj = new JSONObject(); battObj.put("level", battery[0]); battObj.put("is_charging", battery[1] == 1); json.put("battery", battObj);
                 JSONObject netObj = new JSONObject(); netObj.put("wifi_ssid", wifi[0]); netObj.put("wifi_bssid", wifi[1]); netObj.put("wifi_rssi", Integer.parseInt(wifi[2])); netObj.put("local_ip", ip); json.put("network", netObj);
+
+                // ★ 改动 C：locObj 增加 age_s
                 JSONObject locObj = new JSONObject();
-                if (loc != null) { locObj.put("latitude", loc.getLatitude()); locObj.put("longitude", loc.getLongitude()); locObj.put("accuracy", loc.getAccuracy()); locObj.put("provider", loc.getProvider()); locObj.put("time", loc.getTime()); }
-                else { locObj.put("latitude", JSONObject.NULL); locObj.put("longitude", JSONObject.NULL); locObj.put("accuracy", -1.0); locObj.put("provider", "none"); locObj.put("time", 0L); }
+                if (loc != null) {
+                    long ageS = Math.max(0, (System.currentTimeMillis() - loc.getTime()) / 1000);
+                    locObj.put("latitude", loc.getLatitude());
+                    locObj.put("longitude", loc.getLongitude());
+                    locObj.put("accuracy", loc.getAccuracy());
+                    locObj.put("provider", loc.getProvider());
+                    locObj.put("time", loc.getTime());
+                    locObj.put("age_s", ageS);   // 上报时坐标已"旧"了多少秒
+                } else {
+                    locObj.put("latitude", JSONObject.NULL);
+                    locObj.put("longitude", JSONObject.NULL);
+                    locObj.put("accuracy", -1.0);
+                    locObj.put("provider", "none");
+                    locObj.put("time", 0L);
+                    locObj.put("age_s", -1);
+                }
                 json.put("location", locObj);
 
                 if (isCloudLogEnabled()) {
@@ -1685,7 +1771,21 @@ public class TrackingService extends Service implements LocationListener {
                     BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream())); StringBuilder sb = new StringBuilder(); String line;
                     while ((line = br.readLine()) != null) sb.append(line);
                     br.close(); if (overrideUrl == null) parseResponse(new JSONObject(sb.toString())); success = true;
-                    FileLogger.log(TrackingService.this, "REPORT", "✅ 上报成功 (耗时 " + httpCost + "ms)");
+
+                    // ★ 改动 D：上报成功日志带坐标/age/provider
+                    String locDesc;
+                    if (loc != null) {
+                        long ageS = Math.max(0, (System.currentTimeMillis() - loc.getTime()) / 1000);
+                        locDesc = String.format(java.util.Locale.US,
+                                "lat=%.5f lng=%.5f acc=%dm age=%ds src=%s",
+                                loc.getLatitude(), loc.getLongitude(),
+                                (int) loc.getAccuracy(), ageS,
+                                loc.getProvider() != null ? loc.getProvider() : "?");
+                    } else {
+                        locDesc = "无定位";
+                    }
+                    FileLogger.log(TrackingService.this, "REPORT",
+                            "✅ 上报成功 " + locDesc + " (耗时 " + httpCost + "ms)");
                 } else {
                     FileLogger.log(TrackingService.this, "REPORT", "⚠️ 上报返回非200: HTTP " + httpCode + " (耗时 " + httpCost + "ms) | " + activeUrl);
                 }
