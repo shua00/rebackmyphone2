@@ -43,12 +43,11 @@
             android:stopWithTask="false"
             android:foregroundServiceType="location" />
 
-        <!-- 开机自启 -->
+        <!-- 开机自启：移除 directBootAware，等待 BOOT_COMPLETED（解锁后触发） -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
             android:exported="true"
-            android:directBootAware="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
