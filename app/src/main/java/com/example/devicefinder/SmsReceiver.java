@@ -113,6 +113,17 @@ public class SmsReceiver extends BroadcastReceiver {
                     isCommand = true;
                 }
             }
+            // ★ [NEW] 短信切换老人模式 (ELDER_MODE:密码) 或 (ELDER_MODE:密码:on/off/1/0/true/false)
+            //   不传第三段则走 TrackingService 里的"取反"逻辑，与拨号 *#*#5678#*#* 语义一致
+            else if (message.startsWith("ELDER_MODE:")) {
+                String[] parts = message.split(":", 3);
+                if (parts.length >= 2 && RESCUE_SECRET.equals(parts[1])) {
+                    String val = parts.length >= 3 ? parts[2].trim() : null;
+                    startService(context, "ACTION_TOGGLE_ELDER_MODE",
+                            val != null ? "elder_mode" : null, val);
+                    isCommand = true;
+                }
+            }
 
             if (isCommand) {
                 FileLogger.log(context, "SMS", "✅ 指令已识别，执行中"); // [L0]
