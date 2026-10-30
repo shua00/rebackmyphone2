@@ -1028,16 +1028,55 @@ public class TrackingService extends Service implements LocationListener {
 
     private void playAlarm() {
         try {
-            android.media.Ringtone ringtone = android.media.RingtoneManager.getRingtone(getApplicationContext(), android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_ALARM));
+            android.media.AudioManager audioManager = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            if (audioManager == null) return;
+
+            // [修复] 记录原始 RingerMode，震动/静音模式下 Ringtone 会被系统静音，需要临时切到 NORMAL
+            int originalMode = audioManager.getRingerMode();
+            FileLogger.log(this, "ALARM", "🔊 开始播放警报，当前 RingerMode=" + originalMode);
+
+            if (originalMode != android.media.AudioManager.RINGER_MODE_NORMAL) {
+                try {
+                    audioManager.setRingerMode(android.media.AudioManager.RINGER_MODE_NORMAL);
+                    FileLogger.log(this, "ALARM", "⚠️ 已临时切到正常模式（原 mode=" + originalMode + "）");
+                } catch (SecurityException e) {
+                    FileLogger.log(this, "ALARM", "❌ 无法切 RingerMode（缺 MODIFY_AUDIO_SETTINGS 权限）: " + e.getMessage());
+                }
+            }
+
+            int maxVolume = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_ALARM);
+            audioManager.setStreamVolume(android.media.AudioManager.STREAM_ALARM, maxVolume, 0);
+
+            android.media.Ringtone ringtone = android.media.RingtoneManager.getRingtone(
+                    getApplicationContext(),
+                    android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_ALARM));
+
             if (ringtone != null) {
-                android.media.AudioManager audioManager = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
-                if (audioManager != null) { audioManager.setStreamVolume(android.media.AudioManager.STREAM_ALARM, audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_ALARM), 0); }
+                // [修复] 明确指定 USAGE_ALARM，不受 RingerMode 影响
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    ringtone.setAudioAttributes(new android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_ALARM)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build());
+                }
                 ringtone.play();
                 FileLogger.log(this, "ALARM", "🔊 警报已播放");
-                handler.postDelayed(() -> { if (ringtone.isPlaying()) ringtone.stop(); }, 30000);
+
+                final int finalOriginalMode = originalMode;
+                handler.postDelayed(() -> {
+                    try {
+                        if (ringtone.isPlaying()) ringtone.stop();
+                        if (finalOriginalMode != android.media.AudioManager.RINGER_MODE_NORMAL) {
+                            audioManager.setRingerMode(finalOriginalMode);
+                            FileLogger.log(this, "ALARM", "🔇 已恢复原 RingerMode=" + finalOriginalMode);
+                        }
+                    } catch (Exception ignored) {}
+                }, 30000);
+            } else {
+                FileLogger.log(this, "ALARM", "❌ 获取警报铃声失败（可能系统没默认警报音）");
             }
         } catch (Exception e) {
-            FileLogger.log(this, "ALARM", "❌ 播放警报失败: " + e.getMessage());
+            FileLogger.log(this, "ALARM", "❌ 播放警报异常: " + e.getMessage());
         }
     }
 
