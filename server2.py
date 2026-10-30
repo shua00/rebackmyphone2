@@ -24,7 +24,12 @@ ALL_DEVICES_STATUS = {}
 CHAT_MESSAGES = []
 print_lock = threading.Lock()
 
-LAST_MSG_INFO = {"key": "", "time": 0}
+# [修复 7] UDP 去重从「单 key」改成「dict」，支持多设备交替发消息
+# 原结构：{"key": "", "time": 0}   只记住最后一条
+# 新结构：{dedup_key: last_time}    每对 (sender, content) 独立记录
+LAST_MSG_INFO = {}
+LAST_MSG_INFO_MAX = 100       # 超过 100 条时清理过期项
+LAST_MSG_INFO_TTL = 10.0      # 10 秒过期（实际去重窗口是 3 秒，10 秒后清理是保守值）
 
 # [新增] 日志上传目录
 UPLOAD_LOG_DIR = "uploads/logs"
@@ -67,17 +72,25 @@ def udp_listener():
                     content = parts[3]
 
                     if sender not in ["Web_Console", "PC_Terminal"]:
+                        # [修复 7] 按 dedup_key 去重，多设备交替发消息也能正确识别
                         dedup_key = sender + ":" + content
                         now_ts = time.time()
-                        if dedup_key == LAST_MSG_INFO["key"] and (now_ts - LAST_MSG_INFO["time"] < 3.0):
+                        if now_ts - LAST_MSG_INFO.get(dedup_key, 0) < 3.0:
                             continue
-                        LAST_MSG_INFO["key"] = dedup_key
-                        LAST_MSG_INFO["time"] = now_ts
+                        LAST_MSG_INFO[dedup_key] = now_ts
 
+                        # [修复 7] 定期清理过期条目，防止 dict 无限增长
+                        if len(LAST_MSG_INFO) > LAST_MSG_INFO_MAX:
+                            cutoff = now_ts - LAST_MSG_INFO_TTL
+                            stale = [k for k, v in list(LAST_MSG_INFO.items()) if v < cutoff]
+                            for k in stale:
+                                LAST_MSG_INFO.pop(k, None)
+
+                        now_ms = int(datetime.datetime.now().timestamp() * 1000)
                         if sender not in ALL_DEVICES_STATUS:
                             ALL_DEVICES_STATUS[sender] = {
                                 "device_id": sender,
-                                "received_at": int(datetime.datetime.now().timestamp() * 1000),
+                                "received_at": now_ms,
                                 "network": {},
                                 "battery": {"level": "?"}
                             }
@@ -85,6 +98,11 @@ def udp_listener():
                         if 'network' not in ALL_DEVICES_STATUS[sender]:
                             ALL_DEVICES_STATUS[sender]['network'] = {}
                         ALL_DEVICES_STATUS[sender]['network']['local_ip'] = source_ip
+
+                        # [修复 1] 每次收到对讲消息都刷新 received_at，清除失联标志
+                        ALL_DEVICES_STATUS[sender]["received_at"] = now_ms
+                        ALL_DEVICES_STATUS[sender].pop("offline_alerted", None)
+                        ALL_DEVICES_STATUS[sender]["last_chat"] = now_ms
 
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         with print_lock:
@@ -314,7 +332,8 @@ def handle_client(client_conn, client_addr):
                 except Exception:
                     log_data = body_part
 
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                # [修复 3] 文件名加微秒 %f，避免同一秒内多次上传覆盖
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 safe_id = "".join(c for c in device_id if c.isalnum() or c in "_-")
                 filename = f"{safe_id}_{ts}.log"
                 filepath = os.path.join(UPLOAD_LOG_DIR, filename)
@@ -376,6 +395,26 @@ def handle_client(client_conn, client_addr):
             except Exception:
                 pass
 
+        # ===== GET /api/cloud_logs (实时查询设备云端日志，修复 6) =====
+        elif "GET /api/cloud_logs" in header_text:
+            try:
+                req_line = header_text.split("\r\n")[0]
+                path_with_query = req_line.split(" ")[1] if len(req_line.split(" ")) > 1 else ""
+                query = urlparse(path_with_query).query
+                params = parse_qs(query)
+                dev_id = params.get("device_id", [""])[0]
+
+                with print_lock:
+                    info = ALL_DEVICES_STATUS.get(dev_id, {})
+                    resp = json.dumps({
+                        "cloud_logs": info.get("cloud_logs", ""),
+                        "cloud_logs_time": info.get("cloud_logs_time", 0),
+                    })
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode())
+            except Exception:
+                pass
+
         # ===== POST /api/control =====
         elif "POST /api/control" in header_text:
             try:
@@ -387,7 +426,15 @@ def handle_client(client_conn, client_addr):
                 success = False
 
                 def smart_send(cmd_prefix):
+                    # [修复 2] 判断手机 IP 和 server2.py 是否同网段，同网段才单播
+                    # 原因：server2.py 在公网时，手机上报的 local_ip 是私网地址，单播不可达
                     sent_any = False
+                    try:
+                        local_ip = get_local_ip()
+                        local_prefix = ".".join(local_ip.split(".")[:3])
+                    except Exception:
+                        local_prefix = ""
+
                     if isinstance(target_ip, list):
                         for ip in target_ip:
                             if ip and ip != '0.0.0.0':
@@ -396,9 +443,15 @@ def handle_client(client_conn, client_addr):
                     elif target_ip == "all" or target_ip == "255.255.255.255":
                         for dev_id, info in list(ALL_DEVICES_STATUS.items()):
                             ip = info.get('network', {}).get('local_ip')
-                            if ip and ip != '0.0.0.0':
+                            if not ip or ip == '0.0.0.0':
+                                continue
+                            if local_prefix and ip.startswith(local_prefix + "."):
+                                # 同网段，单播
                                 send_udp_broadcast(cmd_prefix, ip)
-                                sent_any = True
+                            else:
+                                # 不同网段（公网部署场景），改发广播
+                                send_udp_broadcast(cmd_prefix, "255.255.255.255")
+                            sent_any = True
                         if not sent_any:
                             send_udp_broadcast(cmd_prefix, "255.255.255.255")
                     else:
@@ -751,7 +804,6 @@ var markersLayer = null;
 var polyline = null;
 var isMapVisible = false;
 var isChatVisible = false;
-var allDevicesData = """ + json.dumps(ALL_DEVICES_STATUS).replace('</', '<\\/') + """;
 
 function showToast(msg) {
     var toast = document.getElementById("toast");
@@ -875,19 +927,23 @@ async function showTrack(devId) {
     }, 250);
 }
 
-function showCloudLogs(devId) {
-    var info = allDevicesData[devId];
-    var logs = info && info.cloud_logs ? info.cloud_logs : "该设备尚未上传日志。\\n请先在【高级设置】中开启「云端日志」，并在手机端等待下一次上报。";
-    var logTime = info && info.cloud_logs_time ? new Date(info.cloud_logs_time).toLocaleString() : "未知";
+// [修复 6] 点击「📄 日志」实时查询云端日志，不再依赖页面加载时的快照
+async function showCloudLogs(devId) {
+    try {
+        const res = await fetch('/api/cloud_logs?device_id=' + encodeURIComponent(devId));
+        const info = await res.json();
+        var logs = (info && info.cloud_logs) ? info.cloud_logs : "该设备尚未上传日志。\\n请先在【高级设置】中开启「云端日志」，并在手机端等待下一次上报。";
+        var logTime = (info && info.cloud_logs_time) ? new Date(info.cloud_logs_time).toLocaleString() : "未知";
 
-    document.getElementById('modalTitle').innerText = "📄 运行日志 - " + devId;
-    document.getElementById('msgList').innerHTML = `
-        <div style="color:#57606a; margin-bottom: 10px; font-size: 13px;">
-            最近快照时间: ${logTime}
-        </div>
-        <pre style="background: #f6f8fa; padding: 12px; border-radius: 6px; font-size: 12px; white-space: pre-wrap; border: 1px solid #d0d7de; color: #24292f; max-height: 400px; overflow-y: auto;">${logs}</pre>
-    `;
-    document.getElementById('msgModal').style.display = 'block';
+        document.getElementById('modalTitle').innerText = "📄 运行日志 - " + devId;
+        document.getElementById('msgList').innerHTML = `
+            <div style="color:#57606a; margin-bottom: 10px; font-size: 13px;">
+                最近快照时间: ${logTime}
+            </div>
+            <pre style="background: #f6f8fa; padding: 12px; border-radius: 6px; font-size: 12px; white-space: pre-wrap; border: 1px solid #d0d7de; color: #24292f; max-height: 400px; overflow-y: auto;">${logs}</pre>
+        `;
+        document.getElementById('msgModal').style.display = 'block';
+    } catch(e) { showToast("拉取日志失败: " + e.message); }
 }
 
 async function showLogs() {
