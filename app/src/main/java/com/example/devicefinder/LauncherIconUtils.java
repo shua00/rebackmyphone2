@@ -59,7 +59,8 @@ public final class LauncherIconUtils {
                     + " → " + (visible ? "可见" : "隐藏"));
             return true;
         } catch (Exception e) {
-            Log.e(TAG, "修改 alias 状态失败: " + e.getMessage());
+            // 👇 打印完整的堆栈信息，如果还有问题，你在 logcat 里一眼就能看到
+            Log.e(TAG, "修改 alias 状态失败", e); 
             return false;
         }
     }
