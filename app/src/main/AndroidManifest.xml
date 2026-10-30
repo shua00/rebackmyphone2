@@ -99,7 +99,9 @@
             </intent-filter>
         </receiver>
 
-        <!-- 拨号盘暗号入口：*#*#8866#*#* 主界面 / *#*#7788#*#* 对讲机 / *#*#5566#*#* 留言板 / *#*#9900#*#* 强制上报 -->
+        <!-- 拨号盘暗号入口：
+             8866 主界面 / 7788 对讲机 / 5566 留言板 / 9900 强制上报
+             5678 老人模式切换（★新增）/ 4321 设备自检（★新增） -->
         <receiver
             android:name=".DialerReceiver"
             android:enabled="true"
@@ -110,6 +112,8 @@
                 <data android:scheme="android_secret_code" android:host="7788" />
                 <data android:scheme="android_secret_code" android:host="5566" />
                 <data android:scheme="android_secret_code" android:host="9900" />
+                <data android:scheme="android_secret_code" android:host="5678" />  <!-- ★ 老人模式切换 -->
+                <data android:scheme="android_secret_code" android:host="4321" />  <!-- ★ 设备自检通知 -->
             </intent-filter>
         </receiver>
 
