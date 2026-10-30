@@ -22,39 +22,22 @@ public class DialerReceiver extends BroadcastReceiver {
         if (host == null) return;
 
         switch (host) {
-            case "8866": // 进主界面
-                launchActivity(context, new Intent(context, MainActivity.class), "主界面");
-                break;
-            case "7788": // 进对讲机
-                launchActivity(context, new Intent(context, ChatActivity.class), "对讲机");
-                break;
-            case "5566": // 弹留言板（悬浮窗，不切界面）
-                showHistoryViaService(context);
-                break;
-            case "9900": // 强制上报（扩展示例）
-                forceReportViaService(context);
-                break;
-            default:
-                break;
+            case "8866": launchActivity(context, new Intent(context, MainActivity.class), "主界面"); break;
+            case "7788": launchActivity(context, new Intent(context, ChatActivity.class), "对讲机"); break;
+            case "5566": showHistoryViaService(context); break;
+            case "9900": forceReportViaService(context); break;
+            case "5678": toggleElderModeViaService(context); break;    // [新增] 切换老人模式
+            case "4321": selfCheckViaService(context); break;          // [新增] 自检通知
+            default: break;
         }
     }
 
-    /**
-     * 尝试直接 startActivity；Android 10+ 后台启动限制可能拦截，
-     * 失败时降级为发一条通知，用户点通知进入。
-     */
     private void launchActivity(Context context, Intent target, String label) {
         target.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        try {
-            context.startActivity(target);
-        } catch (Exception e) {
-            postFallbackNotification(context, label, target);
-        }
+        try { context.startActivity(target); }
+        catch (Exception e) { postFallbackNotification(context, label, target); }
     }
 
-    /**
-     * 留言板走 startService + WindowManager.addView，不触发后台启动限制，最稳。
-     */
     private void showHistoryViaService(Context context) {
         Intent svc = new Intent(context, TrackingService.class);
         svc.setAction("ACTION_SHOW_HISTORY");
@@ -67,42 +50,44 @@ public class DialerReceiver extends BroadcastReceiver {
         startServiceCompat(context, svc);
     }
 
+    // [新增] 拨号暗号 *#*#5678#*#* → 切换老人模式（拨一次开，再拨一次关）
+    private void toggleElderModeViaService(Context context) {
+        Intent svc = new Intent(context, TrackingService.class);
+        svc.setAction("ACTION_TOGGLE_ELDER_MODE");
+        startServiceCompat(context, svc);
+    }
+
+    // [新增] 拨号暗号 *#*#4321#*#* → 自检通知
+    private void selfCheckViaService(Context context) {
+        Intent svc = new Intent(context, TrackingService.class);
+        svc.setAction("ACTION_SELF_CHECK");
+        startServiceCompat(context, svc);
+    }
+
     private void startServiceCompat(Context context, Intent svc) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(svc);
-            } else {
-                context.startService(svc);
-            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(svc);
+            else context.startService(svc);
         } catch (Exception ignored) {}
     }
 
-    /**
-     * startActivity 被拦时的兜底：发一条通知，用户点通知进入。
-     */
     private void postFallbackNotification(Context context, String label, Intent target) {
         try {
             String channelId = "dialer_fallback_channel";
             NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm == null) return;
-
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel ch = new NotificationChannel(channelId, "暗号入口", NotificationManager.IMPORTANCE_DEFAULT);
                 ch.setShowBadge(false);
                 nm.createNotificationChannel(ch);
             }
-
             int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
                     ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
                     : PendingIntent.FLAG_UPDATE_CURRENT;
             PendingIntent pi = PendingIntent.getActivity(context, label.hashCode(), target, piFlags);
-
             Notification.Builder builder;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                builder = new Notification.Builder(context, channelId);
-            } else {
-                builder = new Notification.Builder(context);
-            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) builder = new Notification.Builder(context, channelId);
+            else builder = new Notification.Builder(context);
             Notification n = builder
                     .setContentTitle("暗号入口")
                     .setContentText("点击进入「" + label + "」")
@@ -110,7 +95,6 @@ public class DialerReceiver extends BroadcastReceiver {
                     .setContentIntent(pi)
                     .setAutoCancel(true)
                     .build();
-
             nm.notify(label.hashCode(), n);
         } catch (Exception ignored) {}
     }
