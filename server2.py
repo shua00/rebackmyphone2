@@ -102,6 +102,28 @@ def udp_listener():
         print(f"❌ UDP 监听绑定失败: {e}")
 
 
+# [P0] 失联检测：每 5 分钟扫描一次，超过 2 小时没上报的设备标记为失联
+def offline_detector():
+    while True:
+        try:
+            time.sleep(300)
+            now = int(datetime.datetime.now().timestamp() * 1000)
+            with print_lock:
+                for dev_id, info in list(ALL_DEVICES_STATUS.items()):
+                    last_seen = info.get('received_at', 0)
+                    gap_min = (now - last_seen) // 60000
+                    already_alerted = info.get('offline_alerted', False)
+                    if gap_min > 120 and not already_alerted:
+                        info['offline_alerted'] = True
+                        print(f"\n🚨 【失联告警】{dev_id} 已 {gap_min // 60} 小时 {gap_min % 60} 分钟未上报！")
+                    elif gap_min <= 120 and already_alerted:
+                        info['offline_alerted'] = False
+                        print(f"\n✅ 【恢复】{dev_id} 已恢复上报")
+        except Exception as e:
+            with print_lock:
+                print(f"⚠️ 失联检测异常: {e}")
+
+
 def save_history(dev_id, lat, lng, ts):
     if lat is None or lng is None:
         return
@@ -273,7 +295,7 @@ def handle_client(client_conn, client_addr):
                 except Exception:
                     pass
 
-        # ===== POST /api/upload_log (新增：日志上传) =====
+        # ===== POST /api/upload_log (日志上传) =====
         elif "POST /api/upload_log" in header_text:
             try:
                 req_line = header_text.split("\r\n")[0]
@@ -313,7 +335,7 @@ def handle_client(client_conn, client_addr):
                 except Exception:
                     pass
 
-        # ===== GET /api/logs (新增：日志列表) =====
+        # ===== GET /api/logs (日志列表) =====
         elif "GET /api/logs" in header_text:
             try:
                 files = []
@@ -332,7 +354,7 @@ def handle_client(client_conn, client_addr):
             except Exception:
                 pass
 
-        # ===== GET /api/download_log (新增：下载日志) =====
+        # ===== GET /api/download_log (下载日志) =====
         elif "GET /api/download_log" in header_text:
             try:
                 req_line = header_text.split("\r\n")[0]
@@ -488,9 +510,12 @@ def handle_client(client_conn, client_addr):
             except Exception:
                 pass
 
-        # ===== GET / =====
+        # ===== GET / (Web 控制台) =====
         elif "GET /" in header_text:
             chat_options = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" checked><span>所有人 (群发)</span></label>'
+
+            # [P0] 当前时间，用于计算每个设备的失联状态
+            now_ms = int(datetime.datetime.now().timestamp() * 1000)
 
             html = """<!DOCTYPE html>
 <html><head><meta charset='utf-8'>
@@ -646,7 +671,18 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
 
                 is_locked = info.get('chat_locked', False)
                 chat_lock_str = "<span style='color:#cf222e;'>🔒 已锁</span>" if is_locked else "<span style='color:#2da44e;'>🔓 未锁</span>"
-                sys_status = f"{os_ver} <br><span style='font-size:12px;color:var(--color-fg-muted);'>{screen_on} | {chat_lock_str}</span>"
+
+                # [P0] 失联状态标记
+                last_seen = info.get('received_at', 0)
+                gap_min = (now_ms - last_seen) // 60000 if last_seen else 99999
+                if gap_min > 120:
+                    offline_tag = f"<br><span style='color:#cf222e;font-weight:bold;'>🚨 失联 {gap_min // 60}h{gap_min % 60}m</span>"
+                elif gap_min > 30:
+                    offline_tag = f"<br><span style='color:#bf8700;'>⏸ {gap_min} 分钟未上报</span>"
+                else:
+                    offline_tag = ""
+
+                sys_status = f"{os_ver} <br><span style='font-size:12px;color:var(--color-fg-muted);'>{screen_on} | {chat_lock_str}</span>{offline_tag}"
 
                 lat = info.get('location', {}).get('latitude')
                 lng = info.get('location', {}).get('longitude')
@@ -950,6 +986,7 @@ async function showServerMessages() {
 
 def start_server():
     threading.Thread(target=udp_listener, daemon=True).start()
+    threading.Thread(target=offline_detector, daemon=True).start()  # [P0] 失联检测
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -963,6 +1000,7 @@ def start_server():
         print("=" * 50)
         print(f"🚀 设备同步服务已启动: http://{get_local_ip()}:{PORT}")
         print(f"📁 日志上传目录: {os.path.abspath(UPLOAD_LOG_DIR)}")
+        print(f"🚨 失联检测: 每 5 分钟扫描一次，>2 小时未上报告警")
         print("=" * 50)
 
     while True:
