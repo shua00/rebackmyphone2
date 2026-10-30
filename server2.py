@@ -25,13 +25,10 @@ CHAT_MESSAGES = []
 print_lock = threading.Lock()
 
 # [修复 7] UDP 去重从「单 key」改成「dict」，支持多设备交替发消息
-# 原结构：{"key": "", "time": 0}   只记住最后一条
-# 新结构：{dedup_key: last_time}    每对 (sender, content) 独立记录
 LAST_MSG_INFO = {}
-LAST_MSG_INFO_MAX = 100       # 超过 100 条时清理过期项
-LAST_MSG_INFO_TTL = 10.0      # 10 秒过期（实际去重窗口是 3 秒，10 秒后清理是保守值）
+LAST_MSG_INFO_MAX = 100
+LAST_MSG_INFO_TTL = 10.0
 
-# [新增] 日志上传目录
 UPLOAD_LOG_DIR = "uploads/logs"
 os.makedirs(UPLOAD_LOG_DIR, exist_ok=True)
 
@@ -66,20 +63,19 @@ def udp_listener():
             source_ip = addr[0]
 
             if msg.startswith("FIND_ME_MSG:"):
-                parts = msg.split(":", 4)
+                # [修复 1] maxsplit=3，避免 content 含冒号时被切碎丢弃
+                parts = msg.split(":", 3)
                 if len(parts) == 4 and parts[1] == RESCUE_SECRET:
                     sender = parts[2]
                     content = parts[3]
 
                     if sender not in ["Web_Console", "PC_Terminal"]:
-                        # [修复 7] 按 dedup_key 去重，多设备交替发消息也能正确识别
                         dedup_key = sender + ":" + content
                         now_ts = time.time()
                         if now_ts - LAST_MSG_INFO.get(dedup_key, 0) < 3.0:
                             continue
                         LAST_MSG_INFO[dedup_key] = now_ts
 
-                        # [修复 7] 定期清理过期条目，防止 dict 无限增长
                         if len(LAST_MSG_INFO) > LAST_MSG_INFO_MAX:
                             cutoff = now_ts - LAST_MSG_INFO_TTL
                             stale = [k for k, v in list(LAST_MSG_INFO.items()) if v < cutoff]
@@ -99,7 +95,6 @@ def udp_listener():
                             ALL_DEVICES_STATUS[sender]['network'] = {}
                         ALL_DEVICES_STATUS[sender]['network']['local_ip'] = source_ip
 
-                        # [修复 1] 每次收到对讲消息都刷新 received_at，清除失联标志
                         ALL_DEVICES_STATUS[sender]["received_at"] = now_ms
                         ALL_DEVICES_STATUS[sender].pop("offline_alerted", None)
                         ALL_DEVICES_STATUS[sender]["last_chat"] = now_ms
@@ -120,7 +115,6 @@ def udp_listener():
         print(f"❌ UDP 监听绑定失败: {e}")
 
 
-# [P0] 失联检测：每 5 分钟扫描一次，超过 2 小时没上报的设备标记为失联
 def offline_detector():
     while True:
         try:
@@ -210,7 +204,6 @@ def handle_client(client_conn, client_addr):
     try:
         client_conn.settimeout(10.0)
 
-        # 按 Content-Length 读完整请求，不再 recv(16384) 一次截断
         raw = b""
         while b"\r\n\r\n" not in raw:
             chunk = client_conn.recv(65536)
@@ -265,7 +258,8 @@ def handle_client(client_conn, client_addr):
                     ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"] = data["received_at"]
                 elif "cloud_logs" in ALL_DEVICES_STATUS[dev_id]:
                     data["cloud_logs"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs"]
-                    data["cloud_logs_time"] = ALL_DEVICES_STATUS[dev_id]["cloud_logs_time"]
+                    # [修复 5] 用 .get 防止历史数据缺字段时 KeyError
+                    data["cloud_logs_time"] = ALL_DEVICES_STATUS[dev_id].get("cloud_logs_time", 0)
 
                 ALL_DEVICES_STATUS[dev_id] = data
 
@@ -313,7 +307,7 @@ def handle_client(client_conn, client_addr):
                 except Exception:
                     pass
 
-        # ===== POST /api/upload_log (日志上传) =====
+        # ===== POST /api/upload_log =====
         elif "POST /api/upload_log" in header_text:
             try:
                 req_line = header_text.split("\r\n")[0]
@@ -332,7 +326,6 @@ def handle_client(client_conn, client_addr):
                 except Exception:
                     log_data = body_part
 
-                # [修复 3] 文件名加微秒 %f，避免同一秒内多次上传覆盖
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 safe_id = "".join(c for c in device_id if c.isalnum() or c in "_-")
                 filename = f"{safe_id}_{ts}.log"
@@ -354,7 +347,7 @@ def handle_client(client_conn, client_addr):
                 except Exception:
                     pass
 
-        # ===== GET /api/logs (日志列表) =====
+        # ===== GET /api/logs =====
         elif "GET /api/logs" in header_text:
             try:
                 files = []
@@ -370,10 +363,16 @@ def handle_client(client_conn, client_addr):
                 resp = json.dumps(files)
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode())
-            except Exception:
-                pass
+            except Exception as e:
+                # [修复 4] 异常返回 500 并打日志
+                with print_lock:
+                    print(f"❌ GET /api/logs 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
-        # ===== GET /api/download_log (下载日志) =====
+        # ===== GET /api/download_log =====
         elif "GET /api/download_log" in header_text:
             try:
                 req_line = header_text.split("\r\n")[0]
@@ -392,10 +391,16 @@ def handle_client(client_conn, client_addr):
                     content = f.read()
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=\"{safe_name}\"\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(content)}\r\nConnection: close\r\n\r\n".encode() + content)
-            except Exception:
-                pass
+            except Exception as e:
+                # [修复 4] 异常返回 500 并打日志
+                with print_lock:
+                    print(f"❌ GET /api/download_log 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
-        # ===== GET /api/cloud_logs (实时查询设备云端日志，修复 6) =====
+        # ===== GET /api/cloud_logs =====
         elif "GET /api/cloud_logs" in header_text:
             try:
                 req_line = header_text.split("\r\n")[0]
@@ -412,8 +417,14 @@ def handle_client(client_conn, client_addr):
                     })
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode())
-            except Exception:
-                pass
+            except Exception as e:
+                # [修复 4] 异常返回 500 并打日志
+                with print_lock:
+                    print(f"❌ GET /api/cloud_logs 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
         # ===== POST /api/control =====
         elif "POST /api/control" in header_text:
@@ -426,8 +437,6 @@ def handle_client(client_conn, client_addr):
                 success = False
 
                 def smart_send(cmd_prefix):
-                    # [修复 2] 判断手机 IP 和 server2.py 是否同网段，同网段才单播
-                    # 原因：server2.py 在公网时，手机上报的 local_ip 是私网地址，单播不可达
                     sent_any = False
                     try:
                         local_ip = get_local_ip()
@@ -446,10 +455,8 @@ def handle_client(client_conn, client_addr):
                             if not ip or ip == '0.0.0.0':
                                 continue
                             if local_prefix and ip.startswith(local_prefix + "."):
-                                # 同网段，单播
                                 send_udp_broadcast(cmd_prefix, ip)
                             else:
-                                # 不同网段（公网部署场景），改发广播
                                 send_udp_broadcast(cmd_prefix, "255.255.255.255")
                             sent_any = True
                         if not sent_any:
@@ -514,13 +521,25 @@ def handle_client(client_conn, client_addr):
                 resp = json.dumps({"status": "ok" if success else "error", "msg": "指令执行失败" if not success else ""})
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
-            except Exception:
-                pass
+            except Exception as e:
+                # [修复 4] 异常返回 500 并打日志
+                with print_lock:
+                    print(f"❌ POST /api/control 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
         # ===== GET /api/history =====
         elif "GET /api/history" in header_text:
             try:
-                dev_id = header_text.split("device_id=")[1].split(" ")[0]
+                # [修复 2] 用 parse_qs 正规解析 device_id，兼容 URL 编码与特殊字符
+                req_line = header_text.split("\r\n")[0]
+                path_with_query = req_line.split(" ")[1] if len(req_line.split(" ")) > 1 else ""
+                query = urlparse(path_with_query).query
+                params = parse_qs(query)
+                dev_id = params.get("device_id", [""])[0]
+
                 conn = sqlite3.connect('track_history.db', timeout=10)
                 c = conn.cursor()
                 c.execute("SELECT lat, lng, timestamp FROM history WHERE device_id=? ORDER BY timestamp DESC LIMIT 50", (dev_id,))
@@ -529,8 +548,14 @@ def handle_client(client_conn, client_addr):
                 resp = json.dumps(rows)
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
-            except Exception:
-                pass
+            except Exception as e:
+                # [修复 4] 异常返回 500 并打日志
+                with print_lock:
+                    print(f"❌ GET /api/history 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
         # ===== GET /api/messages =====
         elif "GET /api/messages" in header_text:
@@ -543,8 +568,14 @@ def handle_client(client_conn, client_addr):
                 resp = json.dumps(rows)
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
-            except Exception:
-                pass
+            except Exception as e:
+                # [修复 4] 异常返回 500 并打日志
+                with print_lock:
+                    print(f"❌ GET /api/messages 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
         # ===== GET /api/chat_history =====
         elif "GET /api/chat_history" in header_text:
@@ -560,14 +591,26 @@ def handle_client(client_conn, client_addr):
                     resp = json.dumps(data_to_send)
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
-            except Exception:
-                pass
+            except Exception as e:
+                # [修复 4] 异常返回 500 并打日志
+                with print_lock:
+                    print(f"❌ GET /api/chat_history 异常: {e}")
+                try:
+                    client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
 
         # ===== GET / (Web 控制台) =====
         elif "GET /" in header_text:
+            # [修复 3] 精确匹配根路径，未匹配到 API 的 GET 请求返回 404，便于调试
+            req_line = header_text.split("\r\n")[0]
+            path = req_line.split(" ")[1] if len(req_line.split(" ")) > 1 else ""
+            if path != "/" and path != "/index.html" and not path.startswith("/?"):
+                client_conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                return
+
             chat_options = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" checked><span>所有人 (群发)</span></label>'
 
-            # [P0] 当前时间，用于计算每个设备的失联状态
             now_ms = int(datetime.datetime.now().timestamp() * 1000)
 
             html = """<!DOCTYPE html>
@@ -725,7 +768,6 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
                 is_locked = info.get('chat_locked', False)
                 chat_lock_str = "<span style='color:#cf222e;'>🔒 已锁</span>" if is_locked else "<span style='color:#2da44e;'>🔓 未锁</span>"
 
-                # [P0] 失联状态标记
                 last_seen = info.get('received_at', 0)
                 gap_min = (now_ms - last_seen) // 60000 if last_seen else 99999
                 if gap_min > 120:
@@ -739,8 +781,16 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
 
                 lat = info.get('location', {}).get('latitude')
                 lng = info.get('location', {}).get('longitude')
+                age_s = info.get('location', {}).get('age_s')
                 if lat is not None and lng is not None:
                     coord = f"<a href='https://uri.amap.com/marker?position={lng},{lat}' target='_blank'>{lat:.6f}, {lng:.6f}</a>"
+                    if age_s is not None and age_s >= 0:
+                        if age_s >= 1800:
+                            coord += f"<br><span style='color:#cf222e;font-size:12px;font-weight:bold;'>🚨 旧 {age_s // 60}min</span>"
+                        elif age_s >= 300:
+                            coord += f"<br><span style='color:#bf8700;font-size:12px;'>⚠️ 旧 {age_s // 60}min</span>"
+                        elif age_s >= 60:
+                            coord += f"<br><span style='color:#57606a;font-size:12px;'>旧 {age_s // 60}min</span>"
                 else:
                     coord = "<span style='color:var(--color-fg-muted);'>无定位</span>"
 
@@ -907,7 +957,8 @@ function toggleMap() {
 
 async function showTrack(devId) {
     if (!isMapVisible) toggleMap();
-    const res = await fetch(`/api/history?device_id=${devId}`);
+    // [修复 2] 对 device_id 做 URL 编码，避免特殊字符导致查询失败
+    const res = await fetch(`/api/history?device_id=${encodeURIComponent(devId)}`);
     const data = await res.json();
     if (data.length === 0) return showToast("暂无该设备的轨迹数据");
     setTimeout(() => {
@@ -927,7 +978,6 @@ async function showTrack(devId) {
     }, 250);
 }
 
-// [修复 6] 点击「📄 日志」实时查询云端日志，不再依赖页面加载时的快照
 async function showCloudLogs(devId) {
     try {
         const res = await fetch('/api/cloud_logs?device_id=' + encodeURIComponent(devId));
@@ -1031,8 +1081,9 @@ async function showServerMessages() {
         else:
             client_conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 
-    except Exception:
-        pass
+    except Exception as e:
+        with print_lock:
+            print(f"❌ handle_client 顶层异常: {e}")
     finally:
         try:
             client_conn.close()
@@ -1042,7 +1093,7 @@ async function showServerMessages() {
 
 def start_server():
     threading.Thread(target=udp_listener, daemon=True).start()
-    threading.Thread(target=offline_detector, daemon=True).start()  # [P0] 失联检测
+    threading.Thread(target=offline_detector, daemon=True).start()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
