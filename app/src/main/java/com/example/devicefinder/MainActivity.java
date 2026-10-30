@@ -311,6 +311,8 @@ public class MainActivity extends Activity {
     }
 
     private void hideLauncherIcon() {
-    LauncherIconUtils.setLauncherIconVisible(this, false);
+        // 👇 加这行日志，看看有没有打印
+        android.util.Log.d("HideIcon", "MainActivity 触发了隐藏图标调用");
+        LauncherIconUtils.setLauncherIconVisible(this, false);
     }
 }
