@@ -311,12 +311,6 @@ public class MainActivity extends Activity {
     }
 
     private void hideLauncherIcon() {
-        try {
-            PackageManager pm = getPackageManager();
-            ComponentName alias = new ComponentName(this, "com.example.devicefinder.VisibleAliasActivity");
-            if (pm.getComponentEnabledSetting(alias) != PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
-                pm.setComponentEnabledSetting(alias, PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP);
-            }
-        } catch (Exception ignored) {}
+    LauncherIconUtils.setLauncherIconVisible(this, false);
     }
 }
