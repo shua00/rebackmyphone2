@@ -181,16 +181,44 @@ def get_local_ip():
         return "127.0.0.1"
 
 
+def get_subnet_broadcast():
+    """根据本机 IP 计算子网定向广播地址"""
+    ip = get_local_ip()
+    if ip.startswith("127.") or ip == "0.0.0.0":
+        return "255.255.255.255"
+    parts = ip.split(".")
+    if len(parts) == 4:
+        return ".".join(parts[:3]) + ".255"
+    return "255.255.255.255"
+
+
 def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        with print_lock:
-            print(f"\n📡 [控制台] 发送至 {target_ip}: {command_str}")
 
-        for _ in range(3):
-            sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
-            time.sleep(0.05)
+        # ★ 如果是全局广播，改用子网广播
+        actual_target = target_ip
+        if target_ip == "255.255.255.255":
+            subnet_bcast = get_subnet_broadcast()
+            if subnet_bcast != "255.255.255.255":
+                actual_target = subnet_bcast
+
+        with print_lock:
+            print(f"\n📡 [控制台] 发送至 {actual_target}: {command_str}")
+
+        # 双发：子网广播 + 全局广播
+        targets = [actual_target]
+        if actual_target != "255.255.255.255":
+            targets.append("255.255.255.255")
+
+        for t in targets:
+            for _ in range(3):
+                try:
+                    sock.sendto(command_str.encode('utf-8'), (t, 8888))
+                    time.sleep(0.05)
+                except Exception:
+                    pass
 
         sock.close()
         return True
