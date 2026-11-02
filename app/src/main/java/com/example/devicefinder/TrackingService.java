@@ -1686,20 +1686,27 @@ public class TrackingService extends Service implements LocationListener {
                 final long FRESH_TIMEOUT_MS = 10000L;              // 单次上报最多等 10 秒拿新定位
 
                 if (loc == null || locAgeMs > FRESH_THRESHOLD_MS) {
-                    long t0 = System.currentTimeMillis();
-                    Location fresh = acquireFreshLocation(FRESH_TIMEOUT_MS);
-                    long costMs = System.currentTimeMillis() - t0;
-                    if (fresh != null) {
+                    // 旧坐标超过 15 分钟，且不是强制触发，直接跳过
+                    if (loc != null && locAgeMs > 15 * 60 * 1000L && !force) {
                         FileLogger.log(TrackingService.this, "REPORT",
-                                "🔎 主动刷新定位成功 (耗时 " + costMs + "ms, provider=" + fresh.getProvider()
-                                        + ", acc=" + (int) fresh.getAccuracy() + "m)");
-                        loc = fresh;
-                        lastLocation = fresh;
+                                "⏭ 跳过定位刷新（旧值 " + (locAgeMs / 60000) + " 分钟前），直接使用旧坐标");
                     } else {
-                        FileLogger.log(TrackingService.this, "REPORT",
-                                "⚠️ 主动刷新定位超时 (耗时 " + costMs + "ms, 旧值 "
-                                        + (locAgeMs == Long.MAX_VALUE ? "无" : (locAgeMs / 1000) + "s 前")
-                                        + ")，将使用旧值");
+                        // 尝试刷新
+                        long t0 = System.currentTimeMillis();
+                        Location fresh = acquireFreshLocation(FRESH_TIMEOUT_MS);
+                        long costMs = System.currentTimeMillis() - t0;
+                        if (fresh != null) {
+                            FileLogger.log(TrackingService.this, "REPORT",
+                                    "🔎 主动刷新定位成功 (耗时 " + costMs + "ms, provider=" + fresh.getProvider()
+                                            + ", acc=" + (int) fresh.getAccuracy() + "m)");
+                            loc = fresh;
+                            lastLocation = fresh;
+                        } else {
+                            FileLogger.log(TrackingService.this, "REPORT",
+                                    "⚠️ 主动刷新定位超时 (耗时 " + costMs + "ms, 旧值 "
+                                            + (locAgeMs == Long.MAX_VALUE ? "无" : (locAgeMs / 1000) + "s 前")
+                                            + ")，将使用旧值");
+                        }
                     }
                 }
 
@@ -1760,33 +1767,40 @@ public class TrackingService extends Service implements LocationListener {
                 conn.setRequestMethod("POST"); conn.setRequestProperty("Content-Type", "application/json"); conn.setConnectTimeout(15000); conn.setReadTimeout(15000); conn.setDoOutput(true);
 
                 long httpStart = System.currentTimeMillis();
-                OutputStream os = conn.getOutputStream(); os.write(json.toString().getBytes("UTF-8")); os.flush(); os.close();
-                int httpCode = conn.getResponseCode();
-                long httpCost = System.currentTimeMillis() - httpStart;
-
-                if (httpCode == 200) {
-                    BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream())); StringBuilder sb = new StringBuilder(); String line;
-                    while ((line = br.readLine()) != null) sb.append(line);
-                    br.close(); if (overrideUrl == null) parseResponse(new JSONObject(sb.toString())); success = true;
-
-                    // ★ 改动 D：上报成功日志带坐标/age/provider
-                    String locDesc;
-                    if (loc != null) {
-                        long ageS = Math.max(0, (System.currentTimeMillis() - loc.getTime()) / 1000);
-                        locDesc = String.format(java.util.Locale.US,
-                                "lat=%.5f lng=%.5f acc=%dm age=%ds src=%s",
-                                loc.getLatitude(), loc.getLongitude(),
-                                (int) loc.getAccuracy(), ageS,
-                                loc.getProvider() != null ? loc.getProvider() : "?");
+                try {
+                    OutputStream os = conn.getOutputStream();
+                    os.write(json.toString().getBytes("UTF-8"));
+                    os.flush();
+                    os.close();
+                    int httpCode = conn.getResponseCode();
+                    long httpCost = System.currentTimeMillis() - httpStart;
+                
+                    if (httpCode == 200) {
+                        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                        StringBuilder sb = new StringBuilder(); String line;
+                        while ((line = br.readLine()) != null) sb.append(line);
+                        br.close(); 
+                        if (overrideUrl == null) parseResponse(new JSONObject(sb.toString())); 
+                        success = true;
+                        
+                        // ... 下面保留你原来的 locDesc 打印日志 ...
+                        
                     } else {
-                        locDesc = "无定位";
+                        FileLogger.log(TrackingService.this, "REPORT", "⚠️ 上报返回非200: HTTP " + httpCode + " (耗时 " + httpCost + "ms) | " + activeUrl);
+                        // 👈 新增：非 200 直接存离线队列
+                        if (overrideUrl == null) queuePendingReport(json); 
                     }
-                    FileLogger.log(TrackingService.this, "REPORT",
-                            "✅ 上报成功 " + locDesc + " (耗时 " + httpCost + "ms)");
-                } else {
-                    FileLogger.log(TrackingService.this, "REPORT", "⚠️ 上报返回非200: HTTP " + httpCode + " (耗时 " + httpCost + "ms) | " + activeUrl);
-                }
-                conn.disconnect();
+                } catch (Exception e) {
+                    String errMsg = e.getMessage();
+                    if (errMsg != null && errMsg.contains("Unable to resolve host")) {
+                        FileLogger.log(TrackingService.this, "REPORT", "❌ DNS 解析失败: " + errMsg);
+                    } else {
+                        FileLogger.log(TrackingService.this, "REPORT", "❌ 上报异常: " + errMsg);
+                    }
+                    // 👈 新增：发生超时或断流等异常，直接存离线队列
+                    if (overrideUrl == null) queuePendingReport(json);
+                } finally {
+                    conn.disconnect();
             } catch (Exception e) {
                 String errMsg = e.getMessage();
                 if (errMsg != null && errMsg.contains("Unable to resolve host")) {
@@ -1908,6 +1922,7 @@ public class TrackingService extends Service implements LocationListener {
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(15000);
             conn.setDoOutput(true);
+            conn.setRequestProperty("Connection", "close"); // 👈 新增这一行，通用优化，防假死
             OutputStream os = conn.getOutputStream();
             os.write(json.toString().getBytes("UTF-8"));
             os.flush();
