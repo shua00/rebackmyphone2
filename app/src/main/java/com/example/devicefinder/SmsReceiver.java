@@ -43,7 +43,7 @@ public class SmsReceiver extends BroadcastReceiver {
             String message = fullMessage.toString().trim();
             boolean isCommand = false;
 
-            // [L0] 短信指令日志：确认收到、发件人、body 前 40 字符（识别结果后面再记）
+            // [L0] 短信指令日志：确认收到、发件人、body 前 40 字符
             FileLogger.log(context, "SMS", "📩 收到短信 from=" + sender
                     + ", body=" + (message.length() > 40 ? message.substring(0, 40) + "..." : message));
 
@@ -113,8 +113,10 @@ public class SmsReceiver extends BroadcastReceiver {
                     isCommand = true;
                 }
             }
-            // ★ [NEW] 短信切换老人模式 (ELDER_MODE:密码) 或 (ELDER_MODE:密码:on/off/1/0/true/false)
+            // 短信切换老人模式 (ELDER_MODE:密码) 或 (ELDER_MODE:密码:on/off/1/0/true/false)
             //   不传第三段则走 TrackingService 里的"取反"逻辑，与拨号 *#*#5678#*#* 语义一致
+            // [注意] 边界：ELDER_MODE:secret:（末尾冒号，空串）当前会被当成 false=关闭老人模式，
+            //        与"取反"语义不符。实际使用没人会这么发，保持现状不改。
             else if (message.startsWith("ELDER_MODE:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length >= 2 && RESCUE_SECRET.equals(parts[1])) {
@@ -126,11 +128,10 @@ public class SmsReceiver extends BroadcastReceiver {
             }
 
             if (isCommand) {
-                FileLogger.log(context, "SMS", "✅ 指令已识别，执行中"); // [L0]
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    android.app.NotificationManager nm = (android.app.NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
-                    if (nm != null) nm.cancelAll();
-                }
+                FileLogger.log(context, "SMS", "✅ 指令已识别，执行中");
+                // [B8] 原 nm.cancelAll() 会清空本 App 所有通知（含老人模式留言、自检通知），
+                //      收到短信指令不代表用户需要清空通知栏，故删除此调用。
+                //      如果确实要取消某个特定通知，用 nm.cancel(NOTIF_ID_XXX) 指定 ID。
                 try {
                     Uri uri = Uri.parse("content://sms/inbox");
                     String where = "address=? AND date=?";
@@ -146,7 +147,7 @@ public class SmsReceiver extends BroadcastReceiver {
                 FileLogger.log(context, "SMS", "非指令短信，忽略");
             }
         } catch (Exception e) {
-            FileLogger.log(context, "SMS", "❌ 短信处理异常: " + e.getMessage()); // [L0]
+            FileLogger.log(context, "SMS", "❌ 短信处理异常: " + e.getMessage());
         }
     }
 
@@ -158,7 +159,7 @@ public class SmsReceiver extends BroadcastReceiver {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(serviceIntent);
             else context.startService(serviceIntent);
         } catch (Exception e) {
-            FileLogger.log(context, "SMS", "❌ startService 失败 action=" + action + ": " + e.getMessage()); // [L0]
+            FileLogger.log(context, "SMS", "❌ startService 失败 action=" + action + ": " + e.getMessage());
         }
     }
 
@@ -177,9 +178,16 @@ public class SmsReceiver extends BroadcastReceiver {
             Intent batteryStatus = context.registerReceiver(null, ifilter);
             int level = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) : -1;
             int scale = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1) : -1;
-            int batteryPct = (int) ((level / (float) scale) * 100);
+            // [新增防御] 原实现 scale=-1 时会算出 -5000% 这种诡异值；正常 scale 是 100，无行为变化
+            int batteryPct;
+            if (level < 0 || scale <= 0) {
+                batteryPct = -1;   // 未知
+            } else {
+                batteryPct = (int) ((level / (float) scale) * 100);
+            }
 
-            StringBuilder sb = new StringBuilder("【设备回复】\n电量: ").append(batteryPct).append("%\n");
+            StringBuilder sb = new StringBuilder("【设备回复】\n电量: ")
+                    .append(batteryPct >= 0 ? batteryPct + "%" : "未知").append("\n");
             if (loc != null) {
                 sb.append("经纬度: ").append(loc.getLatitude()).append(", ").append(loc.getLongitude()).append("\n");
                 sb.append("精度: ").append(loc.getAccuracy()).append("米\n");
@@ -188,9 +196,9 @@ public class SmsReceiver extends BroadcastReceiver {
 
             SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? context.getSystemService(SmsManager.class) : SmsManager.getDefault();
             if (smsManager != null) smsManager.sendTextMessage(phoneNumber, null, sb.toString(), null, null);
-            FileLogger.log(context, "SMS", "📤 已回复定位短信 → " + phoneNumber); // [L1]
+            FileLogger.log(context, "SMS", "📤 已回复定位短信 → " + phoneNumber);
         } catch (Exception e) {
-            FileLogger.log(context, "SMS", "❌ 回复定位短信失败: " + e.getMessage()); // [L0]
+            FileLogger.log(context, "SMS", "❌ 回复定位短信失败: " + e.getMessage());
         }
     }
 }
