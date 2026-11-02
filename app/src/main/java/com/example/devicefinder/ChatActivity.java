@@ -27,7 +27,9 @@ public class ChatActivity extends Activity {
     private Button btnSend;
     private TextView tvNewMsg; // 【新增】新消息标签
 
-    public static boolean isForeground = false;
+    // [M1] volatile：TrackingService 的 UDP 接收线程读此字段决定是否 sendBroadcast，
+    //      若无 volatile，跨线程可见性无保证，可能出现"手机收到消息但聊天页不刷新"
+    public static volatile boolean isForeground = false;
     private boolean isAtBottom = true; // 【新增】是否在最底部
 
     private final Handler refreshHandler = new Handler(Looper.getMainLooper());
@@ -46,8 +48,17 @@ public class ChatActivity extends Activity {
 
         Intent svc = new Intent(this, TrackingService.class);
         svc.setAction("ACTION_RESET_NOTIFICATION");
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { startForegroundService(svc); }
-        else { startService(svc); }
+        // [C1] 防御：Activity 尚未完全可见时，个别 ROM 对 startForegroundService 限制更严，
+        //      抛异常会让 Activity 直接崩溃；改为记日志 + 继续，页面仍可打开查看历史
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svc);
+            } else {
+                startService(svc);
+            }
+        } catch (Exception e) {
+            android.util.Log.e("ChatActivity", "启动 TrackingService 失败: " + e.getMessage());
+        }
 
         chatText = findViewById(R.id.chatText);
         scrollView = findViewById(R.id.scrollView);
@@ -75,7 +86,7 @@ public class ChatActivity extends Activity {
         btnSend.setOnClickListener(v -> sendMessage());
 
         inputMsg.setOnEditorActionListener((v, actionId, event) -> {
-            if (actionId == EditorInfo.IME_ACTION_SEND || 
+            if (actionId == EditorInfo.IME_ACTION_SEND ||
                (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
                 sendMessage();
                 return true;
@@ -83,10 +94,15 @@ public class ChatActivity extends Activity {
             return false;
         });
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(msgReceiver, new IntentFilter("UPDATE_CHAT_UI"), Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(msgReceiver, new IntentFilter("UPDATE_CHAT_UI"));
+        // 已有的 API 判断保留，外层加 try/catch 兜底
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(msgReceiver, new IntentFilter("UPDATE_CHAT_UI"), Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(msgReceiver, new IntentFilter("UPDATE_CHAT_UI"));
+            }
+        } catch (Exception e) {
+            android.util.Log.e("ChatActivity", "注册 UPDATE_CHAT_UI 广播失败: " + e.getMessage());
         }
     }
 
@@ -94,7 +110,7 @@ public class ChatActivity extends Activity {
         String msg = inputMsg.getText().toString().trim();
         if (!msg.isEmpty()) {
             inputMsg.setText("");
-            
+
             // 【新增】拦截暗号清空指令
             if ("/clear".equalsIgnoreCase(msg)) {
                 SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
@@ -108,7 +124,7 @@ public class ChatActivity extends Activity {
             String history = sp.getString("chat_history", "");
             String timeStr = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(new java.util.Date());
             String newRecord = timeStr + " | [我] " + msg;
-            
+
             // 本地追加到最后面
             String updatedHistory = history.isEmpty() ? newRecord : history + "\n" + newRecord;
             sp.edit().putString("chat_history", updatedHistory).apply();
@@ -118,18 +134,37 @@ public class ChatActivity extends Activity {
             Intent intent = new Intent(this, TrackingService.class);
             intent.setAction("ACTION_SEND_UDP_CHAT");
             intent.putExtra("message", msg);
-            startService(intent);
+            // [C2] 原 startService 在服务被 kill 时会抛 IllegalStateException（Android 8+）；
+            //      先按原行为调用，失败再兜底用 startForegroundService 复活服务
+            try {
+                startService(intent);
+            } catch (IllegalStateException e) {
+                android.util.Log.w("ChatActivity", "startService 失败，尝试 startForegroundService: " + e.getMessage());
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(intent);
+                    } else {
+                        throw e; // 老版本不兜底，保持原状
+                    }
+                } catch (Exception e2) {
+                    android.util.Log.e("ChatActivity", "启动 UDP 发送彻底失败: " + e2.getMessage());
+                    Toast.makeText(this, "⚠️ 发送失败，请稍后重试", Toast.LENGTH_SHORT).show();
+                }
+            } catch (Exception e) {
+                android.util.Log.e("ChatActivity", "启动 UDP 发送异常: " + e.getMessage());
+                Toast.makeText(this, "⚠️ 发送失败，请稍后重试", Toast.LENGTH_SHORT).show();
+            }
         }
     }
 
     private void refreshHistory(boolean isNewMessage) {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String history = sp.getString("chat_history", "暂无消息...");
-        
+
         if (!chatText.getText().toString().equals(history)) {
             chatText.setText(history);
-            chatText.setTextIsSelectable(true); 
-            
+            chatText.setTextIsSelectable(true);
+
             if (!isNewMessage || isAtBottom) {
                 // 如果是自己发的，或者当前已经在底部，就自动滑到底部
                 scrollView.post(() -> scrollView.fullScroll(ScrollView.FOCUS_DOWN));
@@ -153,7 +188,7 @@ public class ChatActivity extends Activity {
         super.onPause();
         isForeground = false;
     }
-    
+
     @Override
     public void onBackPressed() {
         moveTaskToBack(true);
@@ -162,6 +197,11 @@ public class ChatActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        unregisterReceiver(msgReceiver);
+        // [B7] 防御：onCreate 中 registerReceiver 已包 try/catch，
+        //      若注册失败或 Activity 生命周期异常未注册就走到 onDestroy，
+        //      unregisterReceiver 会抛 IllegalArgumentException 崩溃
+        try {
+            unregisterReceiver(msgReceiver);
+        } catch (Exception ignored) {}
     }
 }
