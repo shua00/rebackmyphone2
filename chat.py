@@ -2,6 +2,7 @@ import socket
 import threading
 import datetime
 import json
+import time                                      # [F1] 子网广播重试间隔需要
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -102,6 +103,47 @@ def is_server2_running():
         return False
 
 
+# [F1] 计算本机子网定向广播地址（与 server2.py 对齐）
+def get_subnet_broadcast():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip.startswith("127.") or ip == "0.0.0.0":
+            return "255.255.255.255"
+        parts = ip.split(".")
+        if len(parts) == 4:
+            return ".".join(parts[:3]) + ".255"
+    except Exception:
+        pass
+    return "255.255.255.255"
+
+
+# [F1] 独立模式聊天广播：子网 + 全局双发，每目标 3 次
+def broadcast_chat_message(payload_str):
+    data = payload_str.encode('utf-8')
+    subnet = get_subnet_broadcast()
+    if subnet != "255.255.255.255":
+        targets = [subnet, "255.255.255.255"]
+    else:
+        targets = ["255.255.255.255"]
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        for t in targets:
+            for _ in range(3):
+                try:
+                    sock.sendto(data, (t, UDP_PORT))
+                    time.sleep(0.05)
+                except Exception:
+                    pass
+    finally:
+        sock.close()
+
+
 # UDP 监听线程：仅独立模式启动
 def udp_listener():
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -110,13 +152,19 @@ def udp_listener():
         udp_sock.bind(('0.0.0.0', UDP_PORT))
         print(f"🎧 UDP 监听已启动 (端口 {UDP_PORT})，等待对讲机消息...")
         while True:
-            data, addr = udp_sock.recvfrom(1024)
+            # [B2] 1024 → 4096，避免长消息被 UDP 层截断
+            data, addr = udp_sock.recvfrom(4096)
             msg = data.decode('utf-8', errors='ignore')
             if msg.startswith("FIND_ME_MSG:"):
-                parts = msg.split(":", 4)
+                # [B2] maxsplit 从 4 改为 3，content 含冒号时不再被丢弃
+                parts = msg.split(":", 3)
                 if len(parts) == 4 and parts[1] == RESCUE_SECRET:
                     sender = parts[2]
                     content = parts[3]
+                    # 保留原有过滤：浏览器网页自身发送的 Guest_xxx 消息已在 do_POST 中本地追加，
+                    # 这里过滤掉可以避免 loopback 广播造成重复。
+                    # 注意：这导致跨 PC 的两台 chat.py 之间无法看到对方浏览器发出的消息，
+                    # 跨 PC 场景建议使用 server2 面板。
                     if not sender.startswith("Guest_") and sender != "Web_Console":
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         with print_lock:
@@ -160,11 +208,23 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/send':
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length).decode('utf-8')
-            data = json.loads(body)
-            sender = data.get("sender", "Web_Guest")
-            content = data.get("content", "")
+            # [F2] json.loads 加保护，非法 body 不再抛 500
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8', errors='ignore')
+                data = json.loads(body) if body else {}
+            except Exception:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status":"bad_request"}')
+                return
+
+            sender = str(data.get("sender", "Web_Guest"))[:64]
+            content = str(data.get("content", ""))
+            # [F3] content 截断到 4000 字符，避免单条 UDP 包撑爆 MTU
+            if len(content) > 4000:
+                content = content[:4000]
 
             if content:
                 if PROXY_MODE:
@@ -182,7 +242,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     except Exception as e:
                         print(f"❌ 代理发送失败: {e}")
                 else:
-                    # 独立模式：本地记录 + UDP 广播
+                    # 独立模式：本地记录 + 子网/全局双发广播
                     ts = datetime.datetime.now().strftime("%H:%M:%S")
                     with print_lock:
                         print(f"\n💻 [网页] {sender} 说: {content}")
@@ -190,14 +250,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                         if len(CHAT_MESSAGES) > 100: CHAT_MESSAGES.pop(0)
 
                     payload = f"FIND_ME_MSG:{RESCUE_SECRET}:{sender}:{content}"
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                    try:
-                        sock.sendto(payload.encode('utf-8'), ('255.255.255.255', UDP_PORT))
-                    except Exception:
-                        pass
-                    finally:
-                        sock.close()
+                    # [F1] 子网 + 全局双发，每目标 3 次
+                    broadcast_chat_message(payload)
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -218,9 +272,12 @@ if __name__ == '__main__':
         print(f"   聊天记录从 {SERVER2_URL}/api/chat_history 拉取")
         print(f"   发送走 {SERVER2_URL}/api/control (action=chat_msg)")
         print("   不再 bind UDP 8888，与 server2.py 零冲突")
+        print("   提示：启动后 server2.py 若重启/掉线，本进程不会自动切换模式，需重启 chat.py")
     else:
         print("🔌 未检测到 server2.py → chat.py 进入【独立模式】")
-        print(f"   自行监听 UDP {UDP_PORT}，行为与原版一致")
+        print(f"   自行监听 UDP {UDP_PORT}，子网+全局双发广播")
+        subnet = get_subnet_broadcast()
+        print(f"   当前子网广播地址: {subnet if subnet != '255.255.255.255' else '(未检测到内网 IP，仅全局广播)'}")
         threading.Thread(target=udp_listener, daemon=True).start()
     print(f"👉 浏览器访问: http://127.0.0.1:{WEB_PORT}")
     print("=" * 50)
