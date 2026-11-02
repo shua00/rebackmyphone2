@@ -1957,28 +1957,56 @@ public class TrackingService extends Service implements LocationListener {
 
     private void uploadLog(final String tempUrl, final boolean clearAfter) {
         new Thread(() -> {
-            FileInputStream fis = null;
             try {
                 java.io.File dir = getExternalFilesDir(null);
                 if (dir == null) {
                     FileLogger.log(this, "UPLOAD_LOG", "❌ getExternalFilesDir 为 null");
                     return;
                 }
-                java.io.File logFile = new java.io.File(dir, "device_log.txt");
-                if (!logFile.exists() || logFile.length() == 0) {
-                    FileLogger.log(this, "UPLOAD_LOG", "⚠️ 日志文件不存在或为空");
+
+                // ★ 修复：查找当天的 device_log.txt 和所有历史的 device_log_*.txt
+                java.io.File[] logFiles = dir.listFiles((d, name) -> 
+                        name.equals("device_log.txt") || (name.startsWith("device_log_") && name.endsWith(".txt"))
+                );
+
+                if (logFiles == null || logFiles.length == 0) {
+                    FileLogger.log(this, "UPLOAD_LOG", "⚠️ 没有找到任何日志文件");
                     return;
                 }
 
+                // 排序：历史日志按日期排在前，最新的 device_log.txt 排最后
+                java.util.Arrays.sort(logFiles, (f1, f2) -> {
+                    String n1 = f1.getName();
+                    String n2 = f2.getName();
+                    if (n1.equals("device_log.txt")) return 1;
+                    if (n2.equals("device_log.txt")) return -1;
+                    return n1.compareTo(n2);
+                });
+
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
                 GZIPOutputStream gzos = new GZIPOutputStream(baos);
-                fis = new FileInputStream(logFile);
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = fis.read(buf)) > 0) gzos.write(buf, 0, n);
+                long totalOriginalSize = 0;
+
+                for (java.io.File file : logFiles) {
+                    if (file.length() == 0) continue;
+                    totalOriginalSize += file.length();
+
+                    // 写入分隔符，方便在 PC 端阅读时区分不同日期的日志
+                    String header = "\n\n========== File: " + file.getName() + " ==========\n";
+                    gzos.write(header.getBytes("UTF-8"));
+
+                    FileInputStream in = null;
+                    try {
+                        in = new FileInputStream(file);
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = in.read(buf)) > 0) gzos.write(buf, 0, n);
+                    } finally {
+                        if (in != null) try { in.close(); } catch (Exception ignored) {}
+                    }
+                }
                 gzos.close();
                 byte[] gzipData = baos.toByteArray();
-                long originalSize = logFile.length();
 
                 String baseUrl = (tempUrl != null && !tempUrl.isEmpty()) ? tempUrl : getCurrentServerUrl();
                 FileLogger.log(this, "UPLOAD_LOG", "📤 baseUrl=[" + baseUrl + "] (tempUrl=[" + tempUrl + "])");
@@ -1995,7 +2023,7 @@ public class TrackingService extends Service implements LocationListener {
                         + "token=" + java.net.URLEncoder.encode(AUTH_TOKEN, "UTF-8")
                         + "&device_id=" + java.net.URLEncoder.encode(deviceId, "UTF-8");
 
-                FileLogger.log(this, "UPLOAD_LOG", "📤 开始上传日志: " + (originalSize / 1024) + "KB → 压缩后 "
+                FileLogger.log(this, "UPLOAD_LOG", "📤 开始上传 " + logFiles.length + " 个日志文件: " + (totalOriginalSize / 1024) + "KB → 压缩后 "
                         + (gzipData.length / 1024) + "KB → " + uploadUrl);
 
                 URL url = new URL(fullUrl);
@@ -2027,8 +2055,12 @@ public class TrackingService extends Service implements LocationListener {
                     FileLogger.log(this, "UPLOAD_LOG", "✅ 上传成功 (耗时 " + cost + "ms): " + resp);
 
                     if (clearAfter) {
-                        boolean deleted = logFile.delete();
-                        FileLogger.log(this, "UPLOAD_LOG", deleted ? "🧹 本地日志已清空" : "⚠️ 本地日志删除失败");
+                        // ★ 修复：清空时删除所有日志文件
+                        int deleted = 0;
+                        for (java.io.File file : logFiles) {
+                            if (file.delete()) deleted++;
+                        }
+                        FileLogger.log(this, "UPLOAD_LOG", "🧹 本地日志已清空 (" + deleted + "/" + logFiles.length + ")");
                     }
                 } else {
                     FileLogger.log(this, "UPLOAD_LOG", "⚠️ 上传失败: HTTP " + code + " (耗时 " + cost + "ms)");
@@ -2036,44 +2068,8 @@ public class TrackingService extends Service implements LocationListener {
                 conn.disconnect();
             } catch (Exception e) {
                 FileLogger.log(this, "UPLOAD_LOG", "❌ 上传异常: " + e.getMessage());
-            } finally {
-                if (fis != null) { try { fis.close(); } catch (Exception ignored) {} }
             }
         }).start();
-    }
-
-    private String getNetworkTypeDesc(NetworkInfo activeNet) {
-        String typeName = activeNet.getTypeName();
-        if (ConnectivityManager.TYPE_MOBILE != activeNet.getType()) return typeName;
-        try {
-            TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
-            if (tm == null) return typeName;
-            int subType = tm.getNetworkType();
-            String sub;
-            switch (subType) {
-                case TelephonyManager.NETWORK_TYPE_NR: sub = "5G"; break;
-                case TelephonyManager.NETWORK_TYPE_LTE: sub = "4G"; break;
-                case TelephonyManager.NETWORK_TYPE_HSPAP:
-                case TelephonyManager.NETWORK_TYPE_HSDPA:
-                case TelephonyManager.NETWORK_TYPE_HSUPA:
-                case TelephonyManager.NETWORK_TYPE_UMTS:
-                case TelephonyManager.NETWORK_TYPE_EVDO_0:
-                case TelephonyManager.NETWORK_TYPE_EVDO_A:
-                case TelephonyManager.NETWORK_TYPE_EVDO_B:
-                case TelephonyManager.NETWORK_TYPE_EHRPD:
-                case TelephonyManager.NETWORK_TYPE_HSPA:
-                    sub = "3G"; break;
-                case TelephonyManager.NETWORK_TYPE_EDGE:
-                case TelephonyManager.NETWORK_TYPE_GPRS:
-                case TelephonyManager.NETWORK_TYPE_1xRTT:
-                case TelephonyManager.NETWORK_TYPE_IDEN:
-                    sub = "2G"; break;
-                default: sub = String.valueOf(subType); break;
-            }
-            return "MOBILE(" + sub + ")";
-        } catch (Exception e) {
-            return typeName;
-        }
     }
 
     private void fetchRemoteConfig() {
