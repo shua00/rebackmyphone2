@@ -1740,7 +1740,7 @@ public class TrackingService extends Service implements LocationListener {
             for (Network n : cm.getAllNetworks()) {
                 NetworkCapabilities nc = cm.getNetworkCapabilities(n);
                 if (nc != null && nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    socket.setNetwork(n);
+                    n.bindSocket(socket);
                     return;
                 }
             }
