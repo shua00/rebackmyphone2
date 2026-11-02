@@ -4,10 +4,21 @@
 DeviceFinder 局域网救援/调试终端
 支持环境：Windows / Linux(Armbian) / Termux(Android)
 
-【本次修复】
-A. 扫描局域网时，_probe_ips 从 FIND_ME_REPORT 改成 FIND_ME_REPORT_TEMP，
-   指向 PC 的 9090 内置接收端。之前 FIND_ME_REPORT 让手机上报到公网服务器，
-   PC 的 9090 收不到，导致扫描永远 0 台。
+【本次修复 R1~R14】
+R1  udp_listener split(":",3)      — 聊天内容含冒号不再被丢弃
+R2  _handle_report 用 update()      — 上报不再覆盖 last_chat / last_log
+R3  ThreadingHTTPServer             — 并发上报不再排队超时（扫描命中率提升的关键）
+R4  send_udp 子网广播也发 3 次      — 与 server2.py 行为一致
+R5  send_udp 单播也发 2 次          — 拉日志丢包率下降
+R6  _handle_report 不再下发 config  — 不覆盖手机端自定义配置
+R7  get_local_ip 多目标 + fib_trie  — 无外网 / Termux 不再返回 127.0.0.1
+R8  主菜单"强制上报"指向 PC 接收端   — 不再白等 15 秒超时
+R9  计数器读写统一加锁              — 消除隐式竞态
+R10 _probe_ips 探测节奏             — ARP 探测与全网段探测间隔 ≥3s，避免节流
+R11 _probe_ips 去掉无效 settimeout  — UDP sendto 是立即返回的
+R12 LogReceiver 增加 do_GET         — 浏览器访问 9090 可直接健康检查
+R13 pull_logs_multi 批量发送        — 从串行 30s/台改为并发+统一等待
+R14 choose_target 空列表明确提示    — 不再静默 fallback 到广播
 
 【配套手机端修改】
 AndroidManifest.xml 需加：
@@ -15,9 +26,8 @@ AndroidManifest.xml 需加：
 TrackingService.java 的 playAlarm() 需配合修改，才能让静音/震动模式下警报响。
 
 【Termux 加速提示】
-如果扫描局域网很慢（15 秒+），可以执行：
     pkg install iproute2 net-tools
-这样 ip neigh 和 arp -a 都能用，扫描从 15 秒降到 3 秒。
+扫描从 15s 降到 3s。
 
 【重要提醒】
 测试扫描/拉日志/悬浮窗时，手机必须保持亮屏（锁屏时 HTTP 上报和悬浮窗被系统限制）。
@@ -33,9 +43,21 @@ import re
 import subprocess
 import threading
 import concurrent.futures
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
+
+# [R3] ThreadingHTTPServer 兼容导入（Python 3.7+ 内置，老版本降级）
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    import socketserver
+    from http.server import HTTPServer
+
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
 
 # ===== 配置区 =====
 RESCUE_SECRET = "your_private_secret_key"
@@ -87,19 +109,45 @@ def is_valid_url(url):
     return True
 
 
+# [R9] 统一计数器读取入口，写入/读取都在 _state_lock 内
+def _get_counter(wait_type):
+    with _state_lock:
+        return RECEIVED_REPORTS if wait_type == "report" else RECEIVED_LOGS
+
+
+# [R7] 多级降级获取本机内网 IP；无外网 / Termux / 无 ip 命令时也能拿到正确 IP
 def get_local_ip():
-    """4 级降级获取本机内网 IP"""
+    # 1) 多目标 connect：UDP connect 不需要真实连通，仅用于拿到出口网卡 IP
+    for target in [("8.8.8.8", 80), ("114.114.114.114", 53),
+                   ("1.1.1.1", 443), ("223.5.5.5", 53)]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1)
+            s.connect(target)
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127.") and ip != "0.0.0.0":
+                return ip
+        except Exception:
+            pass
+
+    # 2) /proc/net/fib_trie：Linux / Termux 通用，无需 root 或 ip 命令
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(1)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        if ip and not ip.startswith("127.") and ip != "0.0.0.0":
-            return ip
+        with open("/proc/net/fib_trie", "r") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if "LOCAL" in line and i > 0:
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+)", lines[i - 1])
+                if m:
+                    ip = m.group(1)
+                    if (is_valid_ip(ip) and not ip.startswith("127.")
+                            and not ip.endswith(".0")
+                            and not ip.startswith("169.254.")):
+                        return ip
     except Exception:
         pass
 
+    # 3) ip -4 addr
     try:
         result = subprocess.run(["ip", "-4", "addr"], capture_output=True,
                                 text=True, timeout=3, errors='ignore')
@@ -109,11 +157,12 @@ def get_local_ip():
                 parts = line.split()
                 if len(parts) >= 2:
                     ip = parts[1].split("/")[0]
-                    if is_valid_ip(ip):
+                    if is_valid_ip(ip) and not ip.startswith("169.254."):
                         return ip
     except Exception:
         pass
 
+    # 4) ifconfig
     try:
         result = subprocess.run(["ifconfig"], capture_output=True,
                                 text=True, timeout=3, errors='ignore')
@@ -123,18 +172,21 @@ def get_local_ip():
                 for i, p in enumerate(parts):
                     if p == "inet" and i + 1 < len(parts):
                         ip = parts[i + 1]
-                        if is_valid_ip(ip) and not ip.startswith("127."):
+                        if (is_valid_ip(ip) and not ip.startswith("127.")
+                                and not ip.startswith("169.254.")):
                             return ip
     except Exception:
         pass
 
+    # 5) Windows ipconfig
     if os.name == "nt":
         try:
             result = subprocess.run(["ipconfig"], capture_output=True,
                                     text=True, timeout=3, errors='ignore')
             for match in re.finditer(r"IPv4.*?[:：]\s*(\d+\.\d+\.\d+\.\d+)", result.stdout):
                 ip = match.group(1)
-                if is_valid_ip(ip) and not ip.startswith("127."):
+                if (is_valid_ip(ip) and not ip.startswith("127.")
+                        and not ip.startswith("169.254.")):
                     return ip
         except Exception:
             pass
@@ -150,50 +202,56 @@ def get_network_prefix(ip):
 
 
 # ===== UDP 发送 =====
+# [R4][R5] 子网广播发 3 次，单播发 2 次；UDP 丢包率不低，重试是必要成本
 def send_udp(command_str, target_ip="255.255.255.255", quiet=False):
     if not quiet:
         print(f"\n📡 发送指令至 {target_ip}: {command_str}")
+
+    is_broadcast = (target_ip == "255.255.255.255") or target_ip.endswith(".255")
+    send_times = 3 if is_broadcast else 2
+    gap = 0.5 if is_broadcast else 0.15
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    send_times = 3 if target_ip == "255.255.255.255" else 1
-    for i in range(send_times):
-        try:
-            sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
-        except Exception as e:
+    try:
+        for i in range(send_times):
+            try:
+                sock.sendto(command_str.encode('utf-8'), (target_ip, 8888))
+            except Exception as e:
+                if not quiet:
+                    print(f"   [{i+1}/{send_times}] 发送失败: {e}")
+                break
             if not quiet:
-                print(f"   [{i+1}/{send_times}] 发送失败: {e}")
-            break
-        if send_times > 1 and not quiet:
-            print(f"   [{i+1}/{send_times}] 发送中...")
-            time.sleep(0.5)
-        elif send_times == 1 and not quiet:
-            print(f"   [1/1] 发送成功 (单播模式)")
-    sock.close()
+                if send_times > 1:
+                    print(f"   [{i+1}/{send_times}] 发送中...")
+                else:
+                    print(f"   [1/1] 发送成功 (单播模式)")
+            if i < send_times - 1:
+                time.sleep(gap)
+    finally:
+        sock.close()
+
     if not quiet:
         print("✅ 发送完毕。")
 
 
+# [R9] 每次循环重新取计数，读操作走锁
 def wait_for_response(before, wait_sec, wait_type):
     start = time.time()
     while time.time() - start < wait_sec:
         time.sleep(0.1)
-        if wait_type == "report" and RECEIVED_REPORTS > before:
-            return time.time() - start
-        if wait_type == "log" and RECEIVED_LOGS > before:
+        if _get_counter(wait_type) > before:
             return time.time() - start
     return None
 
 
 def send_udp_and_wait(command_str, target_ip="255.255.255.255", wait_sec=15, wait_type="report"):
     """先广播，5 秒无响应自动对已知设备单播"""
-    def counter():
-        return RECEIVED_REPORTS if wait_type == "report" else RECEIVED_LOGS
-
     if wait_type is None:
         send_udp(command_str, target_ip)
         return
 
-    before = counter()
+    before = _get_counter(wait_type)
     send_udp(command_str, target_ip)
 
     if target_ip != "255.255.255.255":
@@ -222,7 +280,7 @@ def send_udp_and_wait(command_str, target_ip="255.255.255.255", wait_sec=15, wai
     print(f"⚠️ 广播 5 秒无响应，尝试对 {len(known)} 台已知设备单播...")
     for dev_id, ip in known:
         print(f"\n📡 单播到 {dev_id} ({ip})...")
-        before = counter()
+        before = _get_counter(wait_type)
         send_udp(command_str, ip, quiet=True)
         elapsed = wait_for_response(before, 3, wait_type)
         if elapsed is not None:
@@ -234,8 +292,8 @@ def send_udp_and_wait(command_str, target_ip="255.255.255.255", wait_sec=15, wai
     print(f"⚠️ 所有已知设备均未响应")
 
 
+# [R14] 空列表时明确提示，不再静默 fallback 到广播
 def choose_target(prompt="🎯 选择目标 (编号/IP/回车广播): "):
-    """大部分指令用：显示已知设备，选编号/IP/回车广播"""
     with _state_lock:
         devices = dict(DISCOVERED_DEVICES)
 
@@ -253,12 +311,19 @@ def choose_target(prompt="🎯 选择目标 (编号/IP/回车广播): "):
             print(f"  {i}. {dev_id:<26} ({ip:<15}) {batt:<5} {ago_str}")
     else:
         dev_list = []
+        print("\n📭 暂无已知设备（需先让手机上报一次，或先扫描局域网）")
+        print("   回车 → 广播；直接输入 IP → 单播")
 
     choice = input(prompt).strip()
     if not choice:
         return "255.255.255.255"
     if is_valid_ip(choice):
         return choice
+
+    if not dev_list:
+        print(f"⚠️ 暂无已知设备，输入 '{choice}' 无法解析为编号，回退广播")
+        return "255.255.255.255"
+
     try:
         idx = int(choice)
         if 1 <= idx <= len(dev_list):
@@ -271,6 +336,30 @@ def choose_target(prompt="🎯 选择目标 (编号/IP/回车广播): "):
 
 # ===== HTTP 接收端 =====
 class LogReceiver(BaseHTTPRequestHandler):
+
+    # [R12] 健康检查：浏览器访问 9090 直接可看到状态，不再 501
+    def do_GET(self):
+        try:
+            with _state_lock:
+                n = len(DISCOVERED_DEVICES)
+                r = RECEIVED_REPORTS
+                l = RECEIVED_LOGS
+            body = (
+                "DeviceFinder receiver OK\n"
+                f"devices={n}\n"
+                f"reports={r}\n"
+                f"logs={l}\n"
+                f"log_dir={os.path.abspath(LOG_DIR)}\n"
+            )
+            data = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception:
+            pass
+
     def do_POST(self):
         try:
             if self.path.startswith("/api/upload_log"):
@@ -308,7 +397,7 @@ class LogReceiver(BaseHTTPRequestHandler):
 
         device_id = query.get("device_id", ["unknown"])[0]
         safe_id = "".join(c for c in device_id if c.isalnum() or c in "_-")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{safe_id}_{ts}.log"
         filepath = os.path.join(LOG_DIR, filename)
 
@@ -318,9 +407,9 @@ class LogReceiver(BaseHTTPRequestHandler):
 
         with _state_lock:
             RECEIVED_LOGS += 1
-            DISCOVERED_DEVICES.setdefault(device_id, {})
-            DISCOVERED_DEVICES[device_id]["source_ip"] = self.client_address[0]
-            DISCOVERED_DEVICES[device_id]["last_log"] = time.time()
+            info = DISCOVERED_DEVICES.setdefault(device_id, {})
+            info["source_ip"] = self.client_address[0]
+            info["last_log"] = time.time()
 
         print(f"\n📥 收到日志: {filename} ({len(data)} bytes) → {os.path.abspath(filepath)}")
         self.send_response(200)
@@ -328,6 +417,8 @@ class LogReceiver(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"status":"ok"}')
 
+    # [R2] 用 update 而非整体替换，保留 last_chat / last_log
+    # [R6] 不再下发 config，避免覆盖手机端自定义设置
     def _handle_report(self):
         global RECEIVED_REPORTS
         length = int(self.headers.get("Content-Length", 0))
@@ -352,7 +443,10 @@ class LogReceiver(BaseHTTPRequestHandler):
             nearby = data.get("nearby_wifi", [])
 
             if lat is not None and lng is not None:
-                loc_str = f"{lat},{lng} (精度 {acc:.0f}m, {provider})"
+                try:
+                    loc_str = f"{lat},{lng} (精度 {float(acc):.0f}m, {provider})"
+                except Exception:
+                    loc_str = f"{lat},{lng} ({provider})"
             else:
                 loc_str = "无定位"
             chg_str = "充电中" if is_chg else "未充电"
@@ -362,17 +456,18 @@ class LogReceiver(BaseHTTPRequestHandler):
 
             with _state_lock:
                 RECEIVED_REPORTS += 1
-                DISCOVERED_DEVICES[dev_id] = {
+                info = DISCOVERED_DEVICES.setdefault(dev_id, {})
+                info.update({
                     "ip": local_ip if local_ip and local_ip != "0.0.0.0" else self.client_address[0],
                     "source_ip": self.client_address[0],
                     "last_seen": time.time(),
                     "battery": batt,
                     "wifi": wifi,
-                }
+                })
         except Exception as e:
             print(f"⚠️ 解析上报失败: {e}")
 
-        resp = b'{"status":"success","config":{"report_interval_seconds":1800,"accuracy_mode":"coarse"}}'
+        resp = b'{"status":"success"}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(resp)))
@@ -383,16 +478,18 @@ class LogReceiver(BaseHTTPRequestHandler):
         pass
 
 
+# [R3] 关键修复：并发接收上报，多台手机同时响应不再排队超时
 def start_log_receiver():
     global RECEIVER_OK
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        server = HTTPServer(("0.0.0.0", LOG_PORT), LogReceiver)
+        server = ThreadingHTTPServer(("0.0.0.0", LOG_PORT), LogReceiver)
         RECEIVER_OK = True
         local_ip = get_local_ip()
         print(f"📥 内置接收端已启动: http://{local_ip}:{LOG_PORT}/")
         print(f"   /api/report      → 实时接收上报")
         print(f"   /api/upload_log  → 接收日志，存到 {os.path.abspath(LOG_DIR)}")
+        print(f"   GET /            → 健康检查")
         server.serve_forever()
     except OSError as e:
         if "Address already in use" in str(e) or e.errno in (98, 10048):
@@ -412,18 +509,19 @@ def udp_listener():
         print("🎧 UDP 监听已启动，等待手机对讲消息...")
         while True:
             try:
-                data, addr = sock.recvfrom(1024)
+                data, addr = sock.recvfrom(4096)
                 msg = data.decode('utf-8', errors='ignore')
                 if msg.startswith("FIND_ME_MSG:"):
-                    parts = msg.split(":", 4)
+                    # [R1] maxsplit=3，content 含冒号时不再被丢弃
+                    parts = msg.split(":", 3)
                     if len(parts) == 4 and parts[1] == RESCUE_SECRET:
                         sender = parts[2]
                         content = parts[3]
                         print(f"\n🗣️ [{sender}] {content}  (来自 {addr[0]})")
                         with _state_lock:
-                            DISCOVERED_DEVICES.setdefault(sender, {})
-                            DISCOVERED_DEVICES[sender]["source_ip"] = addr[0]
-                            DISCOVERED_DEVICES[sender]["last_chat"] = time.time()
+                            info = DISCOVERED_DEVICES.setdefault(sender, {})
+                            info["source_ip"] = addr[0]
+                            info["last_chat"] = time.time()
             except Exception as e:
                 print(f"⚠️ UDP 监听异常: {e}")
                 time.sleep(1)
@@ -480,7 +578,8 @@ def status_line():
 
     if is_termux():
         return f"💡 {dev_count}台 | 收{'✅' if RECEIVER_OK else '❌'} | UDP{'✅' if UDP_OK else '❌'} | {ago_str}"
-    return f"💡 设备 {dev_count} 台  |  接收端 {LOG_PORT} {'✅' if RECEIVER_OK else '❌'}  |  UDP {'✅' if UDP_OK else '❌'}  |  上次上报 {ago_str}"
+    return (f"💡 设备 {dev_count} 台  |  接收端 {LOG_PORT} {'✅' if RECEIVER_OK else '❌'}"
+            f"  |  UDP {'✅' if UDP_OK else '❌'}  |  上次上报 {ago_str}")
 
 
 # ===== ARP 查询 3 级降级 =====
@@ -536,18 +635,15 @@ def get_arp_ips(prefix):
 
 
 # ===== 局域网扫描 =====
+# [R11] 去掉无效的 settimeout（UDP sendto 是立即返回的）
+# [R10] ARP 探测与全网段探测之间保持 ≥3s 间隔，避免手机端 2 秒节流丢包
 def _probe_ips(ips, local_ip):
-    """
-    [本次修复 A] 用 FIND_ME_REPORT_TEMP 指向 PC 内置接收端。
-    原代码发 FIND_ME_REPORT 让手机上报到公网服务器，PC 的 9090 收不到，扫描永远 0 台。
-    """
     temp_url = f"http://{local_ip}:{LOG_PORT}/api/report"
     cmd = f"FIND_ME_REPORT_TEMP:{RESCUE_SECRET}:{temp_url}"
 
     def probe(ip):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0.5)
             s.sendto(cmd.encode(), (ip, 8888))
             s.close()
         except Exception:
@@ -575,6 +671,7 @@ def scan_lan_devices():
     if arp_ips:
         print(f"📋 ARP 表里找到 {len(arp_ips)} 个 IP，先探测...")
         _probe_ips(arp_ips, local_ip)
+        # [R10] 明确间隔，避免手机端 2 秒节流丢弃第二次探测
         time.sleep(3)
     else:
         print(f"⚠️ ARP 表为空")
@@ -622,10 +719,8 @@ def periodic_probe(target_ip):
     s = input("总探测时长秒数（回车默认 600）: ").strip()
     duration = int(s) if s.isdigit() and int(s) > 0 else 600
 
-    global RECEIVED_REPORTS
     local_ip = get_local_ip()
     temp_url = f"http://{local_ip}:{LOG_PORT}/api/report"
-    # [本次修复] 用 FIND_ME_REPORT_TEMP 才能收到 PC 的上报
     cmd = f"FIND_ME_REPORT_TEMP:{RESCUE_SECRET}:{temp_url}"
 
     print(f"\n🔄 每 {interval} 秒发一次 FIND_ME_REPORT_TEMP（指向 PC:9090），持续 {duration} 秒")
@@ -639,7 +734,8 @@ def periodic_probe(target_ip):
     try:
         while time.time() < end:
             probe_count += 1
-            before = RECEIVED_REPORTS
+            # [R9] 走锁读计数器
+            before = _get_counter("report")
             print(f"\n--- 第 {probe_count} 次探测 ---")
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -656,7 +752,7 @@ def periodic_probe(target_ip):
             got = False
             while time.time() < wait_until:
                 time.sleep(0.2)
-                if RECEIVED_REPORTS > before:
+                if _get_counter("report") > before:
                     got = True
                     break
 
@@ -733,30 +829,41 @@ def select_targets():
         return []
 
 
+# [R13] 改为"先全发 → 统一等"，从串行 30s/台 → 并发，10 台设备从 300s 降到 ~10s
 def pull_logs_multi(target_ips, temp_url, clear_after):
     if not target_ips:
         print("⚠️ 未选择任何目标")
         return
 
-    global RECEIVED_LOGS
-    print(f"\n📡 拉取 {len(target_ips)} 台设备的日志（逐台执行）")
-    print(f"   ⚠️ 手机必须亮屏，否则 HTTP 上传被限制")
     cmd = f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}:{temp_url}" + (":clear" if clear_after else "")
+    send_time = time.time()
 
-    success = 0
-    for i, ip in enumerate(target_ips, 1):
-        print(f"\n--- [{i}/{len(target_ips)}] {ip} ---")
-        before = RECEIVED_LOGS
+    print(f"\n📡 向 {len(target_ips)} 台设备发送拉日志指令")
+    print(f"   ⚠️ 手机必须亮屏，否则 HTTP 上传被限制")
+    for ip in target_ips:
         send_udp(cmd, ip, quiet=True)
-        print(f"   已发送，等待上传...")
-        elapsed = wait_for_response(before, 30, "log")
-        if elapsed is not None:
-            print(f"   ✅ 收到日志（{elapsed:.1f}s）")
-            success += 1
-        else:
-            print(f"   ⚠️ 超时未收到")
+        time.sleep(0.1)
 
-    print(f"\n📊 完成: {success}/{len(target_ips)} 台成功")
+    print(f"⏳ 等待手机上传（最多 60 秒）...")
+    deadline = time.time() + 60
+    received_ips = set()
+
+    while time.time() < deadline:
+        time.sleep(0.5)
+        with _state_lock:
+            for dev_id, info in DISCOVERED_DEVICES.items():
+                src_ip = info.get("source_ip")
+                if src_ip in target_ips and src_ip not in received_ips:
+                    if info.get("last_log", 0) >= send_time:
+                        received_ips.add(src_ip)
+                        print(f"   ✅ {src_ip} 已上传 ({dev_id})")
+        if len(received_ips) >= len(target_ips):
+            break
+
+    print(f"\n📊 完成: {len(received_ips)}/{len(target_ips)} 台成功")
+    missing = [ip for ip in target_ips if ip not in received_ips]
+    if missing:
+        print(f"⚠️ 未响应: {', '.join(missing)}")
 
 
 # ===== 二级菜单 =====
@@ -900,7 +1007,7 @@ def print_main_menu(local_ip):
     print(f"   {env_name()}  |  {local_ip}")
     print("=" * 50)
     print("\n📱 高频操作")
-    print("  1. 📍 强制上报")
+    print("  1. 📍 强制上报（指向 PC 接收端，实时查看）")   # [R8] 语义变更提示
     print("  2. 📍 定位+上报")
     print("  3. 📋 拉取日志（内置）")
     print("  4. 📋 查看设备")
@@ -951,9 +1058,12 @@ def main():
             continue
 
         if choice == '1':
-            send_udp_and_wait(f"FIND_ME_REPORT:{RESCUE_SECRET}", choose_target(), 15, "report")
+            # [R8] 改为 FIND_ME_REPORT_TEMP 指向 PC 接收端，不再白等 15 秒超时
+            target = choose_target()
+            temp_url = f"http://{local_ip}:{LOG_PORT}/api/report"
+            print(f"📤 强制上报（指向 PC 接收端 {temp_url}）")
+            send_udp_and_wait(f"FIND_ME_REPORT_TEMP:{RESCUE_SECRET}:{temp_url}", target, 15, "report")
         elif choice == '2':
-            # [本次修复] 定位+上报：先让手机重新定位，再拉取最新位置到 PC
             target = choose_target()
             temp_url = f"http://{local_ip}:{LOG_PORT}/api/report"
             send_udp(f"FIND_ME_LOCATE_ONCE:{RESCUE_SECRET}", target, quiet=True)
