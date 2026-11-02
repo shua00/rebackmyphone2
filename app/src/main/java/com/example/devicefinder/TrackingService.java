@@ -65,6 +65,7 @@ import java.net.InetSocketAddress;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.GZIPOutputStream;
 
 public class TrackingService extends Service implements LocationListener {
@@ -75,7 +76,7 @@ public class TrackingService extends Service implements LocationListener {
     private AlarmManager alarmManager;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
-    private WifiManager.MulticastLock multicastLock;   // ★ 修复3：UDP 广播保活
+    private WifiManager.MulticastLock multicastLock;
     private PendingIntent alarmPendingIntent;
 
     private SensorManager sensorManager;
@@ -83,16 +84,19 @@ public class TrackingService extends Service implements LocationListener {
 
     private long reportIntervalMs = 1800 * 1000L;
     private String accuracyMode = "coarse";
-    private Location lastLocation = null;
-    private int reportCount = 0;
+    // [M1] volatile：executor 线程写、主线程/其他线程读
+    private volatile Location lastLocation = null;
+    // [B3] AtomicInteger：消除 executor 线程 ++ 与主线程覆盖的竞态
+    private final AtomicInteger reportCount = new AtomicInteger(0);
 
     private boolean enableWifiLock = true;
     private boolean enableMotionTrigger = true;
 
     private static long lastReportTime = 0;
     private static final Object reportLock = new Object();
-    private static int consecutiveFailures = 0;
-    private static boolean isListeningForRescue = false;
+    // [M1] volatile
+    private static volatile int consecutiveFailures = 0;
+    private static volatile boolean isListeningForRescue = false;
 
     private static long lastNotificationClickTime = 0;
     private static int notificationClickCount = 0;
@@ -119,7 +123,25 @@ public class TrackingService extends Service implements LocationListener {
 
     private volatile boolean serviceDestroyed = false;
     private volatile boolean rescueRetryScheduled = false;
-    private DatagramSocket rescueSocketRef = null;
+    // [M1] volatile
+    private volatile DatagramSocket rescueSocketRef = null;
+    // [B5] UDP 监听重入保护锁
+    private final Object rescueLock = new Object();
+
+    // ==================== [HTTP下行] 字段区 ====================
+    private static final String PREF_EXECUTED_CMD_IDS = "executed_cmd_ids";
+    private static final int EXECUTED_CMD_IDS_MAX = 100;
+    private static final int FAST_POLL_BATTERY_THRESHOLD = 20;
+    private static final int FAST_POLL_MAX_CONSECUTIVE = 5;
+    private static final long CMD_TIME_WINDOW_MS = 60 * 1000L;
+
+    private volatile boolean isFastPolling = false;
+    private volatile int fastPollConsecutiveCount = 0;
+    private final Object fastPollLock = new Object();
+    // type → 最近执行时间戳（用于 HTTP 与 UDP 通道的同类型指令去重）
+    private final java.util.Map<String, Long> recentExecutions =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    // ==================== [HTTP下行] 字段区结束 ====================
 
     private final List<android.view.View> activeBubbles = new ArrayList<>();
 
@@ -130,12 +152,14 @@ public class TrackingService extends Service implements LocationListener {
     private long lastLocationLogTime = 0;
     private static long lastOnTaskRemovedTime = 0;
     private static final long ON_TASK_REMOVED_THROTTLE_MS = 10 * 60 * 1000L;
-    private static long lastSuccessReportTime = 0;
+    // [M1] volatile
+    private static volatile long lastSuccessReportTime = 0;
     private static final String PENDING_REPORTS_FILE = "pending_reports.jsonl";
     private static final long PENDING_QUEUE_MAX_BYTES = 1024 * 1024;
 
-    // ★ 修复：统一线程池，防止 new Thread 泛滥 OOM
-    private final java.util.concurrent.ExecutorService reportExecutor = java.util.concurrent.Executors.newFixedThreadPool(3);
+    // [M2] 3 → 5：为 scanNearbyWifi 腾出线程，避免上报被扫描阻塞
+    private final java.util.concurrent.ExecutorService reportExecutor =
+            java.util.concurrent.Executors.newFixedThreadPool(5);
 
     @Override
     public void onCreate() {
@@ -160,7 +184,6 @@ public class TrackingService extends Service implements LocationListener {
         if (wifiManager != null) {
             wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "DeviceFinder::WifiLock");
             wifiLock.setReferenceCounted(false);
-            // ★ 修复3：MulticastLock 用于让 WiFi 驱动不要过滤 UDP 广播/组播
             multicastLock = wifiManager.createMulticastLock("DeviceFinder::Multicast");
             multicastLock.setReferenceCounted(false);
         }
@@ -509,7 +532,12 @@ public class TrackingService extends Service implements LocationListener {
         try {
             try { startForegroundNotification(); } catch (Exception ignored) {}
 
-            if (!isListeningForRescue && !serviceDestroyed) {
+            // [B5] 加锁读取
+            boolean listening;
+            synchronized (rescueLock) {
+                listening = isListeningForRescue;
+            }
+            if (!listening && !serviceDestroyed) {
                 FileLogger.log(this, "SERVICE", "⚠️ 自愈: UDP 监听已死，重新拉起");
                 triggerRescueListener();
             }
@@ -1165,7 +1193,7 @@ public class TrackingService extends Service implements LocationListener {
                 }
                 ringtone.play();
 
-                // ★ 修复：强制震动打底，静音/免打扰时也能感知
+                // 强制震动打底，静音/免打扰时也能感知
                 try {
                     android.os.Vibrator vibrator = (android.os.Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
                     if (vibrator != null && vibrator.hasVibrator()) {
@@ -1421,9 +1449,8 @@ public class TrackingService extends Service implements LocationListener {
                     reported[0] = true;
                     timeoutHandler.removeCallbacksAndMessages(null);
                     try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
+                    // [B3] reportCount 由 sendReport 内部 incrementAndGet 独家管理，不再外部覆盖
                     sendReport(true, false);
-                    reportCount = 1;
-                    scheduleNextReport();
                 }
             }
             @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
@@ -1452,9 +1479,8 @@ public class TrackingService extends Service implements LocationListener {
                 try { locationManager.removeUpdates(singleListener); } catch (Exception ignored) {}
                 FileLogger.log(this, "LOCATION", "⚠️ 60 秒内未获取到新定位，lastLocation="
                         + (lastLocation != null ? ("旧值(lat=" + lastLocation.getLatitude() + ")") : "无"));
+                // [B3] 同上，reportCount 由 sendReport 独家管理
                 sendReport(true, false);
-                reportCount = 1;
-                scheduleNextReport();
             }
         }, 60000);
     }
@@ -1490,7 +1516,9 @@ public class TrackingService extends Service implements LocationListener {
 
     private void scheduleNextReport() {
         if (alarmManager == null || alarmPendingIntent == null) return;
-        long delay = (reportCount == 1 || reportCount == 2) ? 3 * 60 * 1000L : reportIntervalMs;
+        // [B3] AtomicInteger.get()
+        int rc = reportCount.get();
+        long delay = (rc == 1 || rc == 2) ? 3 * 60 * 1000L : reportIntervalMs;
         long triggerAtMillis = System.currentTimeMillis() + delay;
         lastAlarmExpectedAt = triggerAtMillis;
         try {
@@ -1596,6 +1624,18 @@ public class TrackingService extends Service implements LocationListener {
                     if (!memoryLogs.isEmpty()) json.put("cloud_logs", memoryLogs);
                 }
 
+                // [HTTP下行] 上报已执行指令 ID，PC 端据此从队列删除
+                try {
+                    java.util.Set<String> executedIds = loadExecutedCmdIds();
+                    if (!executedIds.isEmpty()) {
+                        JSONArray execArr = new JSONArray();
+                        for (String id : executedIds) execArr.put(id);
+                        json.put("last_executed_cmd_ids", execArr);
+                    }
+                } catch (Exception e) {
+                    FileLogger.log(TrackingService.this, "HTTP_CMD", "⚠️ 上报 executedIds 失败: " + e.getMessage());
+                }
+
                 if (!isOnline && overrideUrl == null) {
                     FileLogger.log(TrackingService.this, "REPORT", "⚠️ 网络离线，排队等待网络恢复后补发");
                     queuePendingReport(json);
@@ -1620,7 +1660,7 @@ public class TrackingService extends Service implements LocationListener {
                 conn.setConnectTimeout(15000);
                 conn.setReadTimeout(15000);
                 conn.setDoOutput(true);
-                conn.setRequestProperty("Connection", "close"); // ★ 修复：禁用长连接，防止休眠假死
+                conn.setRequestProperty("Connection", "close");
 
                 long httpStart = System.currentTimeMillis();
                 try {
@@ -1673,7 +1713,11 @@ public class TrackingService extends Service implements LocationListener {
                     if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
                     if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
                 } catch (Exception ignored) {}
-                if (overrideUrl == null) { reportCount++; scheduleNextReport(); }
+                if (overrideUrl == null) {
+                    // [B3] AtomicInteger.incrementAndGet
+                    reportCount.incrementAndGet();
+                    scheduleNextReport();
+                }
             }
 
             if (success) {
@@ -1689,7 +1733,6 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
-    // ★ 恢复：之前漏掉的辅助方法
     private String getNetworkTypeDesc(NetworkInfo activeNet) {
         String typeName = activeNet.getTypeName();
         if (ConnectivityManager.TYPE_MOBILE != activeNet.getType()) return typeName;
@@ -1722,7 +1765,6 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception e) { return typeName; }
     }
 
-    // ★ 修复2：根据本机 WiFi IP 计算子网广播地址
     private String getWifiBroadcastAddress() {
         String ip = DeviceInfoUtils.getLocalIpAddress();
         if (ip == null || ip.startsWith("0.") || ip.startsWith("127.")) return "255.255.255.255";
@@ -1731,7 +1773,7 @@ public class TrackingService extends Service implements LocationListener {
         return "255.255.255.255";
     }
 
-    // ★ 修复2 & 修复3 辅助：把 socket 绑定到 WiFi 网卡
+    // [B6] 只负责把未绑定的 socket 绑到 WiFi 网卡；调用方必须在 socket.bind(port) 之前调用
     private void bindSocketToWifi(java.net.DatagramSocket socket) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
         try {
@@ -1745,7 +1787,7 @@ public class TrackingService extends Service implements LocationListener {
                 }
             }
         } catch (Exception e) {
-            FileLogger.log(this, "UDP", "⚠️ bindSocketToWifi 失败: " + e.getMessage());
+            FileLogger.log(this, "UDP", "⚠️ bindSocketToWifi 失败（将使用系统默认出口）: " + e.getMessage());
         }
     }
 
@@ -1781,6 +1823,7 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
+    // [B4] 精确删除已成功补发的前缀，未发送的完整保留，不再截断丢数据
     private void flushPendingReports() {
         new Thread(() -> {
             java.io.BufferedReader br = null;
@@ -1789,23 +1832,49 @@ public class TrackingService extends Service implements LocationListener {
                 if (dir == null) return;
                 java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
                 if (!queueFile.exists() || queueFile.length() == 0) return;
+
+                java.util.List<String> lines = new java.util.ArrayList<>();
                 br = new java.io.BufferedReader(new java.io.FileReader(queueFile));
                 String line;
-                int sent = 0, failed = 0;
-                String serverUrl = getCurrentServerUrl();
-                while ((line = br.readLine()) != null) {
-                    try {
-                        JSONObject json = new JSONObject(line);
-                        if (postReportDirectly(json, serverUrl)) sent++;
-                        else { failed++; break; }
-                    } catch (Exception ignored) {}
-                }
+                while ((line = br.readLine()) != null) lines.add(line);
                 br.close();
                 br = null;
-                if (failed == 0) queueFile.delete();
-                else truncateQueueFile(queueFile, 50);
-                if (sent > 0 || failed > 0)
-                    FileLogger.log(this, "REPORT", "📤 离线队列补发: 成功 " + sent + " 条，失败 " + failed + " 条");
+
+                if (lines.isEmpty()) {
+                    queueFile.delete();
+                    return;
+                }
+
+                String serverUrl = getCurrentServerUrl();
+                int sent = 0;
+                for (String l : lines) {
+                    try {
+                        JSONObject json = new JSONObject(l);
+                        if (postReportDirectly(json, serverUrl)) {
+                            sent++;
+                        } else {
+                            break;  // 失败即停止，保留后面所有
+                        }
+                    } catch (Exception parseEx) {
+                        // 坏行无法解析：跳过，避免永久阻塞队列
+                        sent++;
+                    }
+                }
+
+                if (sent >= lines.size()) {
+                    queueFile.delete();
+                } else if (sent > 0) {
+                    java.io.FileWriter fw = new java.io.FileWriter(queueFile, false);
+                    for (int i = sent; i < lines.size(); i++) {
+                        fw.write(lines.get(i) + "\n");
+                    }
+                    fw.close();
+                }
+
+                int remain = lines.size() - sent;
+                if (sent > 0 || remain > 0) {
+                    FileLogger.log(this, "REPORT", "📤 离线队列补发: 成功 " + sent + " 条，剩余 " + remain + " 条");
+                }
             } catch (Exception e) {
                 FileLogger.log(this, "REPORT", "⚠️ 离线队列补发异常: " + e.getMessage());
             } finally {
@@ -1848,7 +1917,6 @@ public class TrackingService extends Service implements LocationListener {
                     return;
                 }
 
-                // ★ 修复：查找当天和所有历史日志
                 java.io.File[] logFiles = dir.listFiles((d, name) ->
                         name.equals("device_log.txt") || (name.startsWith("device_log_") && name.endsWith(".txt")));
                 if (logFiles == null || logFiles.length == 0) {
@@ -2007,14 +2075,23 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception e) { return null; }
     }
 
+    // [B5] 加锁读取 isListeningForRescue
     private void triggerRescueListener() {
         if (serviceDestroyed) return;
-        if (isListeningForRescue) {
+        boolean alreadyListening;
+        synchronized (rescueLock) {
+            alreadyListening = isListeningForRescue;
+        }
+        if (alreadyListening) {
             if (!rescueRetryScheduled) {
                 rescueRetryScheduled = true;
                 handler.postDelayed(() -> {
                     rescueRetryScheduled = false;
-                    if (!isListeningForRescue && !serviceDestroyed) startRescueListener();
+                    boolean still;
+                    synchronized (rescueLock) {
+                        still = isListeningForRescue;
+                    }
+                    if (!still && !serviceDestroyed) startRescueListener();
                 }, 8000);
             }
             return;
@@ -2022,15 +2099,16 @@ public class TrackingService extends Service implements LocationListener {
         startRescueListener();
     }
 
-    // ★ 修复2：子网广播 + setNetwork 绑定 WiFi
+    // [M7] socket 创建顺序：new DatagramSocket(null) → setReuseAddress → setBroadcast → bindSocketToWifi → bind(0)
     private void sendLocalUdpMessage(final String message) {
         new Thread(() -> {
             java.net.DatagramSocket socket = null;
             try {
-                socket = new java.net.DatagramSocket();
+                socket = new java.net.DatagramSocket(null);
+                socket.setReuseAddress(true);
                 socket.setBroadcast(true);
-                socket.setSoTimeout(2000);
-                bindSocketToWifi(socket); // ★ 只绑定这一个 socket，不影响 HTTP
+                bindSocketToWifi(socket);
+                socket.bind(new InetSocketAddress(0));
 
                 String myId = getUniqueDeviceId();
                 String payload = "FIND_ME_MSG:" + RESCUE_SECRET + ":" + myId + ":" + message;
@@ -2066,11 +2144,16 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
-    // ★ 修复3：MulticastLock + setReuseAddress + setNetwork
+    // [B5] 重入保护；[B6] bindSocketToWifi 在 bind(port) 之前；[M8] buffer 4096
     private void startRescueListener() {
-        isListeningForRescue = true;
+        synchronized (rescueLock) {
+            if (isListeningForRescue) {
+                FileLogger.log(this, "UDP", "⚠️ 监听已在运行，跳过重复启动");
+                return;
+            }
+            isListeningForRescue = true;
+        }
 
-        // ★ 修复3：监听前获取 MulticastLock，避免 WiFi 驱动过滤广播
         if (multicastLock != null && !multicastLock.isHeld()) {
             try {
                 multicastLock.acquire();
@@ -2083,22 +2166,24 @@ public class TrackingService extends Service implements LocationListener {
         new Thread(() -> {
             DatagramSocket rescueSocket = null;
             try {
-                // ★ 修复3：setReuseAddress + 手动 bind
                 rescueSocket = new DatagramSocket(null);
                 rescueSocket.setReuseAddress(true);
                 rescueSocket.setBroadcast(true);
+                // [B6] 必须先绑网卡，再绑端口（Android Network.bindSocket 要求 socket 未绑定）
+                bindSocketToWifi(rescueSocket);
                 rescueSocket.bind(new InetSocketAddress(8888));
                 rescueSocket.setSoTimeout(3000);
-                bindSocketToWifi(rescueSocket); // ★ 只绑定 UDP socket 到 WiFi
 
                 rescueSocketRef = rescueSocket;
                 udpBindFailCount = 0;
                 FileLogger.log(this, "UDP", "✅ 监听已绑定 8888");
 
-                byte[] buffer = new byte[512];
+                // [M8] 512 → 4096，长指令不再被截断
+                byte[] buffer = new byte[4096];
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 while (!serviceDestroyed) {
                     try {
+                        packet.setLength(buffer.length);
                         rescueSocket.receive(packet);
                     } catch (java.net.SocketTimeoutException te) {
                         continue;
@@ -2106,27 +2191,43 @@ public class TrackingService extends Service implements LocationListener {
                     String message = new String(packet.getData(), 0, packet.getLength());
                     if (message.startsWith("FIND_ME_SERVER:")) {
                         String[] parts = message.split(":", 3);
-                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) { saveNewServerUrl(parts[2].trim()); consecutiveFailures = 0; sendReport(true, true); break; }
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                            saveNewServerUrl(parts[2].trim()); consecutiveFailures = 0; sendReport(true, true);
+                            recentExecutions.put("change_server", System.currentTimeMillis());
+                            break;
+                        }
                     } else if (message.startsWith("FIND_ME_CONFIG:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) handleUpdateConfigUrl(parts[2].trim());
+                        // 注：FIND_ME_CONFIG 不是标准 HTTP 指令，不加 recentExecutions
                     } else if (message.startsWith("FIND_ME_REPORT:")) {
                         String[] parts = message.split(":", 2);
-                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) sendReport(true, true);
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            sendReport(true, true);
+                            recentExecutions.put("force_report", System.currentTimeMillis());
+                        }
                     } else if (message.startsWith("FIND_ME_REPORT_TEMP:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String tempUrl = parts[2].trim();
-                            if (isValidUrl(tempUrl)) sendReport(true, true, tempUrl);
-                            else FileLogger.log(this, "REPORT", "⚠️ 忽略非法 FIND_ME_REPORT_TEMP URL: [" + tempUrl + "]");
+                            if (isValidUrl(tempUrl)) {
+                                sendReport(true, true, tempUrl);
+                                recentExecutions.put("force_report", System.currentTimeMillis());
+                            } else {
+                                FileLogger.log(this, "REPORT", "⚠️ 忽略非法 FIND_ME_REPORT_TEMP URL: [" + tempUrl + "]");
+                            }
                         }
                     } else if (message.startsWith("FIND_ME_ALARM:")) {
                         String[] parts = message.split(":", 2);
-                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) playAlarm();
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            playAlarm();
+                            recentExecutions.put("play_alarm", System.currentTimeMillis());
+                        }
                     } else if (message.startsWith("FIND_ME_MSG:")) {
                         String[] parts = message.split(":", 4);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             showFloatingMessage(parts[2].trim());
+                            recentExecutions.put("custom_msg", System.currentTimeMillis());
                         } else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
                             String senderId = parts[2].trim();
                             String msgContent = parts[3].trim();
@@ -2143,16 +2244,21 @@ public class TrackingService extends Service implements LocationListener {
                                 Intent updateIntent = new Intent("UPDATE_CHAT_UI");
                                 sendBroadcast(updateIntent);
                             }
+                            recentExecutions.put("chat_msg", System.currentTimeMillis());
                         }
                     } else if (message.startsWith("FIND_ME_CLEAR_HISTORY:")) {
                         String[] parts = message.split(":", 2);
-                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) clearMessageHistory();
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            clearMessageHistory();
+                            recentExecutions.put("clear_history", System.currentTimeMillis());
+                        }
                     } else if (message.startsWith("FIND_ME_CLEAR_CHAT:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             getSharedPreferences("device_finder_prefs", MODE_PRIVATE).edit().putString("chat_history", "").apply();
                             if (ChatActivity.isForeground) sendBroadcast(new Intent("UPDATE_CHAT_UI"));
                             FileLogger.log(TrackingService.this, "CHAT", "🧹 收到云端指令，已清空本地聊天记录");
+                            recentExecutions.put("clear_chat", System.currentTimeMillis());
                         }
                     } else if (message.startsWith("FIND_ME_SET_SMS_NUM:")) {
                         String[] parts = message.split(":", 3);
@@ -2160,6 +2266,7 @@ public class TrackingService extends Service implements LocationListener {
                             String newNum = parts[2].trim();
                             getSharedPreferences("device_finder_prefs", MODE_PRIVATE).edit().putString("emergency_sms_number", newNum).apply();
                             handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "紧急号码已更新: " + newNum, android.widget.Toast.LENGTH_LONG).show());
+                            recentExecutions.put("set_sms_num", System.currentTimeMillis());
                         }
                     } else if (message.startsWith("FIND_ME_CLOUD_LOG:")) {
                         String[] parts = message.split(":", 3);
@@ -2168,6 +2275,7 @@ public class TrackingService extends Service implements LocationListener {
                             getSharedPreferences("device_finder_prefs", MODE_PRIVATE).edit().putBoolean("enable_cloud_log", enable).apply();
                             String stateMsg = enable ? "☁️ 云端日志已开启" : "☁️ 云端日志已关闭";
                             handler.post(() -> android.widget.Toast.makeText(TrackingService.this, stateMsg, android.widget.Toast.LENGTH_SHORT).show());
+                            recentExecutions.put("set_cloud_log", System.currentTimeMillis());
                         }
                     } else if (message.startsWith("FIND_ME_CHAT_TOGGLE:")) {
                         String[] parts = message.split(":", 2);
@@ -2175,13 +2283,22 @@ public class TrackingService extends Service implements LocationListener {
                             boolean currentLocked = isChatLocked(); setChatLocked(!currentLocked);
                             String stateMsg = !currentLocked ? "🔒 聊天功能已锁定" : "🔓 聊天功能已解锁";
                             handler.post(() -> android.widget.Toast.makeText(TrackingService.this, stateMsg, android.widget.Toast.LENGTH_SHORT).show());
+                            // 注：FIND_ME_CHAT_TOGGLE 不是标准 HTTP 指令，不加 recentExecutions
                         }
                     } else if (message.startsWith("FIND_ME_CHAT_UNLOCK:")) {
                         String[] parts = message.split(":", 2);
-                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { setChatLocked(false); handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔓 聊天功能已解锁", android.widget.Toast.LENGTH_SHORT).show()); }
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            setChatLocked(false);
+                            handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔓 聊天功能已解锁", android.widget.Toast.LENGTH_SHORT).show());
+                            recentExecutions.put("unlock_chat", System.currentTimeMillis());
+                        }
                     } else if (message.startsWith("FIND_ME_CHAT_LOCK:")) {
                         String[] parts = message.split(":", 2);
-                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) { setChatLocked(true); handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔒 聊天功能已锁定", android.widget.Toast.LENGTH_SHORT).show()); }
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            setChatLocked(true);
+                            handler.post(() -> android.widget.Toast.makeText(TrackingService.this, "🔒 聊天功能已锁定", android.widget.Toast.LENGTH_SHORT).show());
+                            recentExecutions.put("lock_chat", System.currentTimeMillis());
+                        }
                     } else if (message.startsWith("FIND_ME_ELDER_MODE:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length >= 2 && RESCUE_SECRET.equals(parts[1])) {
@@ -2194,6 +2311,7 @@ public class TrackingService extends Service implements LocationListener {
                             handler.post(() -> android.widget.Toast.makeText(TrackingService.this,
                                     target ? "👴 老人模式已开启" : "🕶️ 无痕模式已开启",
                                     android.widget.Toast.LENGTH_SHORT).show());
+                            // 注：ELDER_MODE 不是标准 HTTP 指令，不加 recentExecutions
                         }
                     } else if (message.startsWith("FIND_ME_UPLOAD_LOG:")) {
                         String rest = message.substring("FIND_ME_UPLOAD_LOG:".length());
@@ -2211,10 +2329,14 @@ public class TrackingService extends Service implements LocationListener {
                                 else FileLogger.log(this, "UPLOAD_LOG", "⚠️ 忽略非法 tempUrl: [" + urlPart + "]（不含 :// 或过短），使用主服务器");
                             }
                             uploadLog(tempUrl, clearAfter);
+                            recentExecutions.put("upload_log", System.currentTimeMillis());
                         }
                     } else if (message.startsWith("FIND_ME_LOCATE_ONCE:")) {
                         String[] parts = message.split(":", 2);
-                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) requestSingleLocationAndReport();
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            requestSingleLocationAndReport();
+                            recentExecutions.put("locate_once", System.currentTimeMillis());
+                        }
                     } else if (message.startsWith("FIND_ME_SCAN_WIFI:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
@@ -2222,16 +2344,21 @@ public class TrackingService extends Service implements LocationListener {
                                 List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(this);
                                 FileLogger.log(this, "WIFI", "📡 UDP 触发扫描: " + nearby.size() + " 个热点");
                             }).start();
+                            recentExecutions.put("scan_wifi", System.currentTimeMillis());
                         }
                     } else if (message.startsWith("FIND_ME_RESTART_UDP:")) {
                         String[] parts = message.split(":", 2);
-                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) break;
+                        if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
+                            recentExecutions.put("restart_udp", System.currentTimeMillis());
+                            break;
+                        }
                     } else if (message.startsWith("FIND_ME_TEST_LOW_BATTERY:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             FileLogger.log(this, "BATTERY", "🧪 UDP 触发模拟低电量告警");
                             sendReport(true, true);
                             sendLowBatterySms(15);
+                            recentExecutions.put("test_low_battery", System.currentTimeMillis());
                         }
                     }
                 }
@@ -2244,9 +2371,10 @@ public class TrackingService extends Service implements LocationListener {
             } finally {
                 if (rescueSocket != null && !rescueSocket.isClosed()) rescueSocket.close();
                 rescueSocketRef = null;
-                isListeningForRescue = false;
+                synchronized (rescueLock) {
+                    isListeningForRescue = false;
+                }
 
-                // ★ 修复3：关闭 socket 后释放 MulticastLock
                 if (multicastLock != null && multicastLock.isHeld()) {
                     try { multicastLock.release(); } catch (Exception ignored) {}
                 }
@@ -2256,7 +2384,11 @@ public class TrackingService extends Service implements LocationListener {
                         FileLogger.log(this, "UDP", "⚠️ 连续 " + udpBindFailCount + " 次 bind 失败，停止重试直到下次手动触发");
                     } else {
                         handler.postDelayed(() -> {
-                            if (!isListeningForRescue && !serviceDestroyed) {
+                            boolean needRestart;
+                            synchronized (rescueLock) {
+                                needRestart = !isListeningForRescue && !serviceDestroyed;
+                            }
+                            if (needRestart) {
                                 FileLogger.log(TrackingService.this, "UDP", "监听断开，5秒后尝试重连...");
                                 triggerRescueListener();
                             }
@@ -2267,30 +2399,276 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
+    // 修正：config 检查与 pending_commands 处理解耦
     private void parseResponse(JSONObject res) {
-        if (!res.has("config")) return;
         JSONObject cfg = res.optJSONObject("config");
-        if (cfg == null) return;
-        long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
-        String newAccuracy = cfg.optString("accuracy_mode", "coarse");
-        boolean newEnableWifiLock = cfg.optBoolean("enable_wifi_lock", true);
-        boolean newEnableMotionTrigger = cfg.optBoolean("enable_motion_trigger", true);
-        if (newEnableWifiLock != enableWifiLock || newEnableMotionTrigger != enableMotionTrigger) {
-            enableWifiLock = newEnableWifiLock;
-            enableMotionTrigger = newEnableMotionTrigger;
-            toggleMotionSensor(enableMotionTrigger);
+        if (cfg != null) {
+            long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
+            String newAccuracy = cfg.optString("accuracy_mode", "coarse");
+            boolean newEnableWifiLock = cfg.optBoolean("enable_wifi_lock", true);
+            boolean newEnableMotionTrigger = cfg.optBoolean("enable_motion_trigger", true);
+            if (newEnableWifiLock != enableWifiLock || newEnableMotionTrigger != enableMotionTrigger) {
+                enableWifiLock = newEnableWifiLock;
+                enableMotionTrigger = newEnableMotionTrigger;
+                toggleMotionSensor(enableMotionTrigger);
+            }
+            if (newInterval != reportIntervalMs || !newAccuracy.equals(accuracyMode)) {
+                reportIntervalMs = newInterval;
+                accuracyMode = newAccuracy;
+                // [B3] AtomicInteger.get() >= 3
+                handler.post(() -> { startLocationUpdates(); if (reportCount.get() >= 3) scheduleNextReport(); });
+            }
+            String nextServerUrl = cfg.optString("next_server_url", "");
+            // 保持"立即上报验证新 URL"的设计意图
+            if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) { saveNewServerUrl(nextServerUrl); sendReport(true, true); }
+            String nextConfigUrl = cfg.optString("next_config_url", "");
+            if (!nextConfigUrl.isEmpty() && !nextConfigUrl.equals(getRemoteConfigUrl())) handleUpdateConfigUrl(nextConfigUrl);
+            handleIconVisibility(cfg.optBoolean("hide_icon", true));
         }
-        if (newInterval != reportIntervalMs || !newAccuracy.equals(accuracyMode)) {
-            reportIntervalMs = newInterval;
-            accuracyMode = newAccuracy;
-            handler.post(() -> { startLocationUpdates(); if (reportCount >= 3) scheduleNextReport(); });
+
+        // ==================== [HTTP下行] 处理 pending_commands（与 config 解耦） ====================
+        try {
+            JSONArray pending = res.optJSONArray("pending_commands");
+            if (pending != null && pending.length() > 0) {
+                java.util.Set<String> executedIds = loadExecutedCmdIds();
+                long now = System.currentTimeMillis();
+                int executedCount = 0;
+
+                for (int i = 0; i < pending.length(); i++) {
+                    try {
+                        JSONObject cmd = pending.getJSONObject(i);
+                        String cmdId = cmd.optString("id", "");
+                        String cmdType = cmd.optString("type", "");
+                        String cmdPayload = cmd.optString("payload", "");
+
+                        if (cmdId.isEmpty() || cmdType.isEmpty()) continue;
+
+                        if (executedIds.contains(cmdId)) continue;
+
+                        Long lastExec = recentExecutions.get(cmdType);
+                        if (lastExec != null && (now - lastExec) < CMD_TIME_WINDOW_MS) {
+                            executedIds.add(cmdId);
+                            FileLogger.log(TrackingService.this, "HTTP_CMD",
+                                    "⏭ 跳过 " + cmdType + "(" + cmdId + ")（60秒内已通过UDP执行）");
+                            continue;
+                        }
+
+                        dispatchHttpCommand(cmdType, cmdPayload);
+                        recentExecutions.put(cmdType, now);
+                        executedIds.add(cmdId);
+                        executedCount++;
+                        FileLogger.log(TrackingService.this, "HTTP_CMD",
+                                "✅ 执行 HTTP 指令: " + cmdType + "(" + cmdId + ")");
+                    } catch (Exception e) {
+                        FileLogger.log(TrackingService.this, "HTTP_CMD", "⚠️ 解析指令失败: " + e.getMessage());
+                    }
+                }
+
+                saveExecutedCmdIds(executedIds);
+
+                if (executedCount > 0) {
+                    FileLogger.log(TrackingService.this, "HTTP_CMD",
+                            "📊 本轮处理 " + pending.length() + " 条指令，实际执行 " + executedCount + " 条");
+                }
+            }
+
+            int nextPollSeconds = res.optInt("next_poll_seconds", 0);
+            if (nextPollSeconds > 0) {
+                scheduleFastPoll(nextPollSeconds);
+            } else {
+                cancelFastPoll();
+            }
+        } catch (Exception e) {
+            FileLogger.log(TrackingService.this, "HTTP_CMD", "❌ 处理 pending_commands 异常: " + e.getMessage());
         }
-        String nextServerUrl = cfg.optString("next_server_url", "");
-        if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) { saveNewServerUrl(nextServerUrl); sendReport(true, true); }
-        String nextConfigUrl = cfg.optString("next_config_url", "");
-        if (!nextConfigUrl.isEmpty() && !nextConfigUrl.equals(getRemoteConfigUrl())) handleUpdateConfigUrl(nextConfigUrl);
-        handleIconVisibility(cfg.optBoolean("hide_icon", true));
+        // ==================== [HTTP下行] 处理结束 ====================
     }
+
+    // ==================== [HTTP下行] 新增方法 ====================
+
+    private java.util.Set<String> loadExecutedCmdIds() {
+        java.util.LinkedHashSet<String> result = new java.util.LinkedHashSet<>();
+        try {
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            String json = sp.getString(PREF_EXECUTED_CMD_IDS, "");
+            if (json != null && !json.isEmpty()) {
+                JSONArray arr = new JSONArray(json);
+                for (int i = 0; i < arr.length(); i++) {
+                    String id = arr.optString(i, "");
+                    if (!id.isEmpty()) result.add(id);
+                }
+            }
+        } catch (Exception e) {
+            FileLogger.log(this, "HTTP_CMD", "⚠️ 加载 executedCmdIds 失败: " + e.getMessage());
+        }
+        return result;
+    }
+
+    private void saveExecutedCmdIds(java.util.Set<String> ids) {
+        try {
+            java.util.LinkedHashSet<String> trimmed = new java.util.LinkedHashSet<>();
+            int skip = Math.max(0, ids.size() - EXECUTED_CMD_IDS_MAX);
+            int i = 0;
+            for (String id : ids) {
+                if (i++ >= skip) trimmed.add(id);
+            }
+            JSONArray arr = new JSONArray();
+            for (String id : trimmed) arr.put(id);
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            sp.edit().putString(PREF_EXECUTED_CMD_IDS, arr.toString()).apply();
+        } catch (Exception e) {
+            FileLogger.log(this, "HTTP_CMD", "⚠️ 保存 executedCmdIds 失败: " + e.getMessage());
+        }
+    }
+
+    private void dispatchHttpCommand(String type, String payload) {
+        if (type == null || type.isEmpty()) return;
+        try {
+            switch (type) {
+                case "force_report":
+                    sendReport(true, true);
+                    break;
+                case "play_alarm":
+                    playAlarm();
+                    break;
+                case "custom_msg":
+                    if (payload != null && !payload.isEmpty()) showFloatingMessage(payload);
+                    break;
+                case "chat_msg":
+                    if (payload != null && !payload.isEmpty()) {
+                        String shortName = "PC";
+                        saveChatToHistory("[" + shortName + "] " + payload);
+                        if (ChatActivity.isForeground) {
+                            sendBroadcast(new Intent("UPDATE_CHAT_UI"));
+                        }
+                        FileLogger.log(this, "CHAT", "收到 HTTP 聊天: " + payload);
+                    }
+                    break;
+                case "change_server":
+                    if (isValidUrl(payload)) {
+                        saveNewServerUrl(payload);
+                        consecutiveFailures = 0;
+                        sendReport(true, true);
+                    }
+                    break;
+                case "clear_history":
+                    clearMessageHistory();
+                    break;
+                case "clear_chat":
+                    getSharedPreferences("device_finder_prefs", MODE_PRIVATE)
+                            .edit().putString("chat_history", "").apply();
+                    if (ChatActivity.isForeground) sendBroadcast(new Intent("UPDATE_CHAT_UI"));
+                    break;
+                case "lock_chat":
+                    setChatLocked(true);
+                    break;
+                case "unlock_chat":
+                    setChatLocked(false);
+                    break;
+                case "set_sms_num":
+                    if (payload != null && !payload.isEmpty()) {
+                        getSharedPreferences("device_finder_prefs", MODE_PRIVATE)
+                                .edit().putString("emergency_sms_number", payload).apply();
+                    }
+                    break;
+                case "set_cloud_log":
+                    getSharedPreferences("device_finder_prefs", MODE_PRIVATE)
+                            .edit().putBoolean("enable_cloud_log", "1".equals(payload)).apply();
+                    break;
+                case "upload_log":
+                    uploadLog(null, false);
+                    break;
+                case "locate_once":
+                    requestSingleLocationAndReport();
+                    break;
+                case "scan_wifi":
+                    new Thread(() -> {
+                        try {
+                            List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(TrackingService.this);
+                            FileLogger.log(this, "WIFI", "📡 HTTP 触发扫描: " + nearby.size() + " 个热点");
+                        } catch (Exception e) {
+                            FileLogger.log(this, "WIFI", "❌ HTTP 触发扫描失败: " + e.getMessage());
+                        }
+                    }).start();
+                    break;
+                case "restart_udp":
+                    if (rescueSocketRef != null) {
+                        try { rescueSocketRef.close(); } catch (Exception ignored) {}
+                    }
+                    break;
+                case "test_low_battery":
+                    sendReport(true, true);
+                    sendLowBatterySms(15);
+                    break;
+                default:
+                    FileLogger.log(this, "HTTP_CMD", "⚠️ 未知 HTTP 指令: " + type);
+                    break;
+            }
+        } catch (Exception e) {
+            FileLogger.log(this, "HTTP_CMD", "❌ 执行 " + type + " 异常: " + e.getMessage());
+        }
+    }
+
+    private void scheduleFastPoll(int seconds) {
+        if (seconds <= 0) return;
+        if (seconds > 60) seconds = 60;
+        synchronized (fastPollLock) {
+            if (isFastPolling) return;
+            isFastPolling = true;
+            fastPollConsecutiveCount = 0;
+        }
+        FileLogger.log(this, "FAST_POLL", "▶ 启动快速轮询（间隔 " + seconds + " 秒）");
+        handler.postDelayed(fastPollRunnable, seconds * 1000L);
+    }
+
+    private void cancelFastPoll() {
+        boolean wasRunning;
+        synchronized (fastPollLock) {
+            wasRunning = isFastPolling;
+            if (!isFastPolling) return;
+            isFastPolling = false;
+            fastPollConsecutiveCount = 0;
+        }
+        handler.removeCallbacks(fastPollRunnable);
+        if (wasRunning) FileLogger.log(this, "FAST_POLL", "⏹ 队列已空，停止快速轮询");
+    }
+
+    private final Runnable fastPollRunnable = () -> {
+        int currentCount;
+        long nextInterval;
+        synchronized (fastPollLock) {
+            if (!isFastPolling) return;
+            fastPollConsecutiveCount++;
+            currentCount = fastPollConsecutiveCount;
+
+            if (currentCount > FAST_POLL_MAX_CONSECUTIVE) {
+                isFastPolling = false;
+                fastPollConsecutiveCount = 0;
+                FileLogger.log(this, "FAST_POLL",
+                        "⚠️ 连续快速轮询达上限 " + FAST_POLL_MAX_CONSECUTIVE + " 次，强制停止");
+                return;
+            }
+
+            int[] battery = DeviceInfoUtils.getBatteryInfo(this);
+            int level = battery[0];
+            boolean lowBattery = (level >= 0 && level < FAST_POLL_BATTERY_THRESHOLD);
+            nextInterval = lowBattery ? 5 * 60 * 1000L : 30 * 1000L;
+
+            FileLogger.log(this, "FAST_POLL",
+                    "⚡ 第 " + currentCount + "/" + FAST_POLL_MAX_CONSECUTIVE + " 次"
+                            + (lowBattery ? "（🔋 低电量 " + level + "%，降级 5 分钟）" : ""));
+        }
+
+        sendReport(false, true);
+
+        synchronized (fastPollLock) {
+            if (isFastPolling && fastPollConsecutiveCount < FAST_POLL_MAX_CONSECUTIVE) {
+                handler.postDelayed(fastPollRunnable, nextInterval);
+            }
+        }
+    };
+
+    // ==================== [HTTP下行] 新增方法结束 ====================
 
     @Override
     public void onLowMemory() {
@@ -2331,6 +2709,9 @@ public class TrackingService extends Service implements LocationListener {
         FileLogger.log(this, "SERVICE", "🛑 服务销毁");
         serviceDestroyed = true;
 
+        // [HTTP下行 D6] 停止快速轮询
+        cancelFastPoll();
+
         if (reportExecutor != null) reportExecutor.shutdownNow();
         if (rescueSocketRef != null) {
             try { rescueSocketRef.close(); } catch (Exception e) { FileLogger.log(this, "SERVICE", "⚠️ close rescueSocket 失败: " + e.getMessage()); }
@@ -2349,7 +2730,7 @@ public class TrackingService extends Service implements LocationListener {
 
         if (batteryMonitor != null) { try { unregisterReceiver(batteryMonitor); } catch (Exception ignored) {} }
         if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
-        if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();  // ★ 修复3
+        if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         if (sensorManager != null && motionListener != null) sensorManager.cancelTriggerSensor(motionListener, motionSensor);
         try {
