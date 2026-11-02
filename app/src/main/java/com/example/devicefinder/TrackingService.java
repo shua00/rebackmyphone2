@@ -2633,7 +2633,10 @@ public class TrackingService extends Service implements LocationListener {
         if (wasRunning) FileLogger.log(this, "FAST_POLL", "⏹ 队列已空，停止快速轮询");
     }
 
-    private final Runnable fastPollRunnable = () -> {
+    // 修复 self-reference：用方法引用初始化，lambda 内部对 fastPollRunnable 的引用合法
+    private final Runnable fastPollRunnable = this::doFastPoll;
+
+    private void doFastPoll() {
         int currentCount;
         long nextInterval;
         synchronized (fastPollLock) {
@@ -2666,7 +2669,7 @@ public class TrackingService extends Service implements LocationListener {
                 handler.postDelayed(fastPollRunnable, nextInterval);
             }
         }
-    };
+    }
 
     // ==================== [HTTP下行] 新增方法结束 ====================
 
