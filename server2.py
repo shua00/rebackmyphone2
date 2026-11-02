@@ -6,6 +6,7 @@ import time
 import sqlite3
 import gzip
 import os
+import re                                       # [F5] fib_trie 兜底需要
 from urllib.parse import urlparse, parse_qs
 
 PORT = 8080
@@ -58,7 +59,8 @@ def udp_listener():
         udp_sock.bind(('0.0.0.0', 8888))
         print("🎧 UDP 监听已启动，等待局域网对讲机消息...")
         while True:
-            data, addr = udp_sock.recvfrom(1024)
+            # [F4] 1024 → 4096，避免含中文/长 URL 的消息被 UDP 层截断
+            data, addr = udp_sock.recvfrom(4096)
             msg = data.decode('utf-8', errors='ignore')
             source_ip = addr[0]
 
@@ -170,15 +172,37 @@ def format_loc_time(ts_ms):
         return "N/A"
 
 
+# [F5] 多目标 connect + /proc/net/fib_trie 兜底，避免无外网时返回 127.0.0.1
 def get_local_ip():
+    for target in [("8.8.8.8", 80), ("114.114.114.114", 53),
+                   ("1.1.1.1", 443), ("223.5.5.5", 53)]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1)
+            s.connect(target)
+            ip = s.getsockname()[0]
+            s.close()
+            if (ip and not ip.startswith("127.")
+                    and ip != "0.0.0.0" and not ip.startswith("169.254.")):
+                return ip
+        except Exception:
+            pass
+
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with open("/proc/net/fib_trie", "r") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if "LOCAL" in line and i > 0:
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+)", lines[i - 1])
+                if m:
+                    ip = m.group(1)
+                    if (ip != "0.0.0.0" and not ip.startswith("127.")
+                            and not ip.startswith("169.254.")):
+                        return ip
     except Exception:
-        return "127.0.0.1"
+        pass
+
+    return "127.0.0.1"
 
 
 def get_subnet_broadcast():
@@ -192,28 +216,41 @@ def get_subnet_broadcast():
     return "255.255.255.255"
 
 
+# [B1] 核心修复：只有全局广播才追加 255.255.255.255，单播绝不追加
 def send_udp_broadcast(command_str, target_ip="255.255.255.255"):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-        # ★ 如果是全局广播，改用子网广播
-        actual_target = target_ip
-        if target_ip == "255.255.255.255":
+        is_full_broadcast = (target_ip == "255.255.255.255")
+        is_subnet_broadcast = target_ip.endswith(".255") and not is_full_broadcast
+
+        if is_full_broadcast:
             subnet_bcast = get_subnet_broadcast()
             if subnet_bcast != "255.255.255.255":
                 actual_target = subnet_bcast
+                targets = [subnet_bcast, "255.255.255.255"]
+            else:
+                actual_target = "255.255.255.255"
+                targets = ["255.255.255.255"]
+            repeats = 3
+        elif is_subnet_broadcast:
+            # 用户显式指定子网广播地址：只发这一种子网广播，3 次
+            actual_target = target_ip
+            targets = [target_ip]
+            repeats = 3
+        else:
+            # [B1] 单播：只发这一个目标，2 次，绝不追加全局广播
+            actual_target = target_ip
+            targets = [target_ip]
+            repeats = 2
 
+        mode_tag = " (广播)" if (is_full_broadcast or is_subnet_broadcast) else " (单播)"
         with print_lock:
-            print(f"\n📡 [控制台] 发送至 {actual_target}: {command_str}")
-
-        # 双发：子网广播 + 全局广播
-        targets = [actual_target]
-        if actual_target != "255.255.255.255":
-            targets.append("255.255.255.255")
+            print(f"\n📡 [控制台] 发送至 {actual_target}{mode_tag}: {command_str}")
 
         for t in targets:
-            for _ in range(3):
+            for _ in range(repeats):
                 try:
                     sock.sendto(command_str.encode('utf-8'), (t, 8888))
                     time.sleep(0.05)
@@ -297,8 +334,10 @@ def handle_client(client_conn, client_addr):
                     save_history(dev_id, lat, lng, data["received_at"])
 
                 response_body = json.dumps({"status": "success", "config": GLOBAL_DEFAULT_CONFIG})
+                # [F6] Content-Length 用字节长度；此处 config 虽为 ASCII 但统一写法防未来引入中文
+                response_bytes = response_body.encode('utf-8')
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\nConnection: close\r\n\r\n{response_body}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + response_bytes)
             except Exception as e:
                 with print_lock:
                     print(f"❌ POST /api/report 解析异常: {e}")
@@ -365,8 +404,9 @@ def handle_client(client_conn, client_addr):
                     print(f"\n📋 收到日志上传: {device_id} -> {filename} ({len(log_data)} bytes)")
 
                 resp = json.dumps({"status": "ok", "filename": filename, "size": len(log_data)})
+                resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode())
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode() + resp_bytes)
             except Exception as e:
                 with print_lock:
                     print(f"❌ upload_log 异常: {e}")
@@ -389,8 +429,9 @@ def handle_client(client_conn, client_addr):
                                 "mtime": int(os.path.getmtime(fp) * 1000)
                             })
                 resp = json.dumps(files)
+                resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode())
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode() + resp_bytes)
             except Exception as e:
                 # [修复 4] 异常返回 500 并打日志
                 with print_lock:
@@ -443,8 +484,10 @@ def handle_client(client_conn, client_addr):
                         "cloud_logs": info.get("cloud_logs", ""),
                         "cloud_logs_time": info.get("cloud_logs_time", 0),
                     })
+                # [F6] cloud_logs 含中文，必须用字节长度
+                resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode())
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp_bytes)
             except Exception as e:
                 # [修复 4] 异常返回 500 并打日志
                 with print_lock:
@@ -483,13 +526,16 @@ def handle_client(client_conn, client_addr):
                             if not ip or ip == '0.0.0.0':
                                 continue
                             if local_prefix and ip.startswith(local_prefix + "."):
+                                # [B1] 同网段走单播（修复后不会再误发全局广播）
                                 send_udp_broadcast(cmd_prefix, ip)
                             else:
+                                # 不同网段走全局广播兜底（原逻辑保留）
                                 send_udp_broadcast(cmd_prefix, "255.255.255.255")
                             sent_any = True
                         if not sent_any:
                             send_udp_broadcast(cmd_prefix, "255.255.255.255")
                     else:
+                        # [B1] 指定单台设备：只单播，不再追加全局广播
                         send_udp_broadcast(cmd_prefix, target_ip)
                         sent_any = True
                     return sent_any
@@ -547,8 +593,10 @@ def handle_client(client_conn, client_addr):
                         success = False
 
                 resp = json.dumps({"status": "ok" if success else "error", "msg": "指令执行失败" if not success else ""})
+                # [F6] msg 含中文，必须用字节长度
+                resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp_bytes)
             except Exception as e:
                 # [修复 4] 异常返回 500 并打日志
                 with print_lock:
@@ -574,8 +622,9 @@ def handle_client(client_conn, client_addr):
                 rows = c.fetchall()
                 conn.close()
                 resp = json.dumps(rows)
+                resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp_bytes)
             except Exception as e:
                 # [修复 4] 异常返回 500 并打日志
                 with print_lock:
@@ -594,8 +643,10 @@ def handle_client(client_conn, client_addr):
                 rows = c.fetchall()
                 conn.close()
                 resp = json.dumps(rows)
+                # [F6] message 含中文，必须用字节长度
+                resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp_bytes)
             except Exception as e:
                 # [修复 4] 异常返回 500 并打日志
                 with print_lock:
@@ -617,8 +668,10 @@ def handle_client(client_conn, client_addr):
                 data_to_send = {"messages": CHAT_MESSAGES, "devices": devices_list}
                 with print_lock:
                     resp = json.dumps(data_to_send)
+                # [F6] 聊天内容含中文，必须用字节长度
+                resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n{resp}".encode('utf-8'))
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp_bytes)
             except Exception as e:
                 # [修复 4] 异常返回 500 并打日志
                 with print_lock:
@@ -1103,8 +1156,10 @@ async function showServerMessages() {
 }
 </script>
 </body></html>"""
+            # [F6] HTML 响应原本就正确用 len(html.encode('utf-8'))，保持
+            html_bytes = html.encode('utf-8')
             client_conn.sendall(
-                f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\nConnection: close\r\n\r\n{html}".encode('utf-8'))
+                f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + html_bytes)
 
         else:
             client_conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
