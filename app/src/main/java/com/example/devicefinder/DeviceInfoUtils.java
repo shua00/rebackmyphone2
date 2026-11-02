@@ -76,17 +76,45 @@ public class DeviceInfoUtils {
     }
 
     // 获取内网 IPv4 地址
+    // 优先返回 WiFi 网卡的 IPv4 地址（wlan0/ap0），其次才回退到其他网卡
     public static String getLocalIpAddress() {
         try {
+            String mobileIp = null;    // 移动数据 IP（保底）
+            String otherIp = null;     // 其他非 WiFi 网卡（次保底）
+    
             for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
                 NetworkInterface intf = en.nextElement();
+                String name = intf.getName();
+                if (!intf.isUp() || intf.isLoopback()) continue;
+    
+                // 提取当前网卡的 IPv4 地址
+                String ip = null;
                 for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements();) {
-                    InetAddress inetAddress = enumIpAddr.nextElement();
-                    if (!inetAddress.isLoopbackAddress() && inetAddress instanceof Inet4Address) {
-                        return inetAddress.getHostAddress();
+                    InetAddress addr = enumIpAddr.nextElement();
+                    if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+                        ip = addr.getHostAddress();
+                        break;
                     }
                 }
+                if (ip == null) continue;
+    
+                // 优先级 1：WiFi / 热点，立即返回
+                if (name.startsWith("wlan") || name.startsWith("ap")) {
+                    return ip;
+                }
+                // 优先级 2：其他非移动网卡（eth、tun 等），暂存
+                else if (!name.startsWith("rmnet") && !name.startsWith("ccmni")) {
+                    if (otherIp == null) otherIp = ip;
+                }
+                // 优先级 3：移动数据（rmnet/ccmni），暂存为最后保底
+                else {
+                    if (mobileIp == null) mobileIp = ip;
+                }
             }
+    
+            // 按优先级返回
+            if (otherIp != null) return otherIp;
+            if (mobileIp != null) return mobileIp;   // ★ 保留移动 IP，不返回 0.0.0.0
         } catch (Exception ignored) {}
         return "0.0.0.0";
     }
