@@ -134,6 +134,9 @@ public class TrackingService extends Service implements LocationListener {
     private static final String PENDING_REPORTS_FILE = "pending_reports.jsonl";
     private static final long PENDING_QUEUE_MAX_BYTES = 1024 * 1024;
 
+    // ★ 优化：统一使用线程池管理上报线程，防止高并发导致 OOM 被系统杀后台
+    private final java.util.concurrent.ExecutorService reportExecutor = java.util.concurrent.Executors.newFixedThreadPool(3);
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -650,6 +653,7 @@ public class TrackingService extends Service implements LocationListener {
                 conn.setRequestProperty("Content-Type", "application/json");
                 conn.setConnectTimeout(5000);
                 conn.setDoOutput(true);
+                conn.setRequestProperty("Connection", "close");
 
                 OutputStream os = conn.getOutputStream();
                 os.write(json.toString().getBytes("UTF-8"));
@@ -785,7 +789,6 @@ public class TrackingService extends Service implements LocationListener {
         saveMessageToHistory(message);
         syncMessageToServer(message);
 
-        // [A+D] 只有老人模式才发脱敏通知；无痕模式行为不变
         if (isElderMode()) {
             showElderMessageNotification();
         }
@@ -879,7 +882,6 @@ public class TrackingService extends Service implements LocationListener {
         });
     }
 
-    // [A+D] 老人模式脱敏通知渠道
     private void ensureElderMessageChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
         try {
@@ -908,7 +910,6 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
-    // [A+D] 老人模式脱敏通知
     private void showElderMessageNotification() {
         try {
             if (Build.VERSION.SDK_INT >= 33
@@ -954,7 +955,6 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
-    // [4321] 自检通知渠道
     private void ensureSelfCheckChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
         try {
@@ -970,7 +970,6 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
-    // [4321] 自检通知：一次性把「老人模式、权限、通知渠道、网络、电量、上报间隔、上次上报」列出来
     private void showSelfCheckNotification() {
         try {
             if (Build.VERSION.SDK_INT >= 33
@@ -1237,7 +1236,6 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
-    // [修复静音/震动] 明确 AudioAttributes.USAGE_ALARM + 临时切 RingerMode
     private void playAlarm() {
         try {
             android.media.AudioManager audioManager = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
@@ -1270,7 +1268,21 @@ public class TrackingService extends Service implements LocationListener {
                             .build());
                 }
                 ringtone.play();
-                FileLogger.log(this, "ALARM", "🔊 警报已播放");
+                
+                // 👈 新增：不管能不能改音量，强制震动打底，防止静音状态下无效
+                try {
+                    android.os.Vibrator vibrator = (android.os.Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                    if (vibrator != null && vibrator.hasVibrator()) {
+                        long[] pattern = {0, 500, 200, 500, 200, 500, 200, 500, 200, 500};
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            vibrator.vibrate(android.os.VibrationEffect.createWaveform(pattern, -1));
+                        } else {
+                            vibrator.vibrate(pattern, -1);
+                        }
+                    }
+                } catch (Exception ignored) {}
+
+                FileLogger.log(this, "ALARM", "🔊 警报已播放 + 震动");
 
                 final int finalOriginalMode = originalMode;
                 handler.postDelayed(() -> {
@@ -1583,12 +1595,6 @@ public class TrackingService extends Service implements LocationListener {
         }, 60000);
     }
 
-    /**
-     * ★ 新增：同步等待一次新定位，最多等 timeoutMs 毫秒。
-     * 由 sendReport 在后台线程调用，内部阻塞等待 CountDownLatch，主线程不受影响。
-     * 任意 provider 先返回就走人；超时返回 null。
-     * 只影响这一次 sendReport，不会污染 startLocationUpdates() 注册的常驻监听。
-     */
     private Location acquireFreshLocation(long timeoutMs) {
         final Location[] result = new Location[1];
         final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
@@ -1655,7 +1661,8 @@ public class TrackingService extends Service implements LocationListener {
 
         final String activeUrl = (overrideUrl != null && !overrideUrl.isEmpty()) ? overrideUrl : getCurrentServerUrl();
 
-        new Thread(() -> {
+        // ★ 优化：使用线程池执行，不再每次 new Thread 导致并发失控
+        reportExecutor.execute(() -> {
             boolean success = false;
             if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
                 try { wifiLock.acquire(); } catch (Exception e) {
@@ -1679,19 +1686,17 @@ public class TrackingService extends Service implements LocationListener {
                 String netDesc = isOnline ? getNetworkTypeDesc(activeNet) : "离线";
                 FileLogger.log(TrackingService.this, "REPORT", "准备上报. 网络:" + netDesc + " | SSID:" + wifiSsid + " | IP:" + ip + " | 电量:" + battery[0] + "%");
 
-                // ★ 改动 B：旧定位时主动刷新（sendReport 已在后台线程，可安全阻塞等待）
                 Location loc = lastLocation;
                 long locAgeMs = loc != null ? (System.currentTimeMillis() - loc.getTime()) : Long.MAX_VALUE;
-                final long FRESH_THRESHOLD_MS = 10 * 60 * 1000L;   // 超过 10 分钟视为旧坐标
-                final long FRESH_TIMEOUT_MS = 10000L;              // 单次上报最多等 10 秒拿新定位
+                final long FRESH_THRESHOLD_MS = 10 * 60 * 1000L;
+                final long FRESH_TIMEOUT_MS = 10000L;
 
+                // ★ 优化：旧坐标超过 15 分钟，且不是强制触发，直接跳过刷新
                 if (loc == null || locAgeMs > FRESH_THRESHOLD_MS) {
-                    // 旧坐标超过 15 分钟，且不是强制触发，直接跳过
                     if (loc != null && locAgeMs > 15 * 60 * 1000L && !force) {
                         FileLogger.log(TrackingService.this, "REPORT",
                                 "⏭ 跳过定位刷新（旧值 " + (locAgeMs / 60000) + " 分钟前），直接使用旧坐标");
                     } else {
-                        // 尝试刷新
                         long t0 = System.currentTimeMillis();
                         Location fresh = acquireFreshLocation(FRESH_TIMEOUT_MS);
                         long costMs = System.currentTimeMillis() - t0;
@@ -1710,7 +1715,6 @@ public class TrackingService extends Service implements LocationListener {
                     }
                 }
 
-                // 兜底：loc 仍为空时读 getLastKnownLocation
                 if (loc == null) {
                     Location netLoc = null, gpsLoc = null, passiveLoc = null;
                     try { netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
@@ -1723,12 +1727,11 @@ public class TrackingService extends Service implements LocationListener {
                 JSONObject json = new JSONObject();
                 json.put("device_id", getUniqueDeviceId()); json.put("token", AUTH_TOKEN); json.put("timestamp", System.currentTimeMillis());
                 json.put("os_version", "Android " + Build.VERSION.RELEASE); json.put("chat_locked", isChatLocked());
-                json.put("elder_mode", isElderMode());   // [A+D] 上报当前模式
+                json.put("elder_mode", isElderMode());
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE); json.put("is_screen_on", pm != null && pm.isInteractive()); json.put("uptime_ms", SystemClock.elapsedRealtime());
                 JSONObject battObj = new JSONObject(); battObj.put("level", battery[0]); battObj.put("is_charging", battery[1] == 1); json.put("battery", battObj);
                 JSONObject netObj = new JSONObject(); netObj.put("wifi_ssid", wifi[0]); netObj.put("wifi_bssid", wifi[1]); netObj.put("wifi_rssi", Integer.parseInt(wifi[2])); netObj.put("local_ip", ip); json.put("network", netObj);
 
-                // ★ 改动 C：locObj 增加 age_s
                 JSONObject locObj = new JSONObject();
                 if (loc != null) {
                     long ageS = Math.max(0, (System.currentTimeMillis() - loc.getTime()) / 1000);
@@ -1737,7 +1740,7 @@ public class TrackingService extends Service implements LocationListener {
                     locObj.put("accuracy", loc.getAccuracy());
                     locObj.put("provider", loc.getProvider());
                     locObj.put("time", loc.getTime());
-                    locObj.put("age_s", ageS);   // 上报时坐标已"旧"了多少秒
+                    locObj.put("age_s", ageS);
                 } else {
                     locObj.put("latitude", JSONObject.NULL);
                     locObj.put("longitude", JSONObject.NULL);
@@ -1764,7 +1767,12 @@ public class TrackingService extends Service implements LocationListener {
                 }
                 URL url = new URL(activeUrl);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST"); conn.setRequestProperty("Content-Type", "application/json"); conn.setConnectTimeout(15000); conn.setReadTimeout(15000); conn.setDoOutput(true);
+                conn.setRequestMethod("POST"); 
+                conn.setRequestProperty("Content-Type", "application/json"); 
+                conn.setConnectTimeout(15000); 
+                conn.setReadTimeout(15000); 
+                conn.setDoOutput(true);
+                conn.setRequestProperty("Connection", "close"); // ★ 优化：强制关闭长连接，防止休眠假死
 
                 long httpStart = System.currentTimeMillis();
                 try {
@@ -1774,20 +1782,27 @@ public class TrackingService extends Service implements LocationListener {
                     os.close();
                     int httpCode = conn.getResponseCode();
                     long httpCost = System.currentTimeMillis() - httpStart;
-                
+
                     if (httpCode == 200) {
-                        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream())); 
                         StringBuilder sb = new StringBuilder(); String line;
                         while ((line = br.readLine()) != null) sb.append(line);
                         br.close(); 
                         if (overrideUrl == null) parseResponse(new JSONObject(sb.toString())); 
                         success = true;
                         
-                        // ... 下面保留你原来的 locDesc 打印日志 ...
-                        
+                        String locDesc;
+                        if (loc != null) {
+                            long ageS = Math.max(0, (System.currentTimeMillis() - loc.getTime()) / 1000);
+                            locDesc = String.format(java.util.Locale.US, "lat=%.5f lng=%.5f acc=%dm age=%ds src=%s",
+                                    loc.getLatitude(), loc.getLongitude(), (int) loc.getAccuracy(), ageS,
+                                    loc.getProvider() != null ? loc.getProvider() : "?");
+                        } else {
+                            locDesc = "无定位";
+                        }
+                        FileLogger.log(TrackingService.this, "REPORT", "✅ 上报成功 " + locDesc + " (耗时 " + httpCost + "ms)");
                     } else {
                         FileLogger.log(TrackingService.this, "REPORT", "⚠️ 上报返回非200: HTTP " + httpCode + " (耗时 " + httpCost + "ms) | " + activeUrl);
-                        // 👈 新增：非 200 直接存离线队列
                         if (overrideUrl == null) queuePendingReport(json); 
                     }
                 } catch (Exception e) {
@@ -1797,20 +1812,20 @@ public class TrackingService extends Service implements LocationListener {
                     } else {
                         FileLogger.log(TrackingService.this, "REPORT", "❌ 上报异常: " + errMsg);
                     }
-                    // 👈 新增：发生超时或断流等异常，直接存离线队列
-                    if (overrideUrl == null) queuePendingReport(json);
+                    Log.e("TrackingService", "===== 上报失败啦 =====");
+                    Log.e("TrackingService", "目标URL: " + activeUrl);
+                    Log.e("TrackingService", "报错原因: " + e.toString());
+                    if (overrideUrl == null) queuePendingReport(json); 
                 } finally {
                     conn.disconnect();
+                }
             } catch (Exception e) {
                 String errMsg = e.getMessage();
                 if (errMsg != null && errMsg.contains("Unable to resolve host")) {
                     FileLogger.log(TrackingService.this, "REPORT", "❌ DNS 解析失败: " + errMsg);
                 } else {
-                    FileLogger.log(TrackingService.this, "REPORT", "❌ 上报异常: " + errMsg);
+                    FileLogger.log(TrackingService.this, "REPORT", "❌ 准备上报异常: " + errMsg);
                 }
-                Log.e("TrackingService", "===== 上报失败啦 =====");
-                Log.e("TrackingService", "目标URL: " + activeUrl);
-                Log.e("TrackingService", "报错原因: " + e.toString());
             } finally {
                 try {
                     if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
@@ -1836,7 +1851,7 @@ public class TrackingService extends Service implements LocationListener {
                     }
                 }
             }
-        }).start();
+        });
     }
 
     private void queuePendingReport(JSONObject json) {
@@ -1922,7 +1937,7 @@ public class TrackingService extends Service implements LocationListener {
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(15000);
             conn.setDoOutput(true);
-            conn.setRequestProperty("Connection", "close"); // 👈 新增这一行，通用优化，防假死
+            conn.setRequestProperty("Connection", "close"); 
             OutputStream os = conn.getOutputStream();
             os.write(json.toString().getBytes("UTF-8"));
             os.flush();
@@ -1991,6 +2006,7 @@ public class TrackingService extends Service implements LocationListener {
                 conn.setReadTimeout(30000);
                 conn.setDoOutput(true);
                 conn.setFixedLengthStreamingMode(gzipData.length);
+                conn.setRequestProperty("Connection", "close");
 
                 OutputStream os = conn.getOutputStream();
                 os.write(gzipData);
@@ -2067,10 +2083,19 @@ public class TrackingService extends Service implements LocationListener {
         lastConfigFetchTime = now;
         new Thread(() -> {
             try {
-                URL url = new URL(configUrl); HttpURLConnection conn = (HttpURLConnection) url.openConnection(); conn.setRequestMethod("GET"); conn.setConnectTimeout(5000); conn.setReadTimeout(5000);
+                URL url = new URL(configUrl); 
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection(); 
+                conn.setRequestMethod("GET"); 
+                conn.setConnectTimeout(5000); 
+                conn.setReadTimeout(5000);
+                conn.setRequestProperty("Connection", "close");
+                
                 if (conn.getResponseCode() == 200) {
-                    BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream())); StringBuilder sb = new StringBuilder(); String line;
-                    while ((line = br.readLine()) != null) sb.append(line); br.close();
+                    BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream())); 
+                    StringBuilder sb = new StringBuilder(); 
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line); 
+                    br.close();
                     String fetchedText = sb.toString().trim();
                     if (fetchedText.startsWith("MSG:")) { showFloatingMessage(fetchedText.substring(4).trim()); }
                     else if (fetchedText.startsWith("http") && !fetchedText.equals(getCurrentServerUrl())) { saveNewServerUrl(fetchedText); consecutiveFailures = 0; sendReport(true, true); }
@@ -2408,6 +2433,11 @@ public class TrackingService extends Service implements LocationListener {
         FileLogger.log(this, "SERVICE", "🛑 服务销毁");
 
         serviceDestroyed = true;
+        
+        // ★ 优化：关闭线程池
+        if (reportExecutor != null) {
+            reportExecutor.shutdownNow();
+        }
 
         if (rescueSocketRef != null) {
             try { rescueSocketRef.close(); } catch (Exception e) {
