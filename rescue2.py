@@ -73,6 +73,9 @@ RECEIVED_REPORTS = 0
 RECEIVED_LOGS = 0
 RECEIVER_OK = False
 UDP_OK = False
+# UDP 聊天消息去重（同一 sender+content 5 秒内只显示 1 次）
+_LAST_UDP_MSG = {}       # {(sender, content): timestamp}
+_LAST_UDP_MSG_TTL = 10   # 清理超过 10 秒的记录
 
 
 # ===== 环境检测 =====
@@ -203,12 +206,15 @@ def get_network_prefix(ip):
 
 # ===== UDP 发送 =====
 # [R4][R5] 子网广播发 3 次，单播发 2 次；UDP 丢包率不低，重试是必要成本
-def send_udp(command_str, target_ip="255.255.255.255", quiet=False):
+def send_udp(command_str, target_ip="255.255.255.255", quiet=False, no_retry=False):
     if not quiet:
         print(f"\n📡 发送指令至 {target_ip}: {command_str}")
 
     is_broadcast = (target_ip == "255.255.255.255") or target_ip.endswith(".255")
-    send_times = 3 if is_broadcast else 2
+    if no_retry:
+        send_times = 1                                    # ← 有副作用指令只发 1 次
+    else:
+        send_times = 3 if is_broadcast else 2
     gap = 0.5 if is_broadcast else 0.15
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -225,7 +231,7 @@ def send_udp(command_str, target_ip="255.255.255.255", quiet=False):
                 if send_times > 1:
                     print(f"   [{i+1}/{send_times}] 发送中...")
                 else:
-                    print(f"   [1/1] 发送成功 (单播模式)")
+                    print(f"   [1/1] 发送成功")
             if i < send_times - 1:
                 time.sleep(gap)
     finally:
@@ -303,12 +309,21 @@ def choose_target(prompt="🎯 选择目标 (编号/IP/回车广播): "):
         now = time.time()
         for i, (dev_id, info) in enumerate(dev_list, 1):
             ip = info.get("source_ip") or info.get("ip", "?")
-            batt = str(info.get("battery", "?")) + "%"
+            # 电量显示
+            batt_raw = info.get("battery")
+            batt = f"{batt_raw}%" if batt_raw is not None else "未上报"
+            # 时间显示：修复 -1分钟前
             last = max(info.get("last_seen", 0), info.get("last_log", 0), info.get("last_chat", 0))
-            ago = int(now - last) if last > 0 else -1
-            ago_str = (f"{ago}秒前" if 0 <= ago < 60 else
-                       f"{ago // 60}分钟前" if ago < 3600 else "")
-            print(f"  {i}. {dev_id:<26} ({ip:<15}) {batt:<5} {ago_str}")
+            if last > 0:
+                ago = max(0, int(now - last))
+                ago_str = (f"{ago}秒前" if ago < 60 else
+                           f"{ago // 60}分钟前" if ago < 3600 else
+                           f"{ago // 3600}小时前")
+            else:
+                ago_str = "从未"
+            # 仅 UDP 标记
+            tag = "" if info.get("last_seen", 0) > 0 else " [仅UDP]"
+            print(f"  {i}. {dev_id:<26} ({ip:<15}){tag:<10} {batt:<6} {ago_str}")
     else:
         dev_list = []
         print("\n📭 暂无已知设备（需先让手机上报一次，或先扫描局域网）")
@@ -499,6 +514,7 @@ def start_log_receiver():
 
 
 # ===== UDP 监听 =====
+# ===== UDP 监听 =====
 def udp_listener():
     global UDP_OK
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -517,6 +533,20 @@ def udp_listener():
                     if len(parts) == 4 and parts[1] == RESCUE_SECRET:
                         sender = parts[2]
                         content = parts[3]
+
+                        # [新增] 5 秒去重：手机发子网+全局共 2 包，只显示 1 条
+                        dedup_key = (sender, content)
+                        now_ts = time.time()
+                        if now_ts - _LAST_UDP_MSG.get(dedup_key, 0) < 5.0:
+                            continue
+                        _LAST_UDP_MSG[dedup_key] = now_ts
+
+                        # 记录数超过 100 时清理过期项
+                        if len(_LAST_UDP_MSG) > 100:
+                            cutoff = now_ts - _LAST_UDP_MSG_TTL
+                            for k in [k for k, v in _LAST_UDP_MSG.items() if v < cutoff]:
+                                _LAST_UDP_MSG.pop(k, None)
+
                         print(f"\n🗣️ [{sender}] {content}  (来自 {addr[0]})")
                         with _state_lock:
                             info = DISCOVERED_DEVICES.setdefault(sender, {})
@@ -548,16 +578,19 @@ def show_devices():
     for dev_id, info in devices.items():
         last = max(info.get("last_seen", 0), info.get("last_log", 0), info.get("last_chat", 0))
         if last > 0:
-            ago = int(now - last)
+            ago = max(0, int(now - last))
             ago_str = (f"{ago}秒前" if ago < 60 else
                        f"{ago // 60}分钟前" if ago < 3600 else
                        f"{ago // 3600}小时前" if ago < 86400 else "很久前")
         else:
-            ago_str = "-"
+            ago_str = "从未"
         ip = info.get("source_ip") or info.get("ip", "?")
-        batt = str(info.get("battery", "?")) + "%"
-        wifi = str(info.get("wifi", "?"))[:18]
-        print(f"{dev_id:<28} {ip:<16} {batt:<6} {wifi:<20} {ago_str:<10}")
+        batt_raw = info.get("battery")
+        batt = f"{batt_raw}%" if batt_raw is not None else "未上报"
+        wifi_raw = info.get("wifi")
+        wifi = str(wifi_raw)[:18] if wifi_raw else "未上报"
+        tag = "" if info.get("last_seen", 0) > 0 else " [仅UDP]"
+        print(f"{dev_id:<28} {ip:<16}{tag:<10} {batt:<8} {wifi:<20} {ago_str:<10}")
     print()
 
 
@@ -569,7 +602,7 @@ def status_line():
             latest = max(latest, info.get("last_seen", 0), info.get("last_log", 0), info.get("last_chat", 0))
 
     if latest > 0:
-        ago = int(time.time() - latest)
+        ago = max(0, int(time.time() - latest))
         ago_str = (f"{ago}秒前" if ago < 60 else
                    f"{ago // 60}分钟前" if ago < 3600 else
                    f"{ago // 3600}小时前")
@@ -577,10 +610,9 @@ def status_line():
         ago_str = "无"
 
     if is_termux():
-        return f"💡 {dev_count}台 | 收{'✅' if RECEIVER_OK else '❌'} | UDP{'✅' if UDP_OK else '❌'} | {ago_str}"
+        return f"💡 {dev_count}台 | 收{'✅' if RECEIVER_OK else '❌'} | UDP{'✅' if UDP_OK else '❌'} | 最近活动 {ago_str}"
     return (f"💡 设备 {dev_count} 台  |  接收端 {LOG_PORT} {'✅' if RECEIVER_OK else '❌'}"
-            f"  |  UDP {'✅' if UDP_OK else '❌'}  |  上次上报 {ago_str}")
-
+            f"  |  UDP {'✅' if UDP_OK else '❌'}  |  最近活动 {ago_str}")
 
 # ===== ARP 查询 3 级降级 =====
 def _try_ip_neigh(prefix):
@@ -786,12 +818,18 @@ def select_targets():
         now = time.time()
         for i, (dev_id, info) in enumerate(dev_list, 1):
             ip = info.get("source_ip") or info.get("ip", "?")
-            batt = str(info.get("battery", "?")) + "%"
-            wifi = str(info.get("wifi", "?"))[:16]
+            batt_raw = info.get("battery")
+            batt = f"{batt_raw}%" if batt_raw is not None else "未上报"
+            wifi_raw = info.get("wifi")
+            wifi = str(wifi_raw)[:16] if wifi_raw else "未上报"
             last = max(info.get("last_seen", 0), info.get("last_log", 0))
-            ago = int(now - last) if last > 0 else -1
-            ago_str = f"{ago}秒前" if 0 <= ago < 60 else (f"{ago // 60}分钟前" if ago < 3600 else "")
-            print(f"  {i}. {dev_id:<26} ({ip:<15}) {batt:<5} {wifi:<18} {ago_str}")
+            if last > 0:
+                ago = max(0, int(now - last))
+                ago_str = f"{ago}秒前" if ago < 60 else (f"{ago // 60}分钟前" if ago < 3600 else "")
+            else:
+                ago_str = "从未"
+            tag = "" if info.get("last_seen", 0) > 0 else " [仅UDP]"
+            print(f"  {i}. {dev_id:<26} ({ip:<15}){tag:<10} {batt:<8} {wifi:<18} {ago_str}")
     else:
         print("\n📭 当前没有已知设备")
         dev_list = []
@@ -841,11 +879,12 @@ def pull_logs_multi(target_ips, temp_url, clear_after):
     print(f"\n📡 向 {len(target_ips)} 台设备发送拉日志指令")
     print(f"   ⚠️ 手机必须亮屏，否则 HTTP 上传被限制")
     for ip in target_ips:
-        send_udp(cmd, ip, quiet=True)
+        # [关键] no_retry=True：拉日志只发 1 次，避免手机重复上传 2 份
+        send_udp(cmd, ip, quiet=True, no_retry=True)
         time.sleep(0.1)
 
-    print(f"⏳ 等待手机上传（最多 60 秒）...")
-    deadline = time.time() + 60
+    print(f"⏳ 等待手机上传（最多 30 秒）...")     # ← 60 → 30
+    deadline = time.time() + 30                   # ← 60 → 30
     received_ips = set()
 
     while time.time() < deadline:
@@ -864,6 +903,7 @@ def pull_logs_multi(target_ips, temp_url, clear_after):
     missing = [ip for ip in target_ips if ip not in received_ips]
     if missing:
         print(f"⚠️ 未响应: {', '.join(missing)}")
+        print(f"   可能原因：手机已切移动数据 / 锁屏 / 拉日志指令丢失")
 
 
 # ===== 二级菜单 =====
@@ -993,7 +1033,7 @@ def menu_d_diagnostic():
         elif c == '2':
             send_udp(f"FIND_ME_RESTART_UDP:{RESCUE_SECRET}", choose_target())
         elif c == '3':
-            send_udp(f"FIND_ME_TEST_LOW_BATTERY:{RESCUE_SECRET}", choose_target())
+            send_udp(f"FIND_ME_TEST_LOW_BATTERY:{RESCUE_SECRET}", choose_target(), no_retry=True)
         elif c == '4':
             periodic_probe(choose_target())
         elif c == '5':
@@ -1083,11 +1123,11 @@ def main():
             show_devices()
         elif choice == '5':
             print("\n⚠️ 手机将以最大音量播放 30 秒警报（静音/震动也会响）")
-            send_udp(f"FIND_ME_ALARM:{RESCUE_SECRET}", choose_target())
+            send_udp(f"FIND_ME_ALARM:{RESCUE_SECRET}", choose_target(), no_retry=True)
         elif choice == '6':
             chat = input("对讲消息内容: ").strip()
             if chat:
-                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:PC_Terminal:{chat}", choose_target())
+                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:PC_Terminal:{chat}", choose_target(), no_retry=True)
 
 
 if __name__ == "__main__":
