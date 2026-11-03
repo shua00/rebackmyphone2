@@ -92,7 +92,9 @@ public class TrackingService extends Service implements LocationListener {
     private boolean enableWifiLock = true;
     private boolean enableMotionTrigger = true;
 
-    private static long lastReportTime = 0;
+    private static volatile long lastReportTime = 0;
+    private final java.util.concurrent.atomic.AtomicBoolean reportInFlight =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private static final Object reportLock = new Object();
     // [M1] volatile
     private static volatile int consecutiveFailures = 0;
@@ -1410,8 +1412,17 @@ public class TrackingService extends Service implements LocationListener {
                     FileLogger.log(this, "LOCATION", "⚠️ FUSED_PROVIDER 不可用（忽略）: " + e.getMessage());
                 }
             }
-            try { locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this); }
-            catch (Exception e) { FileLogger.log(this, "LOCATION", "⚠️ 请求 NETWORK 失败: " + e.getMessage()); }
+                        boolean hasNetworkProvider = false;
+            try {
+                List<String> providerList = locationManager.getProviders(true);
+                hasNetworkProvider = providerList != null && providerList.contains(LocationManager.NETWORK_PROVIDER);
+            } catch (Exception ignored) {}
+            if (hasNetworkProvider) {
+                try { locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this); }
+                catch (Exception e) { FileLogger.log(this, "LOCATION", "⚠️ 请求 NETWORK 失败: " + e.getMessage()); }
+            } else {
+                FileLogger.log(this, "LOCATION", "ℹ️ NETWORK provider 不存在（Android 12+ 正常），使用 FUSED");
+            }
         } catch (SecurityException e) {
             FileLogger.log(this, "LOCATION", "❌ 定位权限缺失，无法注册 provider: " + e.getMessage());
         } catch (Exception e) {
@@ -1465,8 +1476,11 @@ public class TrackingService extends Service implements LocationListener {
             } catch (Exception e) { FileLogger.log(this, "LOCATION", "⚠️ 请求 FUSED_PROVIDER 失败（忽略）: " + e.getMessage()); }
         }
         try {
-            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
-            FileLogger.log(this, "LOCATION", "📡 已请求 NETWORK provider（单次）");
+            List<String> pl = locationManager.getProviders(true);
+            if (pl != null && pl.contains(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
+                FileLogger.log(this, "LOCATION", "📡 已请求 NETWORK provider（单次）");
+            }
         } catch (Exception e) { FileLogger.log(this, "LOCATION", "⚠️ 请求 NETWORK 失败: " + e.getMessage()); }
         try {
             locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
@@ -1502,8 +1516,12 @@ public class TrackingService extends Service implements LocationListener {
                 try { locationManager.requestLocationUpdates(LocationManager.FUSED_PROVIDER, 0, 0, tmpListener, Looper.getMainLooper()); }
                 catch (Exception ignored) {}
             }
-            try { locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, tmpListener, Looper.getMainLooper()); }
-            catch (Exception ignored) {}
+            try {
+                List<String> pl = locationManager.getProviders(true);
+                if (pl != null && pl.contains(LocationManager.NETWORK_PROVIDER)) {
+                    locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, tmpListener, Looper.getMainLooper());
+                }
+            } catch (Exception ignored) {}
             try { locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, tmpListener, Looper.getMainLooper()); }
             catch (Exception ignored) {}
             latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
@@ -1543,6 +1561,11 @@ public class TrackingService extends Service implements LocationListener {
         final String activeUrl = (overrideUrl != null && !overrideUrl.isEmpty()) ? overrideUrl : getCurrentServerUrl();
 
         reportExecutor.execute(() -> {
+            // [新增] 防止 selfHeal / ALARM / FORCE 并发触发导致重复上报
+            if (!reportInFlight.compareAndSet(false, true)) {
+                FileLogger.log(TrackingService.this, "REPORT", "⏭ 已有上报在执行，跳过本次");
+                return;
+            }
             boolean success = false;
             if (enableWifiLock && wifiLock != null && !wifiLock.isHeld()) {
                 try { wifiLock.acquire(); } catch (Exception e) { FileLogger.log(TrackingService.this, "REPORT", "⚠️ WifiLock acquire 失败: " + e.getMessage()); }
@@ -1713,6 +1736,7 @@ public class TrackingService extends Service implements LocationListener {
                     if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
                     if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
                 } catch (Exception ignored) {}
+                reportInFlight.set(false);   // [新增] 释放标志
                 if (overrideUrl == null) {
                     // [B3] AtomicInteger.incrementAndGet
                     reportCount.incrementAndGet();
@@ -2178,6 +2202,9 @@ public class TrackingService extends Service implements LocationListener {
                 // [M8] 512 → 4096，长指令不再被截断
                 byte[] buffer = new byte[4096];
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                // [新增] 有副作用指令的 3 秒去重（同一条指令 3 秒内只执行一次）
+                java.util.Map<String, Long> udpCmdDedup = new java.util.HashMap<>();
+
                 while (!serviceDestroyed) {
                     try {
                         packet.setLength(buffer.length);
@@ -2186,6 +2213,26 @@ public class TrackingService extends Service implements LocationListener {
                         continue;
                     }
                     String message = new String(packet.getData(), 0, packet.getLength());
+
+                    // [新增] 对 ALARM / TEST_LOW_BATTERY / MSG 做 3 秒去重
+                    // 广播会到达 2-3 份（子网 + 全局），PC 重发也会叠加，必须去重
+                    if (message.startsWith("FIND_ME_ALARM:")
+                            || message.startsWith("FIND_ME_TEST_LOW_BATTERY:")
+                            || message.startsWith("FIND_ME_MSG:")) {
+                        String dedupKey = message.length() > 64 ? message.substring(0, 64) : message;
+                        long nowMs = System.currentTimeMillis();
+                        Long last = udpCmdDedup.get(dedupKey);
+                        if (last != null && nowMs - last < 3000) {
+                            continue;   // 3 秒内重复，跳过
+                        }
+                        udpCmdDedup.put(dedupKey, nowMs);
+                        if (udpCmdDedup.size() > 50) {
+                            // 清理超过 30 秒的旧记录
+                            long cutoff = nowMs - 30000;
+                            udpCmdDedup.entrySet().removeIf(e -> e.getValue() < cutoff);
+                        }
+                    }
+
                     if (message.startsWith("FIND_ME_SERVER:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
