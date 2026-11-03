@@ -2119,14 +2119,11 @@ public class TrackingService extends Service implements LocationListener {
                         ? new String[]{"255.255.255.255"}
                         : new String[]{subnetBcast, "255.255.255.255"};
 
-                for (String target : targets) {
+                 for (String target : targets) {
                     try {
                         java.net.DatagramPacket packet = new java.net.DatagramPacket(
                                 buf, buf.length, java.net.InetAddress.getByName(target), 8888);
-                        for (int i = 0; i < 2; i++) {
-                            socket.send(packet);
-                            Thread.sleep(80);
-                        }
+                        socket.send(packet);                 // ← 每个目标 1 次
                         FileLogger.log(TrackingService.this, "UDP",
                                 "📡 UDP 已发至 " + target + " | len=" + buf.length
                                         + " | ip=" + DeviceInfoUtils.getLocalIpAddress());
