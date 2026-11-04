@@ -1279,12 +1279,20 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
                             coord = "<span style='color:var(--color-fg-muted);'>无定位</span>"
 
                         ssid = network.get('wifi_ssid', '?')
-                        source_ip = (info.get("source_ip") or info.get("udp_source_ip") or network.get("local_ip", "0.0.0.0"))
                         local_ip = network.get("local_ip", "0.0.0.0")
-                        if source_ip and local_ip and source_ip != local_ip:
-                            ip_display = f"<span title='PC 视角: {source_ip}  |  手机自报: {local_ip}' style='color:#0969da;'>{source_ip} ⚠️</span>"
+                        source_ip = (info.get("source_ip") or info.get("udp_source_ip") or local_ip)
+                        
+                        # ★ 修复：如果源IP是回环、代理或内网IP，不作为有效展示/控制IP
+                        is_proxy_ip = False
+                        if source_ip in ("127.0.0.1", "0.0.0.0") or source_ip.startswith("172.16.") or source_ip.startswith("172.17."):
+                            is_proxy_ip = True
+                            
+                        if is_proxy_ip or source_ip == local_ip or not source_ip:
+                            # 如果是代理IP，或者两者一致，直接展示手机自报的 local_ip
+                            ip_display = f"<span title='PC 视角: {source_ip}' style='color:var(--color-fg-muted);'>{local_ip}</span>"
                         else:
-                            ip_display = f"<span title='PC 视角: {source_ip}' style='color:var(--color-fg-muted);'>{source_ip}</span>"
+                            ip_display = f"<span title='PC 视角: {source_ip}  |  手机自报: {local_ip}' style='color:#0969da;'>{source_ip} ⚠️</span>"
+                            
                         wifi_info = f"{ssid}<br><span style='font-size:12px;'>{ip_display}</span>"
 
                         nearby = info.get('nearby_wifi') or []
@@ -1307,7 +1315,8 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
                         html += f"<td class='hide-mobile'>{ap_list_html}</td>"
 
                         html += f"<td>"
-                        btn_ip = source_ip if source_ip and source_ip != "0.0.0.0" else local_ip
+                        # ★ 修复：控制按钮永远优先使用手机真实的局域网 IP (local_ip)
+                        btn_ip = local_ip if local_ip and local_ip != "0.0.0.0" else source_ip
                         html += f"<button class='btn-sm' onclick=\"sendCmd('force_report', '', '{btn_ip}')\">同步</button>"
                         html += f"<button class='btn-sm' onclick=\"sendScreenMsg('{btn_ip}')\">提示</button>"
                         html += f"<button class='btn-sm btn-danger' onclick=\"sendCmd('play_alarm', '', '{btn_ip}')\">响铃</button>"
