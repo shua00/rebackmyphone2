@@ -559,9 +559,18 @@ def offline_detector():
                     last_seen = info.get('received_at', 0)
                     gap_min = (now - last_seen) // 60000
                     already_alerted = info.get('offline_alerted', False)
+                    
                     if gap_min > 120 and not already_alerted:
                         info['offline_alerted'] = True
                         print(f"\n🚨 【失联告警】{dev_id} 已 {gap_min // 60} 小时 {gap_min % 60} 分钟未上报！")
+                        
+                        # ★ 新增：给失联设备排队强制唤醒指令 2026-11-04 13:42
+                        # 这样只要它哪怕只有 1 秒钟的清醒并发了 HTTP 请求，就会立刻拿到指令去重置 UDP
+                        if dev_id in HTTP_SUPPORTED_ACTIONS: pass # 避免误判
+                        enqueue_command(dev_id, "force_report", "")
+                        enqueue_command(dev_id, "restart_udp", "")
+                        print(f"📋 [兜底] 已为 {dev_id} 排队 force_report 和 restart_udp 指令")
+                        
                     elif gap_min <= 120 and already_alerted:
                         info['offline_alerted'] = False
                         print(f"\n✅ 【恢复】{dev_id} 已恢复上报")
