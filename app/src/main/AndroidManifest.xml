@@ -1,4 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 
+======================================================================
+  AndroidManifest.xml 修改记录 (2026-11-04)
+  1. 新增 FOREGROUND_SERVICE_DATA_SYNC 权限，适配 Android 14+ 降级机制。
+  2. TrackingService 增加 dataSync 前台类型，防止 Android 14+ 降级时闪退。
+  3. 移除 NEARBY_WIFI_DEVICES 的 neverForLocation 标记，防止极端情况下 BSSID 被系统脱敏。
+======================================================================
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.devicefinder">
 
@@ -7,21 +15,27 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-    <!--修复新增MULTICAST权限20261103-->
+    
+    <!-- UDP 广播/组播本地自救所必须的 Multicast 权限 (20261103) -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
-    <!-- WiFi 扫描（Android 13+ 必须，否则 startScan 永远返回 false / 空结果） -->
-    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
-        android:usesPermissionFlags="neverForLocation" />
+    
+    <!-- ★ [修复] 2026-11-04 移除 neverForLocation，确保后台 WiFi 扫描结果不被系统沙盒强制脱敏（保障后端 WiFi 定位准确） -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+    
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     
-     <!-- 新增动态启用/禁用组件（隐藏图标）必须声明的权限 -->
+    <!-- 动态启用/禁用组件（隐藏图标别名）必须声明的权限 -->
     <uses-permission android:name="android.permission.CHANGE_COMPONENT_ENABLED_STATE" />
 
     <!-- 前台服务与保活 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    
+    <!-- ★ [修复] 2026-11-04 增补 Android 14+ 核心前台 dataSync 权限，对应 Java 代码 startForeground 失败时的容错降级 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -42,14 +56,17 @@
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
         <!-- 核心追踪服务 -->
+        <!-- ★ [修复] 2026-11-04 修改为 foregroundServiceType="location|dataSync"。
+             完美适配 Java 层 startForeground 的 dataSync 降级机制，防止 Android 14+ 闪退 -->
         <service
             android:name=".TrackingService"
             android:enabled="true"
             android:exported="false"
             android:stopWithTask="false"
-            android:foregroundServiceType="location" />
-         <!-- 新增 JobService 声明 2026110413.27-->
-         <service
+            android:foregroundServiceType="location|dataSync" />
+
+        <!-- 保活 JobService 声明 (20261104 13:27) -->
+        <service
             android:name=".KeepAliveJobService"
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="false" />
@@ -76,7 +93,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- 低版本网络恢复 -->
+        <!-- 低版本网络恢复广播（注：仅对 Android 7.0 以下生效，高版本由 NetworkCallback 接管） -->
         <receiver
             android:name=".LegacyNetworkReceiver"
             android:enabled="true"
@@ -86,7 +103,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- 设备管理器（防卸载） -->
+        <!-- 设备管理器（防普通手段轻松卸载） -->
         <receiver
             android:name=".MyDeviceAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
@@ -99,7 +116,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- 短信指令接收 -->
+        <!-- 短信指令接收器 -->
         <receiver
             android:name=".SmsReceiver"
             android:enabled="true"
@@ -145,7 +162,7 @@
             </intent-filter>
         </activity>
 
-        <!-- 桌面启动别名（用于隐藏图标） -->
+        <!-- 桌面启动别名（供 LauncherIconUtils 动态显示/隐藏图标） -->
         <activity-alias
             android:name=".VisibleAliasActivity"
             android:enabled="true"
