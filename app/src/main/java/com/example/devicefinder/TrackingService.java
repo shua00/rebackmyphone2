@@ -385,6 +385,17 @@ public class TrackingService extends Service implements LocationListener {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+
+        // ★ 新增：STICKY 重启 / onTaskRemoved 兜底重启时 intent 或 action 可能为 null 2026-11-04 22:00
+        //    （例如 onTaskRemoved 里 restartServiceIntent 未 setAction，1 秒后触发时 action==null）
+        //    此时 onCreate 的 startForegroundNotification() 已执行，但需要打日志方便诊断 + 再兜底一次。
+        if (intent == null || intent.getAction() == null) {
+            FileLogger.log(this, "SERVICE",
+                    "🔄 STICKY 重启（intent=" + (intent == null ? "null" : "no-action") + "），重建前台通知");
+            try { startForegroundNotification(); } catch (Exception ignored) {}
+            return START_STICKY;
+        }
+        
         if (intent != null) {
             String action = intent.getAction();
             if (action != null) FileLogger.log(this, "SERVICE", "📥 onStartCommand action=" + action);
@@ -551,6 +562,13 @@ public class TrackingService extends Service implements LocationListener {
                 showSelfCheckNotification();
             }
         }
+
+        // ★ 新增：任何 action 处理完后，兜底确保自己是前台服务 2026-11-04 22:00
+        //    startForegroundNotification() 内部已有 try-catch 双层降级，重复调用幂等且无副作用。
+        //    覆盖 ACTION_ALARM_TRIGGER / ACTION_JOB_WAKE_UP / ACTION_SECRET_UNLOCK / ACTION_PLAY_ALARM
+        //    等原先缺少前台兜底的分支，防止被系统降级为后台普通 service。
+        try { startForegroundNotification(); } catch (Exception ignored) {}
+        
         return START_STICKY;
     }
 
