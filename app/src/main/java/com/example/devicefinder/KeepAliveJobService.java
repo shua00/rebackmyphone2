@@ -17,9 +17,9 @@ public class KeepAliveJobService extends JobService {
     public boolean onStartJob(JobParameters params) {
         FileLogger.log(this, "JOB", "⏰ JobScheduler 唤醒，检查服务状态");
         
-        // 尝试拉起 TrackingService
+        // 尝试拉起 TrackingService (注意：不要用 ACTION_KEEP_ALIVE，避免和 Alarm 逻辑混淆)
         Intent intent = new Intent(this, TrackingService.class);
-        intent.setAction("ACTION_KEEP_ALIVE"); // 复用你的保活 Action
+        intent.setAction("ACTION_JOB_WAKE_UP"); 
         
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -31,10 +31,9 @@ public class KeepAliveJobService extends JobService {
             FileLogger.log(this, "JOB", "❌ 拉起服务失败: " + e.getMessage());
         }
 
-        // 任务执行完毕，重新调度自己（防止被打断后不执行）
-        scheduleJob(this);
-        jobFinished(params, false); // false 表示不需要系统重试，我们自己接管调度
-        return true;
+        // ★ 修复1：删除了 scheduleJob(this) 重新注册的代码
+        // ★ 修复2：不需要调用 jobFinished，直接返回 false 表示任务已完成，系统无需保持唤醒锁。
+        return false; 
     }
 
     @Override
@@ -49,8 +48,13 @@ public class KeepAliveJobService extends JobService {
         JobScheduler jobScheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
         if (jobScheduler == null) return;
 
-        // 取消旧的同 ID 任务，防止重复
-        jobScheduler.cancel(JOB_ID);
+        // ★ 修复3：先检查 Job 是否已经存在，避免重复注册/取消导致死循环
+        for (JobInfo job : jobScheduler.getAllPendingJobs()) {
+            if (job.getId() == JOB_ID) {
+                FileLogger.log(context, "JOB", "ℹ️ JobScheduler 已存在，跳过重复注册");
+                return;
+            }
+        }
 
         JobInfo.Builder builder = new JobInfo.Builder(JOB_ID, new ComponentName(context, KeepAliveJobService.class));
         
