@@ -104,6 +104,7 @@ public class TrackingService extends Service implements LocationListener {
     private static String lastReceivedMsg = "";
     private static long lastReceivedMsgTime = 0;
 
+    // ★ [修复] 2026-11-04 AI 将 URL 截断了，已恢复为你实际使用的后端接口
     private static String defaultServerUrl = "http://dingwei.bai001.de5.net/api/report";
     private static final String DEFAULT_REMOTE_CONFIG_URL = "https://your-config-url.com/config.txt";
     private static final String AUTH_TOKEN = "your_private_secret_key";
@@ -125,8 +126,12 @@ public class TrackingService extends Service implements LocationListener {
     private volatile DatagramSocket rescueSocketRef = null;
     private final Object rescueLock = new Object();
     
-    // ★ 新增：看门狗成员 2026-11-04 14:10
+    // 看门狗线程
     private Thread watchdogThread;
+
+    // ★ [核心优化] 2026-11-04 全局同步锁与键值，用于持久化“上次成功上报时间”，解决冷启动看门狗失效问题
+    private static final Object FILE_LOCK = new Object();
+    private static final String PREF_LAST_SUCCESS_REPORT_TIME = "last_success_report_time";
 
     // ==================== [HTTP下行] 字段区 ====================
     private static final String PREF_EXECUTED_CMD_IDS = "executed_cmd_ids";
@@ -151,7 +156,6 @@ public class TrackingService extends Service implements LocationListener {
     private long lastLocationLogTime = 0;
     private static long lastOnTaskRemovedTime = 0;
     private static final long ON_TASK_REMOVED_THROTTLE_MS = 10 * 60 * 1000L;
-    private static volatile long lastSuccessReportTime = 0;
     private static final String PENDING_REPORTS_FILE = "pending_reports.jsonl";
     private static final long PENDING_QUEUE_MAX_BYTES = 1024 * 1024;
 
@@ -210,12 +214,10 @@ public class TrackingService extends Service implements LocationListener {
 
         handler.postDelayed(this::flushPendingReports, 5000);
         
-        // ★ 新增：注册 JobScheduler 和启动看门狗 2026-11-04 14:12
         KeepAliveJobService.scheduleJob(this);
         startWatchdog();
     }
 
-    // ★ 新增：看门狗启动方法 2026-11-04 14:13
     private void startWatchdog() {
         if (watchdogThread != null && watchdogThread.isAlive()) return;
         watchdogThread = new Thread(() -> {
@@ -225,10 +227,14 @@ public class TrackingService extends Service implements LocationListener {
                     if (serviceDestroyed) break;
                     
                     long now = System.currentTimeMillis();
-                    // 如果距离上次成功上报超过 1 小时，强制拉活
-                    if (lastSuccessReportTime > 0 && (now - lastSuccessReportTime > 60 * 60 * 1000L)) {
+                    SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+                    long lastSuccess = sp.getLong(PREF_LAST_SUCCESS_REPORT_TIME, 0);
+
+                    // ★ [核心优化] 2026-11-04 冷启动时lastSuccess从 SharedPreferences 读取，确保看门狗时刻在线
+                    if (lastSuccess > 0 && (now - lastSuccess > 60 * 60 * 1000L)) {
                         FileLogger.log(this, "WATCHDOG", "⚠️ 发现超 1 小时未成功上报，强制触发自救");
-                        sendReport(true, true); // <--- 去掉 handler.post，直接调用（内部已是线程池异步）2026-11-04 22:40
+                        // ★ [优化] 去掉 handler.post 冗余线程切换，因为 sendReport 内部自带线程池
+                        sendReport(true, true); 
                     }
                 } catch (InterruptedException e) {
                     break;
@@ -243,7 +249,6 @@ public class TrackingService extends Service implements LocationListener {
     private void logStartupSelfCheck() {
         try {
             FileLogger.log(this, "SERVICE", "===== 启动自检 =====");
-
             String rom = Build.DISPLAY != null ? Build.DISPLAY : "unknown";
             FileLogger.log(this, "SERVICE", "设备: " + Build.MANUFACTURER + " " + Build.MODEL
                     + " | Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
@@ -385,19 +390,18 @@ public class TrackingService extends Service implements LocationListener {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // ★ [新增] 2026-11-05 第一时间归类唤醒源，便于排查是谁救了服务
+        logWakeSource(intent);
 
-        // ★ 新增：STICKY 重启 / onTaskRemoved 兜底重启时 intent 或 action 可能为 null 2026-11-04 22:00
-        //    （例如 onTaskRemoved 里 restartServiceIntent 未 setAction，1 秒后触发时 action==null）
-        //    此时 onCreate 的 startForegroundNotification() 已执行，但需要打日志方便诊断 + 再兜底一次。
-        // ★ 修改 1：加入 selfHeal()，确保侧滑退出拉起后，UDP 监听和定位等能重新复活 2026-11-04 22:40
+        // ★ [核心优化] 2026-11-04 修复了无 Action 时（侧滑退出重启）不执行自愈逻辑的 Bug
         if (intent == null || intent.getAction() == null) {
             FileLogger.log(this, "SERVICE",
                     "🔄 STICKY/无Action重启（intent=" + (intent == null ? "null" : "no-action") + "），触发兜底自愈");
             try { startForegroundNotification(); } catch (Exception ignored) {}
-            selfHeal(); // <--- 新增这一句
+            selfHeal(); // 关键：恢复被杀的监听和定位等
             return START_STICKY;
         }
-        
+
         if (intent != null) {
             String action = intent.getAction();
             if (action != null) FileLogger.log(this, "SERVICE", "📥 onStartCommand action=" + action);
@@ -491,12 +495,23 @@ public class TrackingService extends Service implements LocationListener {
                 selfHeal();
                 scheduleKeepAliveJob();
                 
-            // ★ 修改 2：新增对 JobScheduler 唤醒的专门处理 2026-11-04 22:40
+            // ★ [核心优化] 2026-11-04 新增独立分支处理 JobScheduler 唤醒，避免和 Alarm 冲突
             } else if ("ACTION_JOB_WAKE_UP".equals(action)) {
                 long uptimeMin = (SystemClock.elapsedRealtime() - serviceCreateTimeMs) / 60000;
                 FileLogger.log(this, "JOB", "💓 JobScheduler 保底唤醒 (已运行 " + uptimeMin + " 分钟)");
-                // 仅触发自愈检查，绝不重新 schedule 闹钟，避免和 ACTION_KEEP_ALIVE 冲突
-                selfHeal(); 
+                // 仅触发自愈检查，绝不重新 schedule 闹钟
+                selfHeal();
+                
+            // ★ [新增] 2026-11-05 无障碍服务唤醒入口
+            } else if ("ACTION_WAKE_BY_ACCESSIBILITY".equals(action)) {
+                long uptimeMin = (SystemClock.elapsedRealtime() - serviceCreateTimeMs) / 60000;
+                FileLogger.log(this, "ACCESSIBILITY", "♿ 无障碍唤醒，执行自愈 (已运行 " + uptimeMin + " 分钟)");
+                selfHeal();
+                
+            // ★ [新增] 2026-11-05 组件自救唤醒入口（预留，配套 AlarmManager 兜底使用）
+            } else if ("ACTION_WAKE_BY_COMPONENT_SELF_HEAL".equals(action)) {
+                FileLogger.log(this, "SERVICE", "🔄 组件自救唤醒，执行自愈");
+                selfHeal();
                 
             } else if ("ACTION_LOCK_CHAT".equals(action)) {
                 setChatLocked(true);
@@ -541,6 +556,7 @@ public class TrackingService extends Service implements LocationListener {
             } else if ("ACTION_SCAN_WIFI".equals(action)) {
                 new Thread(() -> {
                     try {
+                        // ★ [修复] 2026-11-04 补全 AI 丢失的泛型 List<JSONObject>
                         List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(TrackingService.this);
                         FileLogger.log(TrackingService.this, "WIFI", "📡 手动扫描完成: " + nearby.size() + " 个热点");
                         for (JSONObject obj : nearby) {
@@ -573,13 +589,42 @@ public class TrackingService extends Service implements LocationListener {
             }
         }
 
-        // ★ 新增：任何 action 处理完后，兜底确保自己是前台服务 2026-11-04 22:00
-        //    startForegroundNotification() 内部已有 try-catch 双层降级，重复调用幂等且无副作用。
-        //    覆盖 ACTION_ALARM_TRIGGER / ACTION_JOB_WAKE_UP / ACTION_SECRET_UNLOCK / ACTION_PLAY_ALARM
-        //    等原先缺少前台兜底的分支，防止被系统降级为后台普通 service。
         try { startForegroundNotification(); } catch (Exception ignored) {}
-        
         return START_STICKY;
+    }
+
+    // ==================== 唤醒源日志归类 (2026-11-05 新增) ====================
+    private void logWakeSource(Intent intent) {
+        String source = "未知原因唤醒/冷启动";
+        if (intent != null) {
+            String action = intent.getAction();
+            if (action != null) {
+                switch (action) {
+                    case "ACTION_WAKE_BY_ACCESSIBILITY":
+                        source = "♿ [无障碍服务] 强力注入拉活";
+                        break;
+                    case "ACTION_WAKE_BY_COMPONENT_SELF_HEAL":
+                        source = "🔄 [组件自救] 侧滑销毁瞬间就地复活";
+                        break;
+                    case "ACTION_JOB_WAKE_UP":
+                        source = "⏰ [JobScheduler] 定期保底拉活";
+                        break;
+                    case "ACTION_KEEP_ALIVE":
+                        source = "💓 [Alarm保活闹钟] 15分钟心跳复活";
+                        break;
+                    case "ACTION_ALARM_TRIGGER":
+                        source = "⏰ [上报闹钟] 定时任务主动唤醒";
+                        break;
+                    case "ACTION_HEARTBEAT":
+                        source = "💓 [长心跳] 6小时保底业务唤醒";
+                        break;
+                    default:
+                        source = "📥 业务动作 Action: " + action;
+                        break;
+                }
+            }
+        }
+        FileLogger.log(this, "WAKE_SOURCE", "🚩 当前服务启动源: " + source);
     }
 
     private void selfHeal() {
@@ -611,8 +656,11 @@ public class TrackingService extends Service implements LocationListener {
                 registerNetworkCallback();
             }
 
-            if (lastSuccessReportTime > 0 && System.currentTimeMillis() - lastSuccessReportTime > 30 * 60 * 1000L) {
-                long gapMin = (System.currentTimeMillis() - lastSuccessReportTime) / 60000;
+            // ★ [核心优化] 2026-11-04 从 SharedPreferences 读取持久化的成功上报时间
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            long lastSuccess = sp.getLong(PREF_LAST_SUCCESS_REPORT_TIME, 0);
+            if (lastSuccess > 0 && System.currentTimeMillis() - lastSuccess > 30 * 60 * 1000L) {
+                long gapMin = (System.currentTimeMillis() - lastSuccess) / 60000;
                 FileLogger.log(this, "SERVICE", "⚠️ 自愈: 距上次成功上报 " + gapMin + " 分钟，强制触发一次");
                 sendReport(true, false);
             }
@@ -800,6 +848,8 @@ public class TrackingService extends Service implements LocationListener {
                     scrollView.setLayoutParams(lp2);
                 });
 
+                // ★ [修复] 2026-11-04 按照你的要求，恢复长按复制功能。
+                // 注意：极少数老旧机型可能因焦点问题在特殊操作下闪退，若以后发现异常，请改回 false
                 textView.setTextIsSelectable(true);
                 textView.setFocusable(true);
                 textView.setFocusableInTouchMode(true);
@@ -1016,8 +1066,12 @@ public class TrackingService extends Service implements LocationListener {
                 sb.append("电量：").append(battery[0]).append("%（").append(battery[1] == 1 ? "充电中" : "未充电").append("）\n");
             } catch (Exception ignored) {}
             sb.append("上报间隔：").append(reportIntervalMs / 60000).append(" 分钟\n");
-            if (lastSuccessReportTime > 0) {
-                long gapMin = (System.currentTimeMillis() - lastSuccessReportTime) / 60000;
+            
+            // ★ [核心优化] 2026-11-04 从 SharedPreferences 读取持久化时间
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            long lastSuccess = sp.getLong(PREF_LAST_SUCCESS_REPORT_TIME, 0);
+            if (lastSuccess > 0) {
+                long gapMin = (System.currentTimeMillis() - lastSuccess) / 60000;
                 sb.append("上次成功上报：").append(gapMin).append(" 分钟前");
             } else sb.append("上次成功上报：本次启动后暂无");
 
@@ -1308,21 +1362,27 @@ public class TrackingService extends Service implements LocationListener {
         notification.priority = Notification.PRIORITY_MIN;
 
         // ★ 修改：startForeground 增加容错降级 2026-11-04 14:15
+        // ★ [修复] 2026-11-04 Android 14+ 不带类型的 startForeground 会被系统直接禁止
+        //   降级必须用 dataSync 类型，不能退回无类型调用。
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10+ 统一带 LOCATION 类型
                 startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
             } else {
                 startForeground(1001, notification);
             }
         } catch (Exception e) {
             FileLogger.log(this, "SERVICE", "❌ 带 location type 的 startForeground 失败: " + e.getMessage());
-            // ★ 新增：降级处理（去掉 type 再试一次），防止直接闪退
-            try { 
-                startForeground(1001, notification); 
-            } catch (Exception e2) { 
-                FileLogger.log(this, "SERVICE", "❌❌ startForeground 彻底失败: " + e2.getMessage()); 
+            // ★ 降级尝试：使用 dataSync 类型（Manifest 已声明 location|dataSync 双类型）
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                } else {
+                    startForeground(1001, notification);
+                }
+                FileLogger.log(this, "SERVICE", "✅ 已降级为 dataSync 类型前台服务");
+            } catch (Exception e2) {
+                FileLogger.log(this, "SERVICE", "❌❌ 所有类型均失败，服务可能被系统清理: " + e2.getMessage());
             }
         }
     }
@@ -1795,7 +1855,9 @@ public class TrackingService extends Service implements LocationListener {
 
             if (success) {
                 consecutiveFailures = 0;
-                lastSuccessReportTime = System.currentTimeMillis();
+                // ★ [核心优化] 2026-11-04 将成功时间写入 SharedPreferences，持久化状态，防进程被杀看门狗失效
+                getSharedPreferences("device_finder_prefs", MODE_PRIVATE)
+                        .edit().putLong(PREF_LAST_SUCCESS_REPORT_TIME, System.currentTimeMillis()).apply();
                 fetchRemoteConfig();
             } else {
                 if (overrideUrl == null) {
@@ -1864,20 +1926,23 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void queuePendingReport(JSONObject json) {
-        try {
-            java.io.File dir = getExternalFilesDir(null);
-            if (dir == null) return;
-            java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
-            if (queueFile.exists() && queueFile.length() > PENDING_QUEUE_MAX_BYTES) {
-                FileLogger.log(this, "REPORT", "⚠️ 离线队列已满，裁剪保留最近 100 条");
-                truncateQueueFile(queueFile, 100);
+        // ★ [修复] 2026-11-04 并发保护：写入文件必须与 flushPendingReports 互斥
+        synchronized (FILE_LOCK) {
+            try {
+                java.io.File dir = getExternalFilesDir(null);
+                if (dir == null) return;
+                java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
+                if (queueFile.exists() && queueFile.length() > PENDING_QUEUE_MAX_BYTES) {
+                    FileLogger.log(this, "REPORT", "⚠️ 离线队列已满，裁剪保留最近 100 条");
+                    truncateQueueFile(queueFile, 100);
+                }
+                java.io.FileWriter fw = new java.io.FileWriter(queueFile, true);
+                fw.write(json.toString() + "\n");
+                fw.close();
+                FileLogger.log(this, "REPORT", "📥 离线排队一条上报（队列 " + (queueFile.length() / 1024) + "KB）");
+            } catch (Exception e) {
+                FileLogger.log(this, "REPORT", "❌ 离线排队失败: " + e.getMessage());
             }
-            java.io.FileWriter fw = new java.io.FileWriter(queueFile, true);
-            fw.write(json.toString() + "\n");
-            fw.close();
-            FileLogger.log(this, "REPORT", "📥 离线排队一条上报（队列 " + (queueFile.length() / 1024) + "KB）");
-        } catch (Exception e) {
-            FileLogger.log(this, "REPORT", "❌ 离线排队失败: " + e.getMessage());
         }
     }
 
@@ -1897,58 +1962,64 @@ public class TrackingService extends Service implements LocationListener {
 
     private void flushPendingReports() {
         new Thread(() -> {
-            java.io.BufferedReader br = null;
-            try {
-                java.io.File dir = getExternalFilesDir(null);
-                if (dir == null) return;
-                java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
-                if (!queueFile.exists() || queueFile.length() == 0) return;
+            // ★ [修复] 2026-11-04 整个读取-发送-重写流程统一使用文件锁保护，
+            //   避免 queuePendingReport 并发写入导致文件内容错乱或截断。
+            //   锁粒度可以接受：文件通常 <1MB，网络请求在 reportExecutor 之外，
+            //   即使持锁 15 秒（超时最长），也只是让零星的新追加写入稍等，不影响 UI。
+            synchronized (FILE_LOCK) {
+                java.io.BufferedReader br = null;
+                try {
+                    java.io.File dir = getExternalFilesDir(null);
+                    if (dir == null) return;
+                    java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
+                    if (!queueFile.exists() || queueFile.length() == 0) return;
 
-                java.util.List<String> lines = new java.util.ArrayList<>();
-                br = new java.io.BufferedReader(new java.io.FileReader(queueFile));
-                String line;
-                while ((line = br.readLine()) != null) lines.add(line);
-                br.close();
-                br = null;
+                    java.util.List<String> lines = new java.util.ArrayList<>();
+                    br = new java.io.BufferedReader(new java.io.FileReader(queueFile));
+                    String line;
+                    while ((line = br.readLine()) != null) lines.add(line);
+                    br.close();
+                    br = null;
 
-                if (lines.isEmpty()) {
-                    queueFile.delete();
-                    return;
-                }
+                    if (lines.isEmpty()) {
+                        queueFile.delete();
+                        return;
+                    }
 
-                String serverUrl = getCurrentServerUrl();
-                int sent = 0;
-                for (String l : lines) {
-                    try {
-                        JSONObject json = new JSONObject(l);
-                        if (postReportDirectly(json, serverUrl)) {
+                    String serverUrl = getCurrentServerUrl();
+                    int sent = 0;
+                    for (String l : lines) {
+                        try {
+                            JSONObject json = new JSONObject(l);
+                            if (postReportDirectly(json, serverUrl)) {
+                                sent++;
+                            } else {
+                                break;
+                            }
+                        } catch (Exception parseEx) {
                             sent++;
-                        } else {
-                            break;
                         }
-                    } catch (Exception parseEx) {
-                        sent++;
                     }
-                }
 
-                if (sent >= lines.size()) {
-                    queueFile.delete();
-                } else if (sent > 0) {
-                    java.io.FileWriter fw = new java.io.FileWriter(queueFile, false);
-                    for (int i = sent; i < lines.size(); i++) {
-                        fw.write(lines.get(i) + "\n");
+                    if (sent >= lines.size()) {
+                        queueFile.delete();
+                    } else if (sent > 0) {
+                        java.io.FileWriter fw = new java.io.FileWriter(queueFile, false);
+                        for (int i = sent; i < lines.size(); i++) {
+                            fw.write(lines.get(i) + "\n");
+                        }
+                        fw.close();
                     }
-                    fw.close();
-                }
 
-                int remain = lines.size() - sent;
-                if (sent > 0 || remain > 0) {
-                    FileLogger.log(this, "REPORT", "📤 离线队列补发: 成功 " + sent + " 条，剩余 " + remain + " 条");
+                    int remain = lines.size() - sent;
+                    if (sent > 0 || remain > 0) {
+                        FileLogger.log(this, "REPORT", "📤 离线队列补发: 成功 " + sent + " 条，剩余 " + remain + " 条");
+                    }
+                } catch (Exception e) {
+                    FileLogger.log(this, "REPORT", "⚠️ 离线队列补发异常: " + e.getMessage());
+                } finally {
+                    if (br != null) { try { br.close(); } catch (Exception ignored) {} }
                 }
-            } catch (Exception e) {
-                FileLogger.log(this, "REPORT", "⚠️ 离线队列补发异常: " + e.getMessage());
-            } finally {
-                if (br != null) { try { br.close(); } catch (Exception ignored) {} }
             }
         }).start();
     }
@@ -1969,7 +2040,12 @@ public class TrackingService extends Service implements LocationListener {
             os.flush();
             os.close();
             int code = conn.getResponseCode();
-            if (code == 200) { lastSuccessReportTime = System.currentTimeMillis(); return true; }
+            if (code == 200) { 
+                // ★ [核心优化] 2026-11-04 补发成功也更新持久化时间
+                getSharedPreferences("device_finder_prefs", MODE_PRIVATE)
+                        .edit().putLong(PREF_LAST_SUCCESS_REPORT_TIME, System.currentTimeMillis()).apply();
+                return true; 
+            }
             return false;
         } catch (Exception e) {
             return false;
@@ -2459,7 +2535,6 @@ public class TrackingService extends Service implements LocationListener {
 
                 // ★ 修改：指数退避无限重试 2026-11-04 14:20
                 if (!serviceDestroyed) {
-                    // 5s, 15s, 45s, 120s, 最长 300s
                     long retryDelayMs = (long) Math.min(300000, 5000 * Math.pow(3, Math.min(udpBindFailCount, 4)));
                     FileLogger.log(this, "UDP", "监听断开，将在 " + (retryDelayMs / 1000) + " 秒后尝试第 " + (udpBindFailCount + 1) + " 次重连...");
                     
@@ -2780,7 +2855,6 @@ public class TrackingService extends Service implements LocationListener {
         FileLogger.log(this, "SERVICE", "🛑 服务销毁");
         serviceDestroyed = true;
 
-        // ★ 新增：中断看门狗线程 2026-11-04 14:25
         if (watchdogThread != null) {
             watchdogThread.interrupt();
             watchdogThread = null;
