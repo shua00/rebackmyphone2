@@ -228,7 +228,7 @@ public class TrackingService extends Service implements LocationListener {
                     // 如果距离上次成功上报超过 1 小时，强制拉活
                     if (lastSuccessReportTime > 0 && (now - lastSuccessReportTime > 60 * 60 * 1000L)) {
                         FileLogger.log(this, "WATCHDOG", "⚠️ 发现超 1 小时未成功上报，强制触发自救");
-                        handler.post(() -> sendReport(true, true)); 
+                        sendReport(true, true); // <--- 去掉 handler.post，直接调用（内部已是线程池异步）2026-11-04 22:40
                     }
                 } catch (InterruptedException e) {
                     break;
@@ -389,10 +389,12 @@ public class TrackingService extends Service implements LocationListener {
         // ★ 新增：STICKY 重启 / onTaskRemoved 兜底重启时 intent 或 action 可能为 null 2026-11-04 22:00
         //    （例如 onTaskRemoved 里 restartServiceIntent 未 setAction，1 秒后触发时 action==null）
         //    此时 onCreate 的 startForegroundNotification() 已执行，但需要打日志方便诊断 + 再兜底一次。
+        // ★ 修改 1：加入 selfHeal()，确保侧滑退出拉起后，UDP 监听和定位等能重新复活 2026-11-04 22:40
         if (intent == null || intent.getAction() == null) {
             FileLogger.log(this, "SERVICE",
-                    "🔄 STICKY 重启（intent=" + (intent == null ? "null" : "no-action") + "），重建前台通知");
+                    "🔄 STICKY/无Action重启（intent=" + (intent == null ? "null" : "no-action") + "），触发兜底自愈");
             try { startForegroundNotification(); } catch (Exception ignored) {}
+            selfHeal(); // <--- 新增这一句
             return START_STICKY;
         }
         
@@ -488,6 +490,14 @@ public class TrackingService extends Service implements LocationListener {
 
                 selfHeal();
                 scheduleKeepAliveJob();
+                
+            // ★ 修改 2：新增对 JobScheduler 唤醒的专门处理 2026-11-04 22:40
+            } else if ("ACTION_JOB_WAKE_UP".equals(action)) {
+                long uptimeMin = (SystemClock.elapsedRealtime() - serviceCreateTimeMs) / 60000;
+                FileLogger.log(this, "JOB", "💓 JobScheduler 保底唤醒 (已运行 " + uptimeMin + " 分钟)");
+                // 仅触发自愈检查，绝不重新 schedule 闹钟，避免和 ACTION_KEEP_ALIVE 冲突
+                selfHeal(); 
+                
             } else if ("ACTION_LOCK_CHAT".equals(action)) {
                 setChatLocked(true);
             } else if ("ACTION_UNLOCK_CHAT".equals(action)) {
