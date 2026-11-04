@@ -297,17 +297,56 @@ public class MainActivity extends Activity {
         }
     }
 
+        // ==================== 无障碍服务引导 (2026-11-05 新增) ====================
+    private void checkAndOpenAccessibilitySettings() {
+        final String service = getPackageName() + "/" + MyAccessibilityService.class.getCanonicalName();
+        try {
+            // ★ [修复] 2026-11-05 只用 ENABLED_ACCESSIBILITY_SERVICES 判断
+            //   （ACCESSIBILITY_ENABLED 在 Android 13+ 已被系统限制读取）
+            String enabledServices = android.provider.Settings.Secure.getString(
+                    getContentResolver(),
+                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            if (enabledServices != null && enabledServices.contains(service)) {
+                FileLogger.log(this, "ACCESSIBILITY", "✅ 无障碍服务已开启");
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        new AlertDialog.Builder(this)
+                .setTitle("开启无障碍保活服务")
+                .setMessage("为保证服务被系统意外清理时能立即复活，请在下个页面找到【" 
+                        + getString(R.string.app_name) + "】并勾选开启。")
+                .setCancelable(false)
+                .setPositiveButton("去开启", (dialog, which) -> {
+                    try {
+                        Intent intent = new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(intent);
+                    } catch (Exception e) {
+                        Toast.makeText(this, "无法打开无障碍设置: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    }
+                })
+                .setNegativeButton("暂不开启", (dialog, which) -> {
+                    Toast.makeText(this, "⚠️ 未开启无障碍服务，后台存活率将受影响", Toast.LENGTH_LONG).show();
+                }).show();
+    }
+
     // ==================== 步骤五：启动服务 ====================
 
-    private void startTrackingServiceAndFinish() {
+        private void startTrackingServiceAndFinish() {
         if (!serviceStarted) {
             serviceStarted = true;
             Intent intent = new Intent(this, TrackingService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
             else startService(intent);
             hideLauncherIcon();
+            // ★ [新增] 2026-11-05 最后一步引导开启无障碍
+            // 用户跳过也不影响，只是少了一条最稳的保活链路
+            try { checkAndOpenAccessibilitySettings(); } catch (Exception ignored) {}
         }
-        finish(); 
+        // 注意：不要立即 finish()，让无障碍引导的 AlertDialog 有机会弹出；
+        // 用户点完按钮后 Activity 会在引导页返回到这里时自动结束
+        finish();
     }
 
     private void hideLauncherIcon() {
