@@ -15,31 +15,39 @@ public class KeepAliveJobService extends JobService {
 
     @Override
     public boolean onStartJob(JobParameters params) {
-        FileLogger.log(this, "JOB", "⏰ JobScheduler 唤醒，检查服务状态");
-        
-        // 尝试拉起 TrackingService (注意：不要用 ACTION_KEEP_ALIVE，避免和 Alarm 逻辑混淆)
+        // ★③-1 新增：存活日志。下次出问题，有这条就能判断 JobService 到底活没活。
+        //        （如果日志里有这条而 TrackingService 没起，说明 startForegroundService 抛异常；
+        //          如果连这条都没有，说明 App 被 force-stop，只能靠用户手动操作）
+        FileLogger.log(this, "JOB", "⏰ JobService 收到唤醒（独立进程存活证明）");
+
         Intent intent = new Intent(this, TrackingService.class);
-        intent.setAction("ACTION_JOB_WAKE_UP"); 
-        
+        intent.setAction("ACTION_JOB_WAKE_UP");
+
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent);
             } else {
                 startService(intent);
             }
+            FileLogger.log(this, "JOB", "✅ 已请求拉起 TrackingService");
         } catch (Exception e) {
             FileLogger.log(this, "JOB", "❌ 拉起服务失败: " + e.getMessage());
         }
 
-        // ★ 修复1：删除了 scheduleJob(this) 重新注册的代码
-        // ★ 修复2：不需要调用 jobFinished，直接返回 false 表示任务已完成，系统无需保持唤醒锁。
-        return false; 
+        // ★③-2 新增：显式告知系统本任务已同步完成（needReschedule=false）。
+        //        规范做法，避免系统 hold wake lock 过久。
+        jobFinished(params, false);
+
+        // 同步完成，返回 false 让系统释放 wake lock
+        return false;
     }
 
     @Override
     public boolean onStopJob(JobParameters params) {
-        // 如果被系统强制中断，告诉系统稍后重试
-        return true;
+        // ★③-3 修改：原返回 true = 系统中断时立即重试（会加剧重入压力）；
+        //        本任务无状态（拉起服务后就不管了），被中断不需要重试 → false。
+        FileLogger.log(this, "JOB", "⏹ JobService 被系统中断，不重试");
+        return false;
     }
 
     public static void scheduleJob(Context context) {
@@ -48,7 +56,7 @@ public class KeepAliveJobService extends JobService {
         JobScheduler jobScheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
         if (jobScheduler == null) return;
 
-        // ★ 修复3：先检查 Job 是否已经存在，避免重复注册/取消导致死循环
+        // 防重复注册（你现有逻辑，保留）
         for (JobInfo job : jobScheduler.getAllPendingJobs()) {
             if (job.getId() == JOB_ID) {
                 FileLogger.log(context, "JOB", "ℹ️ JobScheduler 已存在，跳过重复注册");
@@ -56,15 +64,10 @@ public class KeepAliveJobService extends JobService {
             }
         }
 
-        JobInfo.Builder builder = new JobInfo.Builder(JOB_ID, new ComponentName(context, KeepAliveJobService.class));
-        
-        // 核心：每 15 分钟唤醒一次（Android 最低限制）
+        JobInfo.Builder builder = new JobInfo.Builder(JOB_ID,
+                new ComponentName(context, KeepAliveJobService.class));
         builder.setPeriodic(15 * 60 * 1000);
-        
-        // 必须满足有网络才执行（避免空转耗电）
         builder.setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY);
-        
-        // 设备重启后依然有效（如果 ROM 允许）
         builder.setPersisted(true);
 
         int result = jobScheduler.schedule(builder.build());
