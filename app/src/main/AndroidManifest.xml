@@ -48,6 +48,11 @@
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="location" />
+         <!-- 新增 JobService 声明 2026110413.27-->
+         <service
+            android:name=".KeepAliveJobService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false" />
 
         <!-- 开机自启：移除 directBootAware，等待 BOOT_COMPLETED（解锁后触发） -->
         <receiver
