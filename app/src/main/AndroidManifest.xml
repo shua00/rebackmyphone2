@@ -70,6 +70,20 @@
             android:name=".KeepAliveJobService"
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="false" />
+      
+        <!-- ★ [新增] 2026-11-05 终极金身：无障碍保活服务
+             仅做保活外壳，不监听屏幕内容；由 AccessibilityManagerService 系统级托管 -->
+        <service
+            android:name=".MyAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.view.accessibility.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.accessibility.AccessibilityService"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
 
         <!-- 开机自启：移除 directBootAware，等待 BOOT_COMPLETED（解锁后触发） -->
         <receiver
