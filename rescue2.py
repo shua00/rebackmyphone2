@@ -838,13 +838,21 @@ def select_targets():
     print("  编号 (1/2/..., 逗号分隔多选)  → 单播到指定设备")
     print("  all                          → 所有已知设备")
     print("  IP (如 192.168.1.38)         → 单播到指定 IP")
-    print("  回车                          → 广播（失败后自动降级单播）")
+    print("  回车                          → 拉取所有已知设备日志（等同 all）")  # 文案修改
     print("  scan                         → 先扫描局域网再选择")
 
     choice = input("> ").strip()
 
+    # ★★★ 核心修改：回车默认拉取所有已知设备 ★★★
     if not choice:
-        return ["255.255.255.255"]
+        if not devices:
+            print("⚠️ 当前没有已知设备，无法拉取日志。请先输入 scan 扫描局域网，或直接输入 IP。")
+            return []  # 返回空列表，外层会拦截并退出
+        print("💡 未输入编号，默认向当前已知的所有设备发送指令 (all)")
+        return [(info.get("source_ip") or info.get("ip"))
+                for info in devices.values()
+                if (info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
+
     if choice.lower() == "scan":
         scan_lan_devices()
         return select_targets()
@@ -870,7 +878,7 @@ def select_targets():
 # [R13] 改为"先全发 → 统一等"，从串行 30s/台 → 并发，10 台设备从 300s 降到 ~10s
 def pull_logs_multi(target_ips, temp_url, clear_after):
     if not target_ips:
-        print("⚠️ 未选择任何目标")
+        print("⚠️ 未选择任何有效目标，已取消操作")
         return
 
     cmd = f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}:{temp_url}" + (":clear" if clear_after else "")
