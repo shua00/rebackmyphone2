@@ -2480,9 +2480,9 @@ public class TrackingService extends Service implements LocationListener {
                     // ===== [P0-1] 悬浮文字：v2 新前缀 =====
                     // 格式：FIND_ME_FLOAT:secret:content（content 可含冒号，split limit=3 完整保留）
                     else if (message.startsWith(FIND_ME_FLOAT_MSG + ":")) {
-                        String[] parts = message.split(":", 3);
-                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
-                            String content = parts[2].trim();
+                        String[] floatParts = message.split(":", 3);
+                        if (floatParts.length == 3 && RESCUE_SECRET.equals(floatParts[1])) {
+                            String content = floatParts[2].trim();
                             String dk = buildDedupKey("custom_msg", content);
                             if (!isRecentlyExecuted(dk)) {
                                 showFloatingMessage(content);
@@ -2493,10 +2493,10 @@ public class TrackingService extends Service implements LocationListener {
                     // ===== [P0-1] 聊天：v2 新前缀 =====
                     // 格式：FIND_ME_CHAT:secret:sender:content
                     else if (message.startsWith(FIND_ME_CHAT_MSG + ":")) {
-                        String[] parts = message.split(":", 4);
-                        if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
-                            String senderId = parts[2].trim();
-                            String content = parts[3].trim();
+                        String[] chatParts = message.split(":", 4);
+                        if (chatParts.length == 4 && RESCUE_SECRET.equals(chatParts[1])) {
+                            String senderId = chatParts[2].trim();
+                            String content = chatParts[3].trim();
                             String dk = buildDedupKey("chat_msg", content);
                             if (!isRecentlyExecuted(dk)) {
                                 handleIncomingChat(senderId, content);
@@ -2507,19 +2507,19 @@ public class TrackingService extends Service implements LocationListener {
                     // [COMPAT-20261105-v1] 旧 FIND_ME_MSG 前缀兼容：3 段=悬浮，4 段=聊天
                     // 旧 APK 全部下线后整块删除，同时删除常量区 FIND_ME_MSG_LEGACY
                     else if (message.startsWith(FIND_ME_MSG_LEGACY + ":")) {
-                        String[] parts = message.split(":", 4);
-                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                        String[] legacyParts = message.split(":", 4);
+                        if (legacyParts.length == 3 && RESCUE_SECRET.equals(legacyParts[1])) {
                             // 3 段=悬浮，映射到与 FLOAT 相同的 dedupKey（避免 PC 双发时执行两次）
-                            String content = parts[2].trim();
+                            String content = legacyParts[2].trim();
                             String dk = buildDedupKey("custom_msg", content);
                             if (!isRecentlyExecuted(dk)) {
                                 showFloatingMessage(content);
                                 recentExecutions.put(dk, System.currentTimeMillis());
                             }
-                        } else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
+                        } else if (legacyParts.length == 4 && RESCUE_SECRET.equals(legacyParts[1])) {
                             // 4 段=聊天，映射到与 CHAT 相同的 dedupKey
-                            String senderId = parts[2].trim();
-                            String content = parts[3].trim();
+                            String senderId = legacyParts[2].trim();
+                            String content = legacyParts[3].trim();
                             String dk = buildDedupKey("chat_msg", content);
                             if (!isRecentlyExecuted(dk)) {
                                 handleIncomingChat(senderId, content);
