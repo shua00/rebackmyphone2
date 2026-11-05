@@ -2479,6 +2479,7 @@ public class TrackingService extends Service implements LocationListener {
                             playAlarm();
                             recentExecutions.put("play_alarm", System.currentTimeMillis());
                         }
+                    }
                     // ===== [P0-1] 悬浮文字：v2 新前缀 =====
                     // 格式：FIND_ME_FLOAT:secret:content（content 可含冒号，split limit=3 完整保留）
                     else if (message.startsWith(FIND_ME_FLOAT_MSG + ":")) {
