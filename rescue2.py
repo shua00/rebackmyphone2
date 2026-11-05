@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeviceFinder 局域网救援/调试终端
+DeviceFinder 局域网救援/调试终端 
 支持环境：Windows / Linux(Armbian) / Termux(Android)
 
 【本次修复 R1~R14】
@@ -514,52 +514,63 @@ def start_log_receiver():
 
 
 # ===== UDP 监听 =====
-# ===== UDP 监听 =====
 def udp_listener():
     global UDP_OK
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(('0.0.0.0', 8888))
-        UDP_OK = True
-        print("🎧 UDP 监听已启动，等待手机对讲消息...")
-        while True:
-            try:
-                data, addr = sock.recvfrom(4096)
-                msg = data.decode('utf-8', errors='ignore')
-                if msg.startswith("FIND_ME_MSG:"):
-                    # [R1] maxsplit=3，content 含冒号时不再被丢弃
-                    parts = msg.split(":", 3)
-                    if len(parts) == 4 and parts[1] == RESCUE_SECRET:
-                        sender = parts[2]
-                        content = parts[3]
+    while True:  # ★★★ 新增：外层死循环，实现绑定失败自愈 ★★★
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('0.0.0.0', 8888))
+            UDP_OK = True
+            print("🎧 UDP 监听已启动，等待手机对讲消息...")
+            
+            # 内层死循环：负责接收数据
+            while True:
+                try:
+                    data, addr = sock.recvfrom(4096)
+                    msg = data.decode('utf-8', errors='ignore')
+                    if msg.startswith("FIND_ME_MSG:"):
+                        # [R1] maxsplit=3，content 含冒号时不再被丢弃
+                        parts = msg.split(":", 3)
+                        if len(parts) == 4 and parts[1] == RESCUE_SECRET:
+                            sender = parts[2]
+                            content = parts[3]
 
-                        # [新增] 5 秒去重：手机发子网+全局共 2 包，只显示 1 条
-                        dedup_key = (sender, content)
-                        now_ts = time.time()
-                        if now_ts - _LAST_UDP_MSG.get(dedup_key, 0) < 5.0:
-                            continue
-                        _LAST_UDP_MSG[dedup_key] = now_ts
+                            # [新增] 5 秒去重：手机发子网+全局共 2 包，只显示 1 条
+                            dedup_key = (sender, content)
+                            now_ts = time.time()
+                            if now_ts - _LAST_UDP_MSG.get(dedup_key, 0) < 5.0:
+                                continue
+                            _LAST_UDP_MSG[dedup_key] = now_ts
 
-                        # 记录数超过 100 时清理过期项
-                        if len(_LAST_UDP_MSG) > 100:
-                            cutoff = now_ts - _LAST_UDP_MSG_TTL
-                            for k in [k for k, v in _LAST_UDP_MSG.items() if v < cutoff]:
-                                _LAST_UDP_MSG.pop(k, None)
+                            # 记录数超过 100 时清理过期项
+                            if len(_LAST_UDP_MSG) > 100:
+                                cutoff = now_ts - _LAST_UDP_MSG_TTL
+                                for k in [k for k, v in _LAST_UDP_MSG.items() if v < cutoff]:
+                                    _LAST_UDP_MSG.pop(k, None)
 
-                        print(f"\n🗣️ [{sender}] {content}  (来自 {addr[0]})")
-                        with _state_lock:
-                            info = DISCOVERED_DEVICES.setdefault(sender, {})
-                            info["source_ip"] = addr[0]
-                            info["last_chat"] = time.time()
-            except Exception as e:
-                print(f"⚠️ UDP 监听异常: {e}")
-                time.sleep(1)
-    except OSError as e:
-        if e.errno in (98, 10048):
-            print(f"⚠️ UDP 8888 被占用（server2.py 可能在跑），跳过对讲消息监听")
-        else:
-            print(f"⚠️ UDP 监听失败: {e}")
+                            print(f"\n🗣️ [{sender}] {content}  (来自 {addr[0]})")
+                            with _state_lock:
+                                info = DISCOVERED_DEVICES.setdefault(sender, {})
+                                info["source_ip"] = addr[0]
+                                info["last_chat"] = time.time()
+                except Exception as e:
+                    print(f"⚠️ UDP 接收异常: {e}")
+                    time.sleep(1)
+
+        except OSError as e:
+            UDP_OK = False
+            if e.errno in (98, 10048):
+                print("⚠️ UDP 8888 被占用（可能 server2.py 或 chat.py 正在运行）")
+                print("   ⏳ 10 秒后自动重试绑定...")
+            else:
+                print(f"⚠️ UDP 监听绑定失败: {e}，10 秒后重试...")
+            time.sleep(10)  # ★ 休眠 10 秒后，外层 while True 会再次尝试 bind
+            continue        # 重新开始循环，再次尝试绑定
+        finally:
+            # 每次重试前或异常退出时，确保旧 socket 被关闭
+            try: sock.close()
+            except Exception: pass
 
 
 # ===== 设备列表 / 状态摘要 =====
