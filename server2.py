@@ -58,6 +58,9 @@ ALL_DEVICES_STATUS = {}
 CHAT_MESSAGES = []
 print_lock = threading.Lock()
 
+# ★★★ 新增：数据库写锁，防止高并发写入时 SQLite 锁死 2026-11-05 14:30★★★
+db_write_lock = threading.Lock()
+
 LAST_MSG_INFO = {}
 LAST_MSG_INFO_MAX = 100
 LAST_MSG_INFO_TTL = 10.0
@@ -291,42 +294,44 @@ def save_report(dev_id, data, source_ip):
             try: ext_json = json.dumps(extra, ensure_ascii=False)[:REPORTS_EXT_MAX_BYTES]
             except Exception: pass
 
-        conn = sqlite3.connect('track_history.db', timeout=10)
-        try:
-            conn.execute("PRAGMA busy_timeout=10000")
-            conn.execute("""INSERT INTO reports
-                (device_id, timestamp, received_at, day_str, hour, weekday,
-                 battery_level, is_charging, battery_temp_c, battery_voltage_mv,
-                 wifi_ssid, wifi_bssid, wifi_rssi, local_ip, source_ip,
-                 network_type, network_subtype, has_internet,
-                 sim_state, sim_operator,
-                 is_screen_on, is_screen_locked, airplane_mode,
-                 ringer_mode, volume_alarm, unlock_count_since_boot,
-                 chat_locked, elder_mode, os_version, uptime_ms,
-                 lat, lng, accuracy, location_provider, location_time, location_age_s,
-                 recent_locations_json,
-                 nearby_wifi_count, nearby_wifi_json, raw_json, ext_json)
-                VALUES (?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?, ?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?, ?,?,?,?)""", (
-                dev_id, ts, received_at, dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday(),
-                batt_level, is_charging, batt_temp, batt_volt,
-                wifi_ssid or None, wifi_bssid, wifi_rssi, local_ip, source_ip,
-                net_type, net_subtype, has_internet,
-                sim_state, sim_operator,
-                1 if data.get("is_screen_on") else 0, is_screen_locked, airplane_mode,
-                ringer_mode, volume_alarm, unlock_cnt,
-                1 if data.get("chat_locked") else 0,
-                1 if data.get("elder_mode") else 0,
-                data.get("os_version") if isinstance(data.get("os_version"), str) else None,
-                data.get("uptime_ms") if isinstance(data.get("uptime_ms"), int) else None,
-                lat, lng, accuracy,
-                (loc.get("provider") or None) if isinstance(loc.get("provider"), str) else None,
-                loc_time, loc_age_s,
-                recent_locs_json,
-                len(nearby), nearby_json, raw_json, ext_json
-            ))
-            conn.commit()
-        finally:
-            conn.close()
+        # ★★★ 核心修改：加锁写入，排队执行，防止多线程并发写导致 database is locked 2026-11-05 14:30★★★
+        with db_write_lock:
+            conn = sqlite3.connect('track_history.db', timeout=10)
+            try:
+                conn.execute("PRAGMA busy_timeout=10000")
+                conn.execute("""INSERT INTO reports
+                    (device_id, timestamp, received_at, day_str, hour, weekday,
+                     battery_level, is_charging, battery_temp_c, battery_voltage_mv,
+                     wifi_ssid, wifi_bssid, wifi_rssi, local_ip, source_ip,
+                     network_type, network_subtype, has_internet,
+                     sim_state, sim_operator,
+                     is_screen_on, is_screen_locked, airplane_mode,
+                     ringer_mode, volume_alarm, unlock_count_since_boot,
+                     chat_locked, elder_mode, os_version, uptime_ms,
+                     lat, lng, accuracy, location_provider, location_time, location_age_s,
+                     recent_locations_json,
+                     nearby_wifi_count, nearby_wifi_json, raw_json, ext_json)
+                    VALUES (?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?, ?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?, ?,?,?,?)""", (
+                    dev_id, ts, received_at, dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday(),
+                    batt_level, is_charging, batt_temp, batt_volt,
+                    wifi_ssid or None, wifi_bssid, wifi_rssi, local_ip, source_ip,
+                    net_type, net_subtype, has_internet,
+                    sim_state, sim_operator,
+                    1 if data.get("is_screen_on") else 0, is_screen_locked, airplane_mode,
+                    ringer_mode, volume_alarm, unlock_cnt,
+                    1 if data.get("chat_locked") else 0,
+                    1 if data.get("elder_mode") else 0,
+                    data.get("os_version") if isinstance(data.get("os_version"), str) else None,
+                    data.get("uptime_ms") if isinstance(data.get("uptime_ms"), int) else None,
+                    lat, lng, accuracy,
+                    (loc.get("provider") or None) if isinstance(loc.get("provider"), str) else None,
+                    loc_time, loc_age_s,
+                    recent_locs_json,
+                    len(nearby), nearby_json, raw_json, ext_json
+                ))
+                conn.commit()
+            finally:
+                conn.close()
     except Exception as e:
         with print_lock:
             print(f"⚠️ [reports] 写入失败 {dev_id}: {e}")
@@ -1090,6 +1095,15 @@ def handle_client(client_conn, client_addr):
                 with print_lock: print(f"❌ GET /api/chat_history 异常: {e}")
                 try: client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 except Exception: pass
+                
+        # ===== GET /health (健康检查) =====
+        elif "GET /health" in header_text:
+            try:
+                resp = b'{"status":"ok"}'
+                client_conn.sendall(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp)
+            except Exception:
+                pass
 
         # ===== GET / (Web 控制台) =====
         elif "GET /" in header_text:
