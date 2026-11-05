@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeviceFinder 局域网救援/调试终端 
+DeviceFinder 局域网救援/调试终端
 支持环境：Windows / Linux(Armbian) / Termux(Android)
 
-【本次修复 R1~R14】
+【历史修复 R1~R14】
 R1  udp_listener split(":",3)      — 聊天内容含冒号不再被丢弃
 R2  _handle_report 用 update()      — 上报不再覆盖 last_chat / last_log
 R3  ThreadingHTTPServer             — 并发上报不再排队超时（扫描命中率提升的关键）
@@ -19,6 +19,13 @@ R11 _probe_ips 去掉无效 settimeout  — UDP sendto 是立即返回的
 R12 LogReceiver 增加 do_GET         — 浏览器访问 9090 可直接健康检查
 R13 pull_logs_multi 批量发送        — 从串行 30s/台改为并发+统一等待
 R14 choose_target 空列表明确提示    — 不再静默 fallback 到广播
+
+【本次修复 R15~R19 (2026-11-05)】
+R15 升级 send_udp 支持 IP 列表      — 实现多台设备精准单播批量发送
+R16 合并 choose_target/select_targets — 统一为 choose_targets_multi，支持 1,2 多选，回车默认全选已知设备
+R17 拦截拉日志传入广播地址          — 防止传入 255.255.255.255 导致白等 30 秒
+R18 UDP 监听加入外层自愈死循环      — 端口被占用/断开后 10 秒自动重试抢回 8888
+R19 警报/对讲/低电量移除 no_retry   — 利用默认多次发送机制，降低 UDP 局域网丢包率
 
 【配套手机端修改】
 AndroidManifest.xml 需加：
@@ -205,14 +212,19 @@ def get_network_prefix(ip):
 
 
 # ===== UDP 发送 =====
-# [R4][R5] 子网广播发 3 次，单播发 2 次；UDP 丢包率不低，重试是必要成本
+# [R15] 升级：支持传入 IP 列表实现批量单播
 def send_udp(command_str, target_ip="255.255.255.255", quiet=False, no_retry=False):
+    if isinstance(target_ip, (list, tuple)):
+        for ip in target_ip:
+            send_udp(command_str, ip, quiet=quiet, no_retry=no_retry)
+        return
+        
     if not quiet:
         print(f"\n📡 发送指令至 {target_ip}: {command_str}")
 
     is_broadcast = (target_ip == "255.255.255.255") or target_ip.endswith(".255")
     if no_retry:
-        send_times = 1                                    # ← 有副作用指令只发 1 次
+        send_times = 1
     else:
         send_times = 3 if is_broadcast else 2
     gap = 0.5 if is_broadcast else 0.15
@@ -260,7 +272,10 @@ def send_udp_and_wait(command_str, target_ip="255.255.255.255", wait_sec=15, wai
     before = _get_counter(wait_type)
     send_udp(command_str, target_ip)
 
-    if target_ip != "255.255.255.255":
+    # 兼容列表、具体IP单播
+    is_broadcast = isinstance(target_ip, str) and (target_ip == "255.255.255.255" or target_ip.endswith(".255"))
+    
+    if not is_broadcast:
         elapsed = wait_for_response(before, wait_sec, wait_type)
         if elapsed is not None:
             print(f"✅ 收到响应（{elapsed:.1f}s）")
@@ -298,8 +313,8 @@ def send_udp_and_wait(command_str, target_ip="255.255.255.255", wait_sec=15, wai
     print(f"⚠️ 所有已知设备均未响应")
 
 
-# [R14] 空列表时明确提示，不再静默 fallback 到广播
-def choose_target(prompt="🎯 选择目标 (编号/IP/回车广播): "):
+# [R16] 合并通用多选函数，支持编号、逗号分隔、all、回车全选、scan
+def choose_targets_multi(prompt="🎯 选择目标 (编号/逗号分隔/all/回车全选/IP): "):
     with _state_lock:
         devices = dict(DISCOVERED_DEVICES)
 
@@ -309,10 +324,10 @@ def choose_target(prompt="🎯 选择目标 (编号/IP/回车广播): "):
         now = time.time()
         for i, (dev_id, info) in enumerate(dev_list, 1):
             ip = info.get("source_ip") or info.get("ip", "?")
-            # 电量显示
             batt_raw = info.get("battery")
             batt = f"{batt_raw}%" if batt_raw is not None else "未上报"
-            # 时间显示：修复 -1分钟前
+            wifi_raw = info.get("wifi")
+            wifi = str(wifi_raw)[:16] if wifi_raw else "未上报"
             last = max(info.get("last_seen", 0), info.get("last_log", 0), info.get("last_chat", 0))
             if last > 0:
                 ago = max(0, int(now - last))
@@ -321,32 +336,55 @@ def choose_target(prompt="🎯 选择目标 (编号/IP/回车广播): "):
                            f"{ago // 3600}小时前")
             else:
                 ago_str = "从未"
-            # 仅 UDP 标记
             tag = "" if info.get("last_seen", 0) > 0 else " [仅UDP]"
-            print(f"  {i}. {dev_id:<26} ({ip:<15}){tag:<10} {batt:<6} {ago_str}")
+            print(f"  {i}. {dev_id:<26} ({ip:<15}){tag:<10} {batt:<8} {wifi:<18} {ago_str}")
     else:
+        print("\n📭 当前没有已知设备（需先让手机上报一次，或先扫描局域网）")
         dev_list = []
-        print("\n📭 暂无已知设备（需先让手机上报一次，或先扫描局域网）")
-        print("   回车 → 广播；直接输入 IP → 单播")
+
+    print("\n请选择目标：")
+    print("  编号 (1/2/..., 逗号分隔多选)  → 单播到指定设备")
+    print("  all                          → 所有已知设备")
+    print("  IP (如 192.168.1.38)         → 单播到指定 IP")
+    print("  回车                          → 对所有已知设备操作 (若空则回退广播)")
+    print("  scan                         → 先扫描局域网再选择")
 
     choice = input(prompt).strip()
+
     if not choice:
-        return "255.255.255.255"
+        if not devices:
+            print("💡 无已知设备，回退到全局广播")
+            return ["255.255.255.255"]
+        print("💡 未输入编号，默认对当前已知的所有设备操作 (all)")
+        return [(info.get("source_ip") or info.get("ip"))
+                for info in devices.values()
+                if (info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
+
+    if choice.lower() == "scan":
+        scan_lan_devices()
+        return choose_targets_multi(prompt)
+        
+    if choice.lower() == "all":
+        if not devices:
+            return ["255.255.255.255"]
+        return [(info.get("source_ip") or info.get("ip"))
+                for info in devices.values()
+                if (info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
+                
     if is_valid_ip(choice):
-        return choice
-
-    if not dev_list:
-        print(f"⚠️ 暂无已知设备，输入 '{choice}' 无法解析为编号，回退广播")
-        return "255.255.255.255"
-
+        return [choice]
+        
     try:
-        idx = int(choice)
-        if 1 <= idx <= len(dev_list):
-            return dev_list[idx - 1][1].get("source_ip") or dev_list[idx - 1][1].get("ip")
+        idxs = [int(x.strip()) for x in choice.split(",") if x.strip().isdigit()]
+        result = []
+        for i in idxs:
+            if 0 < i <= len(dev_list):
+                ip = dev_list[i - 1][1].get("source_ip") or dev_list[i - 1][1].get("ip")
+                if ip:
+                    result.append(ip)
+        return result
     except Exception:
-        pass
-    print(f"⚠️ 无效输入，使用广播")
-    return "255.255.255.255"
+        return []
 
 
 # ===== HTTP 接收端 =====
@@ -516,7 +554,7 @@ def start_log_receiver():
 # ===== UDP 监听 =====
 def udp_listener():
     global UDP_OK
-    while True:  # ★★★ 新增：外层死循环，实现绑定失败自愈 ★★★
+    while True:  # ★★★ [R18] 新增：外层死循环，实现绑定失败自愈 ★★★
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -781,15 +819,8 @@ def periodic_probe(target_ip):
             before = _get_counter("report")
             print(f"\n--- 第 {probe_count} 次探测 ---")
 
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            for _ in range(3):
-                try:
-                    sock.sendto(cmd.encode(), (target_ip, 8888))
-                    time.sleep(0.05)
-                except Exception:
-                    pass
-            sock.close()
+            # 改为调用 send_udp 支持列表
+            send_udp(cmd, target_ip, quiet=True)
 
             wait_until = time.time() + 10
             got = False
@@ -817,79 +848,15 @@ def periodic_probe(target_ip):
     print(f"\n📊 探测结果: {probe_count} 次发送，{respond_count} 次响应，响应率 {rate:.0f}%")
 
 
-# ===== 多选目标 + 多台拉日志 =====
-def select_targets():
-    """拉日志专用：显示已知设备，支持编号/all/IP/回车/scan"""
-    with _state_lock:
-        devices = dict(DISCOVERED_DEVICES)
-
-    if devices:
-        print(f"\n📋 当前已知设备（{len(devices)} 台）：")
-        dev_list = list(devices.items())
-        now = time.time()
-        for i, (dev_id, info) in enumerate(dev_list, 1):
-            ip = info.get("source_ip") or info.get("ip", "?")
-            batt_raw = info.get("battery")
-            batt = f"{batt_raw}%" if batt_raw is not None else "未上报"
-            wifi_raw = info.get("wifi")
-            wifi = str(wifi_raw)[:16] if wifi_raw else "未上报"
-            last = max(info.get("last_seen", 0), info.get("last_log", 0))
-            if last > 0:
-                ago = max(0, int(now - last))
-                ago_str = f"{ago}秒前" if ago < 60 else (f"{ago // 60}分钟前" if ago < 3600 else "")
-            else:
-                ago_str = "从未"
-            tag = "" if info.get("last_seen", 0) > 0 else " [仅UDP]"
-            print(f"  {i}. {dev_id:<26} ({ip:<15}){tag:<10} {batt:<8} {wifi:<18} {ago_str}")
-    else:
-        print("\n📭 当前没有已知设备")
-        dev_list = []
-
-    print("\n请选择目标：")
-    print("  编号 (1/2/..., 逗号分隔多选)  → 单播到指定设备")
-    print("  all                          → 所有已知设备")
-    print("  IP (如 192.168.1.38)         → 单播到指定 IP")
-    print("  回车                          → 拉取所有已知设备日志（等同 all）")  # 文案修改
-    print("  scan                         → 先扫描局域网再选择")
-
-    choice = input("> ").strip()
-
-    # ★★★ 核心修改：回车默认拉取所有已知设备 ★★★
-    if not choice:
-        if not devices:
-            print("⚠️ 当前没有已知设备，无法拉取日志。请先输入 scan 扫描局域网，或直接输入 IP。")
-            return []  # 返回空列表，外层会拦截并退出
-        print("💡 未输入编号，默认向当前已知的所有设备发送指令 (all)")
-        return [(info.get("source_ip") or info.get("ip"))
-                for info in devices.values()
-                if (info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
-
-    if choice.lower() == "scan":
-        scan_lan_devices()
-        return select_targets()
-    if choice.lower() == "all":
-        return [(info.get("source_ip") or info.get("ip"))
-                for info in devices.values()
-                if (info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
-    if is_valid_ip(choice):
-        return [choice]
-    try:
-        idxs = [int(x.strip()) for x in choice.split(",") if x.strip().isdigit()]
-        result = []
-        for i in idxs:
-            if 0 < i <= len(dev_list):
-                ip = dev_list[i - 1][1].get("source_ip") or dev_list[i - 1][1].get("ip")
-                if ip:
-                    result.append(ip)
-        return result
-    except Exception:
-        return []
-
-
-# [R13] 改为"先全发 → 统一等"，从串行 30s/台 → 并发，10 台设备从 300s 降到 ~10s
+# [R17] 改为"先全发 → 统一等"，并修复传入广播地址导致的假死
 def pull_logs_multi(target_ips, temp_url, clear_after):
     if not target_ips:
         print("⚠️ 未选择任何有效目标，已取消操作")
+        return
+
+    # ★★★ [R17] 拦截广播地址 ★★★
+    if target_ips == ["255.255.255.255"]:
+        print("⚠️ 拉日志不能使用广播，请选择具体设备编号或输入 all")
         return
 
     cmd = f"FIND_ME_UPLOAD_LOG:{RESCUE_SECRET}:{temp_url}" + (":clear" if clear_after else "")
@@ -902,8 +869,8 @@ def pull_logs_multi(target_ips, temp_url, clear_after):
         send_udp(cmd, ip, quiet=True, no_retry=True)
         time.sleep(0.1)
 
-    print(f"⏳ 等待手机上传（最多 30 秒）...")     # ← 60 → 30
-    deadline = time.time() + 30                   # ← 60 → 30
+    print(f"⏳ 等待手机上传（最多 30 秒）...")     
+    deadline = time.time() + 30                   
     received_ips = set()
 
     while time.time() < deadline:
@@ -946,13 +913,13 @@ def menu_a_server_config():
             if not is_valid_url(url):
                 print(f"❌ URL 非法: {url}")
                 continue
-            send_udp(f"FIND_ME_SERVER:{RESCUE_SECRET}:{url}", choose_target())
+            send_udp(f"FIND_ME_SERVER:{RESCUE_SECRET}:{url}", choose_targets_multi())
         elif c == '2':
             url = input(f"新配置中心 URL (回车默认 {DEFAULT_CONFIG_URL}): ").strip() or DEFAULT_CONFIG_URL
             if not is_valid_url(url):
                 print(f"❌ URL 非法: {url}")
                 continue
-            send_udp(f"FIND_ME_CONFIG:{RESCUE_SECRET}:{url}", choose_target())
+            send_udp(f"FIND_ME_CONFIG:{RESCUE_SECRET}:{url}", choose_targets_multi())
         elif c == '3':
             sec = input("上报间隔秒数（默认 1800）: ").strip()
             if sec.isdigit():
@@ -964,7 +931,7 @@ def menu_a_server_config():
             if not is_valid_url(url):
                 print(f"❌ URL 非法: {url}")
                 continue
-            send_udp(f"FIND_ME_REPORT_TEMP:{RESCUE_SECRET}:{url}", choose_target())
+            send_udp(f"FIND_ME_REPORT_TEMP:{RESCUE_SECRET}:{url}", choose_targets_multi())
 
 
 def menu_b_cloud_switch():
@@ -983,13 +950,13 @@ def menu_b_cloud_switch():
         if c == '0':
             return
         if c == '1':
-            send_udp(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:1", choose_target())
+            send_udp(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:1", choose_targets_multi())
         elif c == '2':
-            send_udp(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:0", choose_target())
+            send_udp(f"FIND_ME_CLOUD_LOG:{RESCUE_SECRET}:0", choose_targets_multi())
         elif c == '3':
-            send_udp(f"FIND_ME_CHAT_LOCK:{RESCUE_SECRET}", choose_target())
+            send_udp(f"FIND_ME_CHAT_LOCK:{RESCUE_SECRET}", choose_targets_multi())
         elif c == '4':
-            send_udp(f"FIND_ME_CHAT_UNLOCK:{RESCUE_SECRET}", choose_target())
+            send_udp(f"FIND_ME_CHAT_UNLOCK:{RESCUE_SECRET}", choose_targets_multi())
 
 
 def menu_c_message_cleanup(local_ip):
@@ -1010,13 +977,13 @@ def menu_c_message_cleanup(local_ip):
         if c == '1':
             msg = input("悬浮文字内容: ").strip()
             if msg:
-                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:{msg}", choose_target())
+                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:{msg}", choose_targets_multi())
         elif c == '2':
-            send_udp(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", choose_target())
+            send_udp(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", choose_targets_multi())
         elif c == '3':
             num = input("报警短信手机号: ").strip()
             if num:
-                send_udp(f"FIND_ME_SET_SMS_NUM:{RESCUE_SECRET}:{num}", choose_target())
+                send_udp(f"FIND_ME_SET_SMS_NUM:{RESCUE_SECRET}:{num}", choose_targets_multi())
         elif c == '4':
             url = input(f"接收 URL (回车默认 http://{local_ip}:{LOG_PORT}/api/report): ").strip()
             if not url:
@@ -1024,7 +991,7 @@ def menu_c_message_cleanup(local_ip):
             if not is_valid_url(url):
                 print(f"❌ URL 非法: {url}")
                 continue
-            targets = select_targets()
+            targets = choose_targets_multi()
             if not targets:
                 continue
             clear = input("上传后清空手机本地日志？(y/N): ").strip().lower() == 'y'
@@ -1048,13 +1015,14 @@ def menu_d_diagnostic():
         if c == '0':
             return
         if c == '1':
-            send_udp(f"FIND_ME_SCAN_WIFI:{RESCUE_SECRET}", choose_target())
+            send_udp(f"FIND_ME_SCAN_WIFI:{RESCUE_SECRET}", choose_targets_multi())
         elif c == '2':
-            send_udp(f"FIND_ME_RESTART_UDP:{RESCUE_SECRET}", choose_target())
+            send_udp(f"FIND_ME_RESTART_UDP:{RESCUE_SECRET}", choose_targets_multi())
         elif c == '3':
-            send_udp(f"FIND_ME_TEST_LOW_BATTERY:{RESCUE_SECRET}", choose_target(), no_retry=True)
+            # ★★★ [R19] 移除 no_retry=True，利用多次发送降低丢包率
+            send_udp(f"FIND_ME_TEST_LOW_BATTERY:{RESCUE_SECRET}", choose_targets_multi())
         elif c == '4':
-            periodic_probe(choose_target())
+            periodic_probe(choose_targets_multi())
         elif c == '5':
             scan_lan_devices()
 
@@ -1118,12 +1086,12 @@ def main():
 
         if choice == '1':
             # [R8] 改为 FIND_ME_REPORT_TEMP 指向 PC 接收端，不再白等 15 秒超时
-            target = choose_target()
+            target = choose_targets_multi()
             temp_url = f"http://{local_ip}:{LOG_PORT}/api/report"
             print(f"📤 强制上报（指向 PC 接收端 {temp_url}）")
             send_udp_and_wait(f"FIND_ME_REPORT_TEMP:{RESCUE_SECRET}:{temp_url}", target, 15, "report")
         elif choice == '2':
-            target = choose_target()
+            target = choose_targets_multi()
             temp_url = f"http://{local_ip}:{LOG_PORT}/api/report"
             send_udp(f"FIND_ME_LOCATE_ONCE:{RESCUE_SECRET}", target, quiet=True)
             print("⏳ 等待手机定位（10 秒）...")
@@ -1133,7 +1101,7 @@ def main():
             url = f"http://{local_ip}:{LOG_PORT}/api/report"
             print(f"📥 内置接收端: {url}")
             print(f"   保存目录: {os.path.abspath(LOG_DIR)}")
-            targets = select_targets()
+            targets = choose_targets_multi()
             if not targets:
                 continue
             clear = input("上传后清空手机本地日志？(y/N): ").strip().lower() == 'y'
@@ -1142,11 +1110,13 @@ def main():
             show_devices()
         elif choice == '5':
             print("\n⚠️ 手机将以最大音量播放 30 秒警报（静音/震动也会响）")
-            send_udp(f"FIND_ME_ALARM:{RESCUE_SECRET}", choose_target(), no_retry=True)
+            # ★★★ [R19] 移除 no_retry=True
+            send_udp(f"FIND_ME_ALARM:{RESCUE_SECRET}", choose_targets_multi())
         elif choice == '6':
             chat = input("对讲消息内容: ").strip()
             if chat:
-                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:PC_Terminal:{chat}", choose_target(), no_retry=True)
+                # ★★★ [R19] 移除 no_retry=True
+                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:PC_Terminal:{chat}", choose_targets_multi())
 
 
 if __name__ == "__main__":
