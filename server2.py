@@ -8,6 +8,8 @@ import gzip
 import os
 import re
 from urllib.parse import urlparse, parse_qs
+# ★ 新增ThreadPoolExecutor 补丁： 2026-11-05 13:50
+from concurrent.futures import ThreadPoolExecutor
 
 """
 ============================================================
@@ -1844,7 +1846,7 @@ def start_server():
         print(f"❌ 端口 {PORT} 绑定失败: {e}")
         return
 
-    server.listen(20)
+    server.listen(50)
     with print_lock:
         print("=" * 50)
         print(f"🚀 设备同步服务已启动: http://{get_local_ip()}:{PORT}")
@@ -1864,11 +1866,17 @@ def start_server():
             print("📊 上报数据库: 首次启动，等待上报")
         print("=" * 50)
 
+    # ★★★ 核心补丁：创建最大 15 个工作线程的线程池 2026-11-05 13:50 ★★★ 
+    # 当手机请求过来时，最多同时处理 15 个，超出的会排队，防止内存被瞬间榨干
+    executor = ThreadPoolExecutor(max_workers=15)
+
     while True:
         try:
             conn, addr = server.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
-        except KeyboardInterrupt: break
+            # 【新写法】：把任务丢进池子，不再无限新建线程
+            executor.submit(handle_client, conn, addr)
+        except KeyboardInterrupt: 
+            break
         except Exception as e:
             print(f"accept 异常: {e}")
             time.sleep(1)
