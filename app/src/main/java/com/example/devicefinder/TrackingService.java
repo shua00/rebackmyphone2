@@ -110,6 +110,15 @@ public class TrackingService extends Service implements LocationListener {
     private static final String AUTH_TOKEN = "your_private_secret_key";
     private static final String RESCUE_SECRET = "your_private_secret_key";
 
+    // ===== 协议前缀（P0-1 拆分）=====
+    /** v2 悬浮文字：FIND_ME_FLOAT:secret:content（content 可含冒号） */
+    private static final String FIND_ME_FLOAT_MSG = "FIND_ME_FLOAT";
+    /** v2 聊天：FIND_ME_CHAT:secret:sender:content */
+    private static final String FIND_ME_CHAT_MSG  = "FIND_ME_CHAT";
+    // [COMPAT-20261105-v1] 旧前缀常量，v1 全部下线后删除本行
+    private static final String FIND_ME_MSG_LEGACY = "FIND_ME_MSG";
+    // [/COMPAT-20261105-v1]
+
     private static long lastConfigFetchTime = 0;
     private static final String PREF_BUBBLE = "bubble_pos_prefs";
 
@@ -247,9 +256,11 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void logStartupSelfCheck() {
-        try {
-            FileLogger.log(this, "SERVICE", "===== 启动自检 =====");
-            String rom = Build.DISPLAY != null ? Build.DISPLAY : "unknown";
+    try {
+        FileLogger.log(this, "SERVICE", "===== 启动自检 =====");
+        FileLogger.log(this, "SERVICE", "[TS] 版本: " + BuildInfo.BUILD_VERSION
+                + " (协议 v" + BuildInfo.PROTOCOL_VERSION + ")");
+        String rom = Build.DISPLAY != null ? Build.DISPLAY : "unknown";
             FileLogger.log(this, "SERVICE", "设备: " + Build.MANUFACTURER + " " + Build.MODEL
                     + " | Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
                     + " | ROM: " + rom);
@@ -1034,6 +1045,8 @@ public class TrackingService extends Service implements LocationListener {
             if (nm == null) return;
 
             StringBuilder sb = new StringBuilder();
+            sb.append("[TS] 版本：").append(BuildInfo.BUILD_VERSION)
+              .append("（协议 v").append(BuildInfo.PROTOCOL_VERSION).append("）\n");
             sb.append("老人模式：").append(isElderMode() ? "👴 已开启" : "🕶️ 无痕").append("\n");
             try {
                 boolean loc = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
@@ -1731,6 +1744,8 @@ public class TrackingService extends Service implements LocationListener {
 
                 JSONObject json = new JSONObject();
                 json.put("device_id", getUniqueDeviceId()); json.put("token", AUTH_TOKEN); json.put("timestamp", System.currentTimeMillis());
+                json.put("protocol_version", BuildInfo.PROTOCOL_VERSION);
+                json.put("build_version", BuildInfo.BUILD_VERSION);
                 json.put("os_version", "Android " + Build.VERSION.RELEASE); json.put("chat_locked", isChatLocked());
                 json.put("elder_mode", isElderMode());
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE); json.put("is_screen_on", pm != null && pm.isInteractive()); json.put("uptime_ms", SystemClock.elapsedRealtime());
@@ -1790,8 +1805,8 @@ public class TrackingService extends Service implements LocationListener {
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json");
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(15000);
+                conn.setConnectTimeout(8000);   // [P0-3] 15000 → 8000，服务器 down 时快速失败
+                conn.setReadTimeout(8000);      // [P0-3]
                 conn.setDoOutput(true);
                 conn.setRequestProperty("Connection", "close");
 
@@ -2031,8 +2046,8 @@ public class TrackingService extends Service implements LocationListener {
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
-            conn.setConnectTimeout(15000);
-            conn.setReadTimeout(15000);
+            conn.setConnectTimeout(8000);   // [P0-3] 15000 → 8000，离线队列补发不再一条卡 15 秒
+            conn.setReadTimeout(8000);      // [P0-3] 51 条 × 8 秒 = 408 秒，比旧版 51 × 15 = 765 秒省一半
             conn.setDoOutput(true);
             conn.setRequestProperty("Connection", "close");
             OutputStream os = conn.getOutputStream();
@@ -2255,26 +2270,42 @@ public class TrackingService extends Service implements LocationListener {
                 socket.bind(new InetSocketAddress(0));
 
                 String myId = getUniqueDeviceId();
-                String payload = "FIND_ME_MSG:" + RESCUE_SECRET + ":" + myId + ":" + message;
-                byte[] buf = payload.getBytes("UTF-8");
+                // v2 新前缀
+                String chatPayload   = FIND_ME_CHAT_MSG + ":" + RESCUE_SECRET + ":" + myId + ":" + message;
+                // [COMPAT-20261105-v1] 旧 4 段前缀双发，v1 全部下线后删除本行 + 下方 legacyBuf 发送
+                String legacyPayload = FIND_ME_MSG_LEGACY + ":" + RESCUE_SECRET + ":" + myId + ":" + message;
+                // [/COMPAT-20261105-v1]
+                byte[] chatBuf   = chatPayload.getBytes("UTF-8");
+                byte[] legacyBuf = legacyPayload.getBytes("UTF-8");
 
                 String subnetBcast = getWifiBroadcastAddress();
                 String[] targets = subnetBcast.equals("255.255.255.255")
                         ? new String[]{"255.255.255.255"}
                         : new String[]{subnetBcast, "255.255.255.255"};
 
-                 for (String target : targets) {
+                for (String target : targets) {
+                    // 先发 v2 新前缀
                     try {
-                        java.net.DatagramPacket packet = new java.net.DatagramPacket(
-                                buf, buf.length, java.net.InetAddress.getByName(target), 8888);
-                        socket.send(packet);
+                        java.net.DatagramPacket p = new java.net.DatagramPacket(
+                                chatBuf, chatBuf.length, java.net.InetAddress.getByName(target), 8888);
+                        socket.send(p);
                         FileLogger.log(TrackingService.this, "UDP",
-                                "📡 UDP 已发至 " + target + " | len=" + buf.length
+                                "📡 CHAT 已发至 " + target + " | len=" + chatBuf.length
                                         + " | ip=" + DeviceInfoUtils.getLocalIpAddress());
                     } catch (Exception e) {
                         FileLogger.log(TrackingService.this, "UDP",
-                                "⚠️ 发往 " + target + " 失败: " + e.getMessage());
+                                "⚠️ CHAT 发往 " + target + " 失败: " + e.getMessage());
                     }
+                    // [COMPAT-20261105-v1] 旧前缀兜底（旧 APK 只认这个），v1 全部下线后删除本段
+                    try {
+                        java.net.DatagramPacket p = new java.net.DatagramPacket(
+                                legacyBuf, legacyBuf.length, java.net.InetAddress.getByName(target), 8888);
+                        socket.send(p);
+                    } catch (Exception e) {
+                        FileLogger.log(TrackingService.this, "UDP",
+                                "⚠️ LEGACY 发往 " + target + " 失败: " + e.getMessage());
+                    }
+                    // [/COMPAT-20261105-v1]
                 }
             } catch (Exception e) {
                 Log.e("TrackingService", "UDP 发送失败: " + e.toString());
@@ -2283,6 +2314,73 @@ public class TrackingService extends Service implements LocationListener {
                 if (socket != null && !socket.isClosed()) try { socket.close(); } catch (Exception ignored) {}
             }
         }).start();
+    }
+
+    // ==================== P0-1/P0-2 辅助方法 ====================
+
+    /** recentExecutions 惰性清理阈值（防止 P0-2 改 Key 后内存无界增长） */
+    private static final int RECENT_EXECUTIONS_MAX = 200;
+
+    /**
+     * P0-2 统一去重判断：60 秒内同 key 视为重复。
+     * - 命中且未过期：返回 true
+     * - 命中且已过期：删除该 key，返回 false
+     * - 未命中：若表超过阈值，清理全部过期项，返回 false
+     */
+    private boolean isRecentlyExecuted(String dedupKey) {
+        long now = System.currentTimeMillis();
+        Long last = recentExecutions.get(dedupKey);
+        if (last != null) {
+            if (now - last < CMD_TIME_WINDOW_MS) return true;
+            recentExecutions.remove(dedupKey);
+        }
+        // 惰性清理：超过阈值时批量清掉所有过期的 key
+        if (recentExecutions.size() > RECENT_EXECUTIONS_MAX) {
+            recentExecutions.entrySet().removeIf(e -> now - e.getValue() > CMD_TIME_WINDOW_MS);
+        }
+        return false;
+    }
+
+    /**
+     * P0-2 统一 dedupKey 生成：HTTP action 与 UDP 前缀在此汇合。
+     * - custom_msg / FLOAT / MSG-3段 → "custom_msg|" + content
+     * - chat_msg / CHAT / MSG-4段   → "chat_msg|" + content
+     * - 其余指令 → cmdType 本身（无 payload 区分需求）
+     */
+    private String buildDedupKey(String cmdType, String payload) {
+        if ("custom_msg".equals(cmdType)) {
+            return "custom_msg|" + (payload == null ? "" : payload);
+        }
+        if ("chat_msg".equals(cmdType)) {
+            return "chat_msg|" + (payload == null ? "" : payload);
+        }
+        return cmdType;
+    }
+
+    /**
+     * 收聊天的公共逻辑（新 CHAT 前缀 / 旧 MSG-4段 兼容块共用）。
+     * 原 UDP 监听里的聊天处理逻辑抽此方法，避免两处重复。
+     */
+    private void handleIncomingChat(String senderId, String msgContent) {
+        // 自己发的忽略
+        if (senderId.equals(getUniqueDeviceId())) return;
+
+        // 3 秒内同内容去重（子网+全局双发会收到 2 个包）
+        String dedupKey = senderId + ":" + msgContent;
+        long now = System.currentTimeMillis();
+        if (dedupKey.equals(lastReceivedMsg) && (now - lastReceivedMsgTime < 3000)) return;
+        lastReceivedMsg = dedupKey;
+        lastReceivedMsgTime = now;
+
+        // 短名称：去掉 device_id 末尾的 _xxxx 后缀
+        String shortName = senderId;
+        if (shortName.contains("_")) shortName = shortName.substring(0, shortName.lastIndexOf("_"));
+
+        saveChatToHistory("[" + shortName + "] " + msgContent);
+        FileLogger.log(this, "CHAT", "收到来自 " + shortName + " 的消息: " + msgContent);
+        if (ChatActivity.isForeground) {
+            sendBroadcast(new Intent("UPDATE_CHAT_UI"));
+        }
     }
 
     private void startRescueListener() {
@@ -2379,29 +2477,58 @@ public class TrackingService extends Service implements LocationListener {
                             playAlarm();
                             recentExecutions.put("play_alarm", System.currentTimeMillis());
                         }
-                    } else if (message.startsWith("FIND_ME_MSG:")) {
+                    // ===== [P0-1] 悬浮文字：v2 新前缀 =====
+                    // 格式：FIND_ME_FLOAT:secret:content（content 可含冒号，split limit=3 完整保留）
+                    else if (message.startsWith(FIND_ME_FLOAT_MSG + ":")) {
+                        String[] parts = message.split(":", 3);
+                        if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
+                            String content = parts[2].trim();
+                            String dk = buildDedupKey("custom_msg", content);
+                            if (!isRecentlyExecuted(dk)) {
+                                showFloatingMessage(content);
+                                recentExecutions.put(dk, System.currentTimeMillis());
+                            }
+                        }
+                    }
+                    // ===== [P0-1] 聊天：v2 新前缀 =====
+                    // 格式：FIND_ME_CHAT:secret:sender:content
+                    else if (message.startsWith(FIND_ME_CHAT_MSG + ":")) {
+                        String[] parts = message.split(":", 4);
+                        if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
+                            String senderId = parts[2].trim();
+                            String content = parts[3].trim();
+                            String dk = buildDedupKey("chat_msg", content);
+                            if (!isRecentlyExecuted(dk)) {
+                                handleIncomingChat(senderId, content);
+                                recentExecutions.put(dk, System.currentTimeMillis());
+                            }
+                        }
+                    }
+                    // [COMPAT-20261105-v1] 旧 FIND_ME_MSG 前缀兼容：3 段=悬浮，4 段=聊天
+                    // 旧 APK 全部下线后整块删除，同时删除常量区 FIND_ME_MSG_LEGACY
+                    else if (message.startsWith(FIND_ME_MSG_LEGACY + ":")) {
                         String[] parts = message.split(":", 4);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
-                            showFloatingMessage(parts[2].trim());
-                            recentExecutions.put("custom_msg", System.currentTimeMillis());
-                        } else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
-                            String senderId = parts[2].trim();
-                            String msgContent = parts[3].trim();
-                            if (senderId.equals(getUniqueDeviceId())) continue;
-                            String dedupKey = senderId + ":" + msgContent;
-                            long now = System.currentTimeMillis();
-                            if (dedupKey.equals(lastReceivedMsg) && (now - lastReceivedMsgTime < 3000)) continue;
-                            lastReceivedMsg = dedupKey; lastReceivedMsgTime = now;
-                            String shortName = senderId;
-                            if (shortName.contains("_")) shortName = shortName.substring(0, shortName.lastIndexOf("_"));
-                            saveChatToHistory("[" + shortName + "] " + msgContent);
-                            FileLogger.log(TrackingService.this, "CHAT", "收到来自 " + shortName + " 的消息: " + msgContent);
-                            if (ChatActivity.isForeground) {
-                                Intent updateIntent = new Intent("UPDATE_CHAT_UI");
-                                sendBroadcast(updateIntent);
+                            // 3 段=悬浮，映射到与 FLOAT 相同的 dedupKey（避免 PC 双发时执行两次）
+                            String content = parts[2].trim();
+                            String dk = buildDedupKey("custom_msg", content);
+                            if (!isRecentlyExecuted(dk)) {
+                                showFloatingMessage(content);
+                                recentExecutions.put(dk, System.currentTimeMillis());
                             }
-                            recentExecutions.put("chat_msg", System.currentTimeMillis());
+                        } else if (parts.length == 4 && RESCUE_SECRET.equals(parts[1])) {
+                            // 4 段=聊天，映射到与 CHAT 相同的 dedupKey
+                            String senderId = parts[2].trim();
+                            String content = parts[3].trim();
+                            String dk = buildDedupKey("chat_msg", content);
+                            if (!isRecentlyExecuted(dk)) {
+                                handleIncomingChat(senderId, content);
+                                recentExecutions.put(dk, System.currentTimeMillis());
+                            }
                         }
+                    }
+                    // [/COMPAT-20261105-v1]
+                    
                     } else if (message.startsWith("FIND_ME_CLEAR_HISTORY:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
@@ -2594,16 +2721,17 @@ public class TrackingService extends Service implements LocationListener {
 
                         if (executedIds.contains(cmdId)) continue;
 
-                        Long lastExec = recentExecutions.get(cmdType);
-                        if (lastExec != null && (now - lastExec) < CMD_TIME_WINDOW_MS) {
+                        // [P0-2] 用 buildDedupKey 生成 Key，同类型不同 payload 不再互相误杀
+                        String dk = buildDedupKey(cmdType, cmdPayload);
+                        if (isRecentlyExecuted(dk)) {
                             executedIds.add(cmdId);
                             FileLogger.log(TrackingService.this, "HTTP_CMD",
-                                    "⏭ 跳过 " + cmdType + "(" + cmdId + ")（60秒内已通过UDP执行）");
+                                    "⏭ 跳过 " + cmdType + "(" + cmdId + ")（60秒内已通过UDP执行, key=" + dk + "）");
                             continue;
                         }
 
                         dispatchHttpCommand(cmdType, cmdPayload);
-                        recentExecutions.put(cmdType, now);
+                        recentExecutions.put(dk, now);
                         executedIds.add(cmdId);
                         executedCount++;
                         FileLogger.log(TrackingService.this, "HTTP_CMD",
