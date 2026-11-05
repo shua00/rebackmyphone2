@@ -2526,8 +2526,7 @@ public class TrackingService extends Service implements LocationListener {
                         }
                     }
                     // [/COMPAT-20261105-v1]
-                    
-                    } else if (message.startsWith("FIND_ME_CLEAR_HISTORY:")) {
+                    else if (message.startsWith("FIND_ME_CLEAR_HISTORY:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             clearMessageHistory();
