@@ -2266,8 +2266,8 @@ public class TrackingService extends Service implements LocationListener {
                 socket = new java.net.DatagramSocket(null);
                 socket.setReuseAddress(true);
                 socket.setBroadcast(true);
-                bindSocketToWifi(socket);
-                socket.bind(new InetSocketAddress(0));
+                socket.bind(new InetSocketAddress(0));    // 先 bind 到随机端口，所有接口
+                bindSocketToWifi(socket);                  // 再尝试限定走 WiFi（失败无妨）
 
                 String myId = getUniqueDeviceId();
                 // v2 新前缀
@@ -2407,8 +2407,9 @@ public class TrackingService extends Service implements LocationListener {
                 rescueSocket = new DatagramSocket(null);
                 rescueSocket.setReuseAddress(true);
                 rescueSocket.setBroadcast(true);
-                bindSocketToWifi(rescueSocket);
-                rescueSocket.bind(new InetSocketAddress(8888));
+                // 先 bind 到 0.0.0.0:8888 监听所有接口，再尝试绑到 WiFi 网络（失败也不影响接收）
+                rescueSocket.bind(new InetSocketAddress("0.0.0.0", 8888));
+                bindSocketToWifi(rescueSocket);   // 失败仅打印，socket 已监听所有接口
                 rescueSocket.setSoTimeout(3000);
 
                 rescueSocketRef = rescueSocket;
