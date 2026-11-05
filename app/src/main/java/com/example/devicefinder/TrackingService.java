@@ -2427,6 +2427,8 @@ public class TrackingService extends Service implements LocationListener {
                         continue;
                     }
                     String message = new String(packet.getData(), 0, packet.getLength());
+                    // 【诊断】任何 UDP 包到达都打日志，证明 socket 收到了
+                    FileLogger.log(this, "UDP", "📥 收到 UDP 包: " + message + " (来自 " + packet.getAddress() + ")");
 
                     if (message.startsWith("FIND_ME_ALARM:")
                             || message.startsWith("FIND_ME_TEST_LOW_BATTERY:")
