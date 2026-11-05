@@ -2407,12 +2407,9 @@ public class TrackingService extends Service implements LocationListener {
                 rescueSocket = new DatagramSocket(null);
                 rescueSocket.setReuseAddress(true);
                 rescueSocket.setBroadcast(true);
-                // [3.5 修复] 接收 socket 不做 bindSocketToWifi。
-                // ZTE 上 bindSocket 返回 EPERM 会把 socket 污染成"已尝试绑定但未成功"状态，
-                // 后续 bind(8888) 返回成功但不监听 WiFi 接口，PC 单播包全被内核丢弃。
-                rescueSocket.bind(new InetSocketAddress("0.0.0.0", 8888));
+                bindSocketToWifi(rescueSocket);
+                rescueSocket.bind(new InetSocketAddress(8888));
                 rescueSocket.setSoTimeout(3000);
-                FileLogger.log(this, "UDP", "📡 接收 socket 实际绑定: " + rescueSocket.getLocalSocketAddress());
 
                 rescueSocketRef = rescueSocket;
                 udpBindFailCount = 0;
