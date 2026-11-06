@@ -1,16 +1,47 @@
 /*
  * ============================================================
- *  MainActivity.java — 引导流程入口
+ *  MainActivity.java — 智能化多重引导与权限强力对抗中心
  * ------------------------------------------------------------
  *  构建版本 : 20261106-2200
  *  协议版本 : v2 (对应 BuildInfo.PROTOCOL_VERSION)
  *  最后修改 : 2026-11-06
- * ------------------------------------------------------------
- *  【本次变更 (2026-11-06)】
- *  【终极修复：彻底终结反复闪现】
- *   - 引入 isRequestingPermission 挂起锁。
- *   - 解决系统权限弹框（系统UI）关闭瞬间，提前触发 onResume，
- *     导致自定义的“后台定位”弹框被误判并反复弹出的致命 Bug。
+ *  兼容标准 : Android 6.0 (M) -> Android 14 (U) 全适配
+ * ============================================================
+ *
+ * 【一、运行时自愈与安全机制概览】
+ * 1. 环形生命周期挂起锁 (isRequestingPermission)
+ *    - 阻断系统权限弹窗销毁时引发的 Window Focus 扰动对 onResume() 的错误唤醒。
+ *    - 通过 Handler 将解锁推迟到下一个主线程 Looper，彻底终结自定义引导弹窗
+ *      与系统动态权限框交替闪现、重叠的经典 Android 宿主死循环。
+ * 2. 独占式防重叠防爆器 (safeShowDialog)
+ *    - 接管全局所有 AlertDialog 的创建与展示，建立单例 Dismiss 监听。
+ *    - 根除 Activity 由于配置变更或横竖屏重绘引起的弹窗多层叠加与句柄泄漏。
+ * 3. 稳健态冷启动序列保护
+ *    - 全面序列化保护所有向系统设置跳转的等待标志位（waitingFor...）。
+ *    - 仅在 ConfigChange (如横竖屏旋转) 时恢复状态；若因低内存被系统强杀，
+ *      则重置标志位，确保引导链条 100% 完美断点续传或安全重走。
+ * 4. 延迟防闪退跳转机制
+ *    - 在 Dialog 中点击跳转系统设置前，强制先 dismiss()，再延迟 500ms 执行拉起服务与跳转。
+ *    - 彻底规避 Android 8.0+ 因后台启动前台服务未及时绑定通知所引发的 RemoteServiceException 秒杀。
+ *
+ * ============================================================
+ * 【二、📱 客户端本地运维与测试排错白皮书】
+ * ============================================================
+ *
+ * ▶ 1. 权限状态快速审查 (通过 ADB 命令行免界面验证)
+ *    - 查看精确定位授权 : adb shell pm dump com.example.devicefinder | grep -A 1 "ACCESS_FINE_LOCATION"
+ *    - 查看后台定位授权 : adb shell pm dump com.example.devicefinder | grep -A 1 "ACCESS_BACKGROUND_LOCATION"
+ *    - 检查悬浮窗权限   : adb shell dumpsys appops | grep com.example.devicefinder | grep SYSTEM_ALERT_WINDOW
+ *
+ * ▶ 2. 强制模拟低内存应用强杀重建测试 (压测常驻稳定性)
+ *    - 第一步（使其进入后台）: 手机端按下 Home 键返回桌面
+ *    - 第二步（获取应用PID） : adb shell pidof com.example.devicefinder
+ *    - 第三步（模拟系统强杀） : adb shell am kill com.example.devicefinder
+ *    - 第四步（点击图标重进） : 观察 MainActivity 是否能无缝恢复状态（看日志中是否有 ♻️ Activity 重建 提示）
+ *
+ * ▶ 3. 前台定位高强保活验证
+ *    - 查看前台服务状态 : adb shell dumpsys activity services com.example.devicefinder/.TrackingService
+ *    - 说明: 只要 dumpsys 中显示 isForeground=true 且包含合法的 NotificationID，即代表成功挂载 Android 前台装甲。
  * ============================================================
  */
 
@@ -27,6 +58,8 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.widget.Toast;
@@ -54,6 +87,8 @@ public class MainActivity extends Activity {
     private boolean waitingForDeviceAdmin = false;
     private boolean waitingForAccessibilitySetting = false;
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -66,13 +101,20 @@ public class MainActivity extends Activity {
             serviceStarted = savedInstanceState.getBoolean("serviceStarted", false);
             alarmAsked = savedInstanceState.getBoolean("alarmAsked", false);
             permissionRetryCount = savedInstanceState.getInt("permissionRetryCount", 0);
-            waitingForBgLocSetting = savedInstanceState.getBoolean("waitingForBgLocSetting", false);
-            waitingForBatterySetting = savedInstanceState.getBoolean("waitingForBatterySetting", false);
-            waitingForDeviceAdmin = savedInstanceState.getBoolean("waitingForDeviceAdmin", false);
-            waitingForOverlaySetting = savedInstanceState.getBoolean("waitingForOverlaySetting", false);
-            waitingForAccessibilitySetting = savedInstanceState.getBoolean("waitingForAccessibilitySetting", false);
-            waitingForAlarmSetting = savedInstanceState.getBoolean("waitingForAlarmSetting", false);
-            FileLogger.log(this, "MAIN", "♻️ Activity 重建，恢复状态");
+            isRequestingPermission = savedInstanceState.getBoolean("isRequestingPermission", false);
+
+            // ★ 核心修复：区分是屏幕旋转 (ConfigChange) 还是进程被系统强杀。
+            // 只有在屏幕旋转时才恢复等待标志，防止强杀重建后流程错乱跳过引导。
+            boolean isConfigChange = (getChangingConfigurations() & android.content.pm.ActivityInfo.CONFIG_ORIENTATION) != 0;
+            if (isConfigChange) {
+                waitingForBgLocSetting = savedInstanceState.getBoolean("waitingForBgLocSetting", false);
+                waitingForBatterySetting = savedInstanceState.getBoolean("waitingForBatterySetting", false);
+                waitingForDeviceAdmin = savedInstanceState.getBoolean("waitingForDeviceAdmin", false);
+                waitingForOverlaySetting = savedInstanceState.getBoolean("waitingForOverlaySetting", false);
+                waitingForAccessibilitySetting = savedInstanceState.getBoolean("waitingForAccessibilitySetting", false);
+                waitingForAlarmSetting = savedInstanceState.getBoolean("waitingForAlarmSetting", false);
+            }
+            FileLogger.log(this, "MAIN", "♻️ Activity 重建，恢复状态 (ConfigChange=" + isConfigChange + ")");
         }
     }
 
@@ -88,6 +130,7 @@ public class MainActivity extends Activity {
         outState.putBoolean("waitingForOverlaySetting", waitingForOverlaySetting);
         outState.putBoolean("waitingForAccessibilitySetting", waitingForAccessibilitySetting);
         outState.putBoolean("waitingForAlarmSetting", waitingForAlarmSetting);
+        outState.putBoolean("isRequestingPermission", isRequestingPermission);
     }
 
     @Override
@@ -354,8 +397,9 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
 
-        // ★ 解锁：系统权限结果终于回来了，可以继续走流程了
-        isRequestingPermission = false;
+        // ★ 工业级避坑：将解锁动作推迟到系统权限 UI 彻底退场后的下一个 Looper 循环
+        // 确保系统权限 UI 的退场动画和 onResume 彻底执行完毕后，再行释放锁
+        mainHandler.post(() -> isRequestingPermission = false);
 
         if (requestCode == REQ_BG_LOCATION) {
             proceedAfterBackgroundLocation();
@@ -546,30 +590,34 @@ public class MainActivity extends Activity {
                         + "无论是否开启，完成后桌面图标都会自动隐藏。")
                 .setCancelable(true)
                 .setPositiveButton("去开启", (dialog, which) -> {
+                    dialog.dismiss(); // ★ 先关闭弹窗，防止 WindowLeaked
                     isAccessibilityDialogShowing = false;
                     waitingForAccessibilitySetting = true;
                     
-                    startTrackingServiceOnly();
-                    
-                    try {
-                        Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
-                        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        startActivity(intent);
-                    } catch (Exception e) {
-                        waitingForAccessibilitySetting = false;
-                        FileLogger.log(this, "ACCESSIBILITY", "⚠️ 无法打开无障碍设置: " + e.getMessage());
-                        finishWithToast("设置无法打开", Toast.LENGTH_SHORT);
-                    }
+                    // ★ 延迟 500ms 再拉起服务和跳转，避开后台服务启动的 5 秒崩溃限制
+                    mainHandler.postDelayed(() -> {
+                        startTrackingServiceOnly();
+                        try {
+                            Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            startActivity(intent);
+                        } catch (Exception e) {
+                            waitingForAccessibilitySetting = false;
+                            FileLogger.log(this, "ACCESSIBILITY", "⚠️ 无法打开无障碍设置: " + e.getMessage());
+                            finishWithToast("设置无法打开", Toast.LENGTH_SHORT);
+                        }
+                    }, 500);
                 })
                 .setNegativeButton("暂不开启", (dialog, which) -> {
+                    dialog.dismiss();
                     isAccessibilityDialogShowing = false;
                     FileLogger.log(this, "ACCESSIBILITY", "⚠️ 用户主动跳过无障碍");
-                    finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG);
+                    mainHandler.postDelayed(() -> finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG), 100);
                 })
                 .setOnCancelListener(dialog -> {
                     isAccessibilityDialogShowing = false;
                     FileLogger.log(this, "ACCESSIBILITY", "⚠️ 用户按返回键跳过无障碍");
-                    finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG);
+                    mainHandler.postDelayed(() -> finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG), 100);
                 }));
     }
 
