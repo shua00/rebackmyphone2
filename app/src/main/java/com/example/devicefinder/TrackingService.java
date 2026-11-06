@@ -174,15 +174,14 @@ public class TrackingService extends Service implements LocationListener {
     @Override
     public void onCreate() {
         super.onCreate();
+        // ★ 第一件事：立刻挂起前台通知，防止 ANR
+        startForegroundNotification(); 
+        
         serviceCreateTimeMs = SystemClock.elapsedRealtime();
-
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-
         FileLogger.log(this, "SERVICE", "🚀 追踪服务已启动 (或复活)");
-
         logStartupSelfCheck();
-
-        startForegroundNotification();
+        // ... 后面的代码保持不变
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm != null) {
@@ -1386,7 +1385,7 @@ public class TrackingService extends Service implements LocationListener {
             }
         } catch (Exception e) {
             FileLogger.log(this, "SERVICE", "❌ 带 location type 的 startForeground 失败: " + e.getMessage());
-            // ★ 降级尝试：使用 dataSync 类型（Manifest 已声明 location|dataSync 双类型）
+            // ★ 降级尝试：使用 dataSync 类型
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
@@ -1396,9 +1395,13 @@ public class TrackingService extends Service implements LocationListener {
                 FileLogger.log(this, "SERVICE", "✅ 已降级为 dataSync 类型前台服务");
             } catch (Exception e2) {
                 FileLogger.log(this, "SERVICE", "❌❌ 所有类型均失败，服务可能被系统清理: " + e2.getMessage());
+                // ★ [终极兜底] 如果服务彻底起不来，必须把隐藏的图标恢复，否则用户彻底失联！
+                try {
+                    LauncherIconUtils.setLauncherIconVisible(this, true);
+                    FileLogger.log(this, "SERVICE", "⚠️ 已强制恢复桌面图标，防止失联");
+                } catch (Exception ignored) {}
             }
         }
-    }
 
     private void scheduleHeartbeatAlarm() {
         if (alarmManager == null) return;
