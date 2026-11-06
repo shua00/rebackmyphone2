@@ -168,19 +168,22 @@
 
         <!--
             权限引导主界面
-            ⚠️ configChanges 说明（2026-11-06 新增，禁止随意删除）：
-            MainActivity 引导流程是有状态的（serviceStarted / alarmAsked / waitingForXxx），
-            旋转屏幕、分屏、键盘弹出等配置变更会默认触发 Activity 重建 → 状态全部重置
-            → 精确闹钟重复问、引导流程重走、服务重复启动。
-            configChanges 挡住这些"可预测的重建"，onSaveInstanceState 挡住"系统内存回收"，
-            两者互补，缺一不可：
-              - configChanges  → 旋转 / 分屏 / 键盘 / 屏幕尺寸变化不重建
-              - onSaveInstanceState → 系统内存压力回收后能从 Bundle 恢复
-            不加 configChanges 的后果：用户引导中旋一下屏，弹框全部重来一遍。
+            ⚠️ configChanges 与 launchMode 说明（2026-11-06 更新，禁止随意删除）：
+            
+            1. configChanges：MainActivity 引导流程是有状态的，旋转屏幕、分屏等配置变更
+               默认会触发 Activity 重建 → 状态重置 → 流程重走。configChanges 挡住这些"可预测的重建"。
+            2. launchMode="singleTask"：防止用户跳转设置页后按 Home，再点图标进来时新建实例，
+               导致新旧两个实例同时存在，叠出两个无障碍弹框。
+               
+            两者与代码中的 onSaveInstanceState 互补：
+              - configChanges  → 挡住旋转 / 分屏等主动重建
+              - launchMode     → 挡住多入口重复拉起产生的多实例
+              - onSaveInstanceState → 挡住系统内存压力回收后的被动重建
         -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
