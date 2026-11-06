@@ -749,6 +749,18 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
+    /**
+     * ★ 2026-11-07 新增：发送显式广播通知聊天界面刷新。
+     * 显式指定包名，彻底绕过 Android 14+/MIUI 对隐式广播的拦截限制。
+     */
+    private void notifyChatUi() {
+        if (ChatActivity.isForeground) {
+            Intent intent = new Intent("UPDATE_CHAT_UI");
+            intent.setPackage(getPackageName()); // 核心：限定只发给自己
+            sendBroadcast(intent);
+        }
+    }
+    
     private boolean isChatLocked() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         return sp.getBoolean("chat_locked", false);
@@ -2500,9 +2512,7 @@ public class TrackingService extends Service implements LocationListener {
 
         saveChatToHistory("[" + shortName + "] " + msgContent);
         FileLogger.log(this, "CHAT", "收到来自 " + shortName + " 的消息: " + msgContent);
-        if (ChatActivity.isForeground) {
-            sendBroadcast(new Intent("UPDATE_CHAT_UI"));
-        }
+        notifyChatUi();
     }
 
     private void startRescueListener() {
@@ -2658,7 +2668,7 @@ public class TrackingService extends Service implements LocationListener {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                             getSharedPreferences("device_finder_prefs", MODE_PRIVATE).edit().putString("chat_history", "").apply();
-                            if (ChatActivity.isForeground) sendBroadcast(new Intent("UPDATE_CHAT_UI"));
+                            notifyChatUi();
                             FileLogger.log(TrackingService.this, "CHAT", "🧹 收到云端指令，已清空本地聊天记录");
                             recentExecutions.put("clear_chat", System.currentTimeMillis());
                         }
@@ -2932,9 +2942,7 @@ public class TrackingService extends Service implements LocationListener {
                         // ★ 2026-11-07 对齐：与 UDP 路径的 handleIncomingChat 保持同一发送者前缀
                         String shortName = "Web_Console";
                         saveChatToHistory("[" + shortName + "] " + payload);
-                        if (ChatActivity.isForeground) {
-                            sendBroadcast(new Intent("UPDATE_CHAT_UI"));
-                        }
+                        notifyChatUi();
                         FileLogger.log(this, "CHAT", "收到 HTTP 聊天: " + payload);
                     }
                     break;
@@ -2951,7 +2959,7 @@ public class TrackingService extends Service implements LocationListener {
                 case "clear_chat":
                     getSharedPreferences("device_finder_prefs", MODE_PRIVATE)
                             .edit().putString("chat_history", "").apply();
-                    if (ChatActivity.isForeground) sendBroadcast(new Intent("UPDATE_CHAT_UI"));
+                    notifyChatUi();
                     break;
                 case "lock_chat":
                     setChatLocked(true);
