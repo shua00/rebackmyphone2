@@ -114,10 +114,15 @@ public class ChatActivity extends Activity {
             // 【新增】拦截暗号清空指令
             if ("/clear".equalsIgnoreCase(msg)) {
                 SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
-                sp.edit().putString("chat_history", "").apply();
+                // ★ 2026-11-07 加固：/clear 属低频操作，用 commit() 同步落盘，
+                //   避免与 TrackingService 的 UDP 接收线程并发写入时被 apply() 的异步落盘覆盖。
+                sp.edit().putString("chat_history", "").commit();
                 Toast.makeText(this, "🧹 聊天记录已清空", Toast.LENGTH_SHORT).show();
+                // 同步通知后台刷新（虽然 isForeground=true 时本 Activity 自己刷新即可，
+                // 但显式广播可保证未来若服务端缓存了聊天快照也能一并清空）
+                sendBroadcast(new Intent("UPDATE_CHAT_UI"));
                 refreshHistory(false);
-                return; // 直接返回，不发送
+                return;
             }
 
             SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
