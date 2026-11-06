@@ -15,6 +15,7 @@
  *   - 修复通知权限复用 REQ_PERMISSIONS 导致的后台定位回环
  *   - 修复隐藏图标异常阻断 Toast / finish（try/catch 兜底）
  *   - 新增 onSaveInstanceState 状态保存，防系统回收后流程重走
+ *   - 修复设备管理器返回后，系统拉取前台服务导致 onResume 被二次触发，从而误杀无障碍弹框的 bug
  *
  *  【核心约束（改代码前必读）】
  *   - 无障碍可跳过，不强制
@@ -60,6 +61,11 @@ public class MainActivity extends Activity {
     private boolean alarmAsked = false;
     // permissionRetryCount：防御性兜底。正常流程不会触发 >=2 分支。
     private int permissionRetryCount = 0;
+    
+    // ===== 防误杀护盾 =====
+    // 记录无障碍 Dialog 是否正在显示。前台服务启动瞬间，某些 ROM 会触发微小的失焦/获焦，
+    // 导致 onResume 被二次调用。有了这个标志，可防止第二次 onResume 把带有 Dialog 的 Activity 误杀。
+    private boolean isAccessibilityDialogShowing = false;
 
     // ===== 等待标志位 =====
     // 用法：置 true 表示"已跳设置页，等待用户返回"；onResume 命中对应分支后第一步清 false，再往下走。
@@ -194,6 +200,10 @@ public class MainActivity extends Activity {
 
         // 服务已启动过：直接结束，不留空白页
         if (serviceStarted) {
+            // ★ [核心修复] 如果无障碍 Dialog 正在显示，说明系统拉前台服务引发了重绘，绝不能 finish
+            if (isAccessibilityDialogShowing) {
+                return;
+            }
             finish();
             return;
         }
@@ -613,6 +623,8 @@ public class MainActivity extends Activity {
             return;
         }
 
+        isAccessibilityDialogShowing = true; // ★ 升起防误杀护盾
+
         new AlertDialog.Builder(this)
                 .setTitle("开启无障碍保活服务（推荐）")
                 .setMessage("为保证 App 被系统清理后能自动复活，推荐开启无障碍服务。\n\n"
@@ -621,6 +633,7 @@ public class MainActivity extends Activity {
                         + "无论是否开启，完成后桌面图标都会自动隐藏。")
                 .setCancelable(true)
                 .setPositiveButton("去开启", (dialog, which) -> {
+                    isAccessibilityDialogShowing = false; // 降下护盾
                     waitingForAccessibilitySetting = true;
                     try {
                         Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
@@ -633,10 +646,12 @@ public class MainActivity extends Activity {
                     }
                 })
                 .setNegativeButton("暂不开启", (dialog, which) -> {
+                    isAccessibilityDialogShowing = false; // 降下护盾
                     FileLogger.log(this, "ACCESSIBILITY", "⚠️ 用户主动跳过无障碍");
                     finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG);
                 })
                 .setOnCancelListener(dialog -> {
+                    isAccessibilityDialogShowing = false; // 降下护盾
                     FileLogger.log(this, "ACCESSIBILITY", "⚠️ 用户按返回键跳过无障碍");
                     finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG);
                 })
