@@ -180,16 +180,21 @@
               - launchMode     → 挡住多入口重复拉起产生的多实例
               - onSaveInstanceState → 挡住系统内存压力回收后的被动重建
         -->
-        <activity
-            android:name=".MainActivity"
+        <!-- ★ [修复] 2026-11-06 修正无障碍 Action 和 Meta-data 名称，使其能被系统正确识别 -->
+        <service
+            android:name=".MyAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="true"
-            android:launchMode="singleTask"
-            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+            android:label="系统安全服务（无障碍）">
             <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.DEFAULT" />
+                <!-- 正确写法：android.accessibilityservice.AccessibilityService -->
+                <action android:name="android.accessibilityservice.AccessibilityService" />
             </intent-filter>
-        </activity>
+            <!-- 正确写法：android.accessibilityservice -->
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
 
         <!-- 桌面启动别名（供 LauncherIconUtils 动态显示/隐藏图标） -->
         <activity-alias
