@@ -1373,19 +1373,15 @@ public class TrackingService extends Service implements LocationListener {
         Notification notification = builder.setContentTitle("系统同步").setContentText("正在运行...").setSmallIcon(iconRes).setContentIntent(chatPi).setOngoing(true).build();
         notification.priority = Notification.PRIORITY_MIN;
 
-        // ★ 修改：startForeground 增加容错降级 2026-11-04 14:15
-        // ★ [修复] 2026-11-04 Android 14+ 不带类型的 startForeground 会被系统直接禁止
-        //   降级必须用 dataSync 类型，不能退回无类型调用。
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+ 统一带 LOCATION 类型
                 startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
             } else {
                 startForeground(1001, notification);
             }
         } catch (Exception e) {
             FileLogger.log(this, "SERVICE", "❌ 带 location type 的 startForeground 失败: " + e.getMessage());
-            // ★ 降级尝试：使用 dataSync 类型
+            // 降级尝试：使用 dataSync 类型
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
@@ -1402,6 +1398,7 @@ public class TrackingService extends Service implements LocationListener {
                 } catch (Exception ignored) {}
             }
         }
+    }
 
     private void scheduleHeartbeatAlarm() {
         if (alarmManager == null) return;
