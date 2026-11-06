@@ -166,10 +166,22 @@
             android:excludeFromRecents="true" 
             android:taskAffinity="com.example.devicefinder.chat" />
 
-        <!-- 权限引导主界面 -->
+        <!--
+            权限引导主界面
+            ⚠️ configChanges 说明（2026-11-06 新增，禁止随意删除）：
+            MainActivity 引导流程是有状态的（serviceStarted / alarmAsked / waitingForXxx），
+            旋转屏幕、分屏、键盘弹出等配置变更会默认触发 Activity 重建 → 状态全部重置
+            → 精确闹钟重复问、引导流程重走、服务重复启动。
+            configChanges 挡住这些"可预测的重建"，onSaveInstanceState 挡住"系统内存回收"，
+            两者互补，缺一不可：
+              - configChanges  → 旋转 / 分屏 / 键盘 / 屏幕尺寸变化不重建
+              - onSaveInstanceState → 系统内存压力回收后能从 Bundle 恢复
+            不加 configChanges 的后果：用户引导中旋一下屏，弹框全部重来一遍。
+        -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.DEFAULT" />
