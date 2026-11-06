@@ -2,13 +2,15 @@
  * ============================================================
  *  MainActivity.java — 引导流程入口
  * ------------------------------------------------------------
- *  构建版本 : 20261106-1308
+ *  构建版本 : 20261106-2200
  *  协议版本 : v2 (对应 BuildInfo.PROTOCOL_VERSION)
  *  最后修改 : 2026-11-06
  * ------------------------------------------------------------
  *  【本次变更 (2026-11-06)】
+ *   - 引入 safeShowDialog 全局安全拦截机制，彻底根治系统重绘导致的弹框反复闪现问题
+ *   - 移除初版 isFirstLaunch 判断，消除 Activity 重建时可能导致的流程死锁隐患
  *   - 修复无障碍弹框闪现消失：弹框期间坚决不启动服务，彻底避开系统 Task 栈刷新误杀
- *   - 修复按 Home 键返回导致叠弹框：入口处增加 isAccessibilityDialogShowing 防重入
+ *   - 修复按 Home 键返回导致叠弹框：入口处增加防重入逻辑
  *   - 修复服务启动失败导致彻底失联：启动失败时保留桌面图标，并合并 Toast 提示
  *   - 修复设备管理器返回后，系统拉取前台服务导致 onResume 被二次触发误杀弹框的 bug
  *   - 修复无障碍引导"一闪而过"：Dialog 回调内收尾，不再提前 finish()
@@ -26,6 +28,7 @@
  *   - onCreate 不得调 checkAndRequestPermissions()（会双弹窗）
  *   - 所有"跳设置页"必须用 waitingForXxx 标志，否则返回后状态丢失
  *   - 弹框显示期间，绝对不可启动服务或隐藏图标
+ *   - 所有自定义弹框必须走 safeShowDialog，严禁直接 new AlertDialog().show()
  *
  *  【流程概览】
  *   精确闹钟 → 运行时权限 → 后台定位 → 通知权限
@@ -60,7 +63,11 @@ public class MainActivity extends Activity {
     private boolean serviceStarted = false;
     private boolean alarmAsked = false;
     private int permissionRetryCount = 0;
+    
+    // 记录无障碍弹框是否正在显示（防系统误杀）
     private boolean isAccessibilityDialogShowing = false; 
+    // 记录全局是否有任何自定义弹框正在显示（防系统重绘导致的叠弹框）
+    private boolean isAnyDialogShowing = false;
 
     private boolean waitingForAlarmSetting = false;
     private boolean waitingForBgLocSetting = false;
@@ -87,6 +94,7 @@ public class MainActivity extends Activity {
             waitingForOverlaySetting = savedInstanceState.getBoolean("waitingForOverlaySetting", false);
             waitingForAccessibilitySetting = savedInstanceState.getBoolean("waitingForAccessibilitySetting", false);
             waitingForAlarmSetting = savedInstanceState.getBoolean("waitingForAlarmSetting", false);
+            FileLogger.log(this, "MAIN", "♻️ Activity 重建，恢复状态");
         }
     }
 
@@ -107,6 +115,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+
+        // ★ 当用户从设置页返回（或系统重绘）时，强制重置全局弹框标志，
+        // 因为跳转设置页时，上一个自定义 Dialog 肯定已经被系统 dismiss 了。
+        isAnyDialogShowing = false;
 
         if (waitingForAlarmSetting) {
             waitingForAlarmSetting = false;
@@ -173,14 +185,30 @@ public class MainActivity extends Activity {
         }
 
         if (serviceStarted) {
-            if (isAccessibilityDialogShowing) {
+            if (isAccessibilityDialogShowing || isAnyDialogShowing) {
                 return;
             }
             finish();
             return;
         }
 
+        // ★ 核心安检：如果当前已经有我们的弹框在显示，说明是系统重绘导致的二次 onResume，直接忽略
+        if (isAnyDialogShowing) {
+            return;
+        }
+
         checkAndRequestPermissions();
+    }
+
+    // ★ 全局安全弹框，彻底杜绝重绘导致的叠框
+    private void safeShowDialog(AlertDialog.Builder builder) {
+        if (isAnyDialogShowing || isFinishing() || isDestroyed()) {
+            return; // 已经有弹框了，或者界面正在关闭，直接拦截
+        }
+        isAnyDialogShowing = true;
+        AlertDialog dialog = builder.create();
+        dialog.setOnDismissListener(d -> isAnyDialogShowing = false);
+        dialog.show();
     }
 
     private void checkAndRequestPermissions() {
@@ -193,7 +221,7 @@ public class MainActivity extends Activity {
             AlarmManager alarmManager = (AlarmManager) getSystemService(ALARM_SERVICE);
             if (alarmManager != null && !alarmManager.canScheduleExactAlarms()) {
                 alarmAsked = true;
-                new AlertDialog.Builder(this)
+                safeShowDialog(new AlertDialog.Builder(this)
                         .setTitle("建议允许精确闹钟")
                         .setMessage("允许精确闹钟后，手机息屏时定位上报会更准点。\n\n"
                                 + "• 点击「去设置」→ 开启「闹钟和提醒」\n"
@@ -211,8 +239,7 @@ public class MainActivity extends Activity {
                                 checkAndRequestPermissions();
                             }
                         })
-                        .setNegativeButton("暂不开启", (dialog, which) -> checkAndRequestPermissions())
-                        .show();
+                        .setNegativeButton("暂不开启", (dialog, which) -> checkAndRequestPermissions()));
                 return;
             }
         }
@@ -262,7 +289,7 @@ public class MainActivity extends Activity {
 
         if (needBgLoc) {
             if (Build.VERSION.SDK_INT >= 30) {
-                new AlertDialog.Builder(this)
+                safeShowDialog(new AlertDialog.Builder(this)
                         .setTitle("设置后台定位")
                         .setMessage("请在下个页面选择「权限」→「位置信息」→「始终允许」。")
                         .setCancelable(false)
@@ -276,7 +303,7 @@ public class MainActivity extends Activity {
                                 waitingForBgLocSetting = false;
                                 proceedAfterBackgroundLocation();
                             }
-                        }).show();
+                        }));
             } else {
                 requestPermissions(
                         new String[]{Manifest.permission.ACCESS_BACKGROUND_LOCATION},
@@ -293,7 +320,7 @@ public class MainActivity extends Activity {
                 || checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED;
 
         if (!bgLocOk) {
-            new AlertDialog.Builder(this)
+            safeShowDialog(new AlertDialog.Builder(this)
                     .setTitle("后台定位未开启")
                     .setMessage("锁屏后可能无法定位。是否重新去设置？\n\n"
                             + "进入后请找到「位置信息」→ 选择「始终允许」。")
@@ -314,8 +341,7 @@ public class MainActivity extends Activity {
                     .setNegativeButton("暂不开启", (dialog, which) -> {
                         Toast.makeText(this, "⚠️ 未开启后台定位，锁屏后可能无法定位", Toast.LENGTH_LONG).show();
                         checkNotifThenProceed();
-                    })
-                    .show();
+                    }));
             return;
         }
 
@@ -385,7 +411,7 @@ public class MainActivity extends Activity {
     }
 
     private void promptBatteryOptimization() {
-        new AlertDialog.Builder(this)
+        safeShowDialog(new AlertDialog.Builder(this)
                 .setTitle("必须关闭电池优化")
                 .setMessage("为保证息屏后仍能持续上报位置，\n请将本应用设为「不限制」。")
                 .setCancelable(false)
@@ -393,11 +419,11 @@ public class MainActivity extends Activity {
                     waitingForBatterySetting = true;
                     openBatteryOptimizationSettings();
                 })
-                .setNegativeButton("暂时跳过", (dialog, which) -> checkOverlayPermission()).show();
+                .setNegativeButton("暂时跳过", (dialog, which) -> checkOverlayPermission()));
     }
 
     private void promptBatteryOptimizationAgain() {
-        new AlertDialog.Builder(this)
+        safeShowDialog(new AlertDialog.Builder(this)
                 .setTitle("电池优化仍未关闭")
                 .setMessage("系统限制尚未解除，息屏后可能无法定位。")
                 .setCancelable(false)
@@ -405,7 +431,7 @@ public class MainActivity extends Activity {
                     waitingForBatterySetting = true;
                     openBatteryOptimizationSettings();
                 })
-                .setNegativeButton("放弃", (dialog, which) -> checkOverlayPermission()).show();
+                .setNegativeButton("放弃", (dialog, which) -> checkOverlayPermission()));
     }
 
     private void openBatteryOptimizationSettings() {
@@ -425,7 +451,7 @@ public class MainActivity extends Activity {
 
     private void checkOverlayPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            new AlertDialog.Builder(this)
+            safeShowDialog(new AlertDialog.Builder(this)
                     .setTitle("开启悬浮窗权限")
                     .setMessage("用于提升后台存活率和显示提示，请在下一页允许「显示在其他应用上层」。")
                     .setCancelable(false)
@@ -435,7 +461,7 @@ public class MainActivity extends Activity {
                                 Uri.parse("package:" + getPackageName()));
                         startActivity(intent);
                     })
-                    .setNegativeButton("暂不开启", (dialog, which) -> checkDeviceAdmin()).show();
+                    .setNegativeButton("暂不开启", (dialog, which) -> checkDeviceAdmin()));
         } else {
             checkDeviceAdmin();
         }
@@ -446,7 +472,7 @@ public class MainActivity extends Activity {
         ComponentName adminComponent = new ComponentName(this, MyDeviceAdminReceiver.class);
 
         if (dpm != null && !dpm.isAdminActive(adminComponent)) {
-            new AlertDialog.Builder(this)
+            safeShowDialog(new AlertDialog.Builder(this)
                     .setTitle("开启防卸载保护")
                     .setMessage("为防止应用被恶意卸载，请在下个页面点击「激活」。")
                     .setCancelable(false)
@@ -465,7 +491,7 @@ public class MainActivity extends Activity {
                     .setNegativeButton("暂不开启", (dialog, which) -> {
                         Toast.makeText(this, "⚠️ 未开启防卸载保护", Toast.LENGTH_LONG).show();
                         checkAndOpenAccessibilitySettingsAndFinish();
-                    }).show();
+                    }));
         } else {
             checkAndOpenAccessibilitySettingsAndFinish();
         }
@@ -487,9 +513,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    /**
-     * 启动服务，成功返回 true，失败返回 false 并记日志（由调用方决定如何提示用户）
-     */
     private boolean startTrackingServiceOnly() {
         if (serviceStarted) return true;
         serviceStarted = true;
@@ -509,8 +532,7 @@ public class MainActivity extends Activity {
     }
 
     private void checkAndOpenAccessibilitySettingsAndFinish() {
-        if (isFinishing() || isDestroyed()) return;
-        if (isAccessibilityDialogShowing) return; // 防重入
+        if (isFinishing() || isDestroyed() || isAnyDialogShowing || isAccessibilityDialogShowing) return;
 
         if (isAccessibilityServiceEnabled()) {
             FileLogger.log(this, "ACCESSIBILITY", "✅ 无障碍服务已开启（跳过引导）");
@@ -520,7 +542,7 @@ public class MainActivity extends Activity {
 
         isAccessibilityDialogShowing = true;
 
-        new AlertDialog.Builder(this)
+        safeShowDialog(new AlertDialog.Builder(this)
                 .setTitle("开启无障碍保活服务（推荐）")
                 .setMessage("为保证 App 被系统清理后能自动复活，推荐开启无障碍服务。\n\n"
                         + "• 点击「去开启」跳转到无障碍设置，找到【" + getString(R.string.app_name) + "】并勾选开启\n"
@@ -531,11 +553,7 @@ public class MainActivity extends Activity {
                     isAccessibilityDialogShowing = false;
                     waitingForAccessibilitySetting = true;
                     
-                    // 此时即将切到外部设置页，启动服务不会干扰 UI
-                    boolean ok = startTrackingServiceOnly();
-                    if (!ok) {
-                        Toast.makeText(this, "服务启动失败，但请先完成无障碍设置", Toast.LENGTH_LONG).show();
-                    }
+                    startTrackingServiceOnly();
                     
                     try {
                         Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
@@ -556,8 +574,7 @@ public class MainActivity extends Activity {
                     isAccessibilityDialogShowing = false;
                     FileLogger.log(this, "ACCESSIBILITY", "⚠️ 用户按返回键跳过无障碍");
                     finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG);
-                })
-                .show();
+                }));
     }
 
     private void finishWithToast(String msg, int duration) {
@@ -569,7 +586,6 @@ public class MainActivity extends Activity {
                 FileLogger.log(this, "ICON", "隐藏图标失败: " + e);
             }
         } else {
-            // 合并 Toast 提示，防止连弹三个
             msg = msg + "\n⚠️ 服务启动失败，已保留桌面图标";
             duration = Toast.LENGTH_LONG;
         }
