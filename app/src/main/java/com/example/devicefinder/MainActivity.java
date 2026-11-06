@@ -7,34 +7,10 @@
  *  最后修改 : 2026-11-06
  * ------------------------------------------------------------
  *  【本次变更 (2026-11-06)】
- *   - 引入 safeShowDialog 全局安全拦截机制，彻底根治系统重绘导致的弹框反复闪现问题
- *   - 移除初版 isFirstLaunch 判断，消除 Activity 重建时可能导致的流程死锁隐患
- *   - 修复无障碍弹框闪现消失：弹框期间坚决不启动服务，彻底避开系统 Task 栈刷新误杀
- *   - 修复按 Home 键返回导致叠弹框：入口处增加防重入逻辑
- *   - 修复服务启动失败导致彻底失联：启动失败时保留桌面图标，并合并 Toast 提示
- *   - 修复设备管理器返回后，系统拉取前台服务导致 onResume 被二次触发误杀弹框的 bug
- *   - 修复无障碍引导"一闪而过"：Dialog 回调内收尾，不再提前 finish()
- *   - 修复 onCreate + onResume 双调用导致弹框叠加
- *   - 修复权限回调 grantResults[0] 死循环（改为遍历全部结果）
- *   - 修复精确闹钟反复询问（alarmAsked 标志，只问一次）
- *   - 修复 API 29 后台定位拒绝死循环（REQ_BG_LOCATION 独立回调）
- *   - 修复通知权限复用 REQ_PERMISSIONS 导致的后台定位回环
- *   - 新增 onSaveInstanceState 状态保存，防系统回收后流程重走
- *
- *  【核心约束（改代码前必读）】
- *   - 无障碍可跳过，不强制
- *   - 无论是否开启无障碍，桌面图标都会隐藏（弹框正文已告知）
- *   - 不提示拨号暗号，用户重进靠"系统设置 → 应用管理 → 打开"
- *   - onCreate 不得调 checkAndRequestPermissions()（会双弹窗）
- *   - 所有"跳设置页"必须用 waitingForXxx 标志，否则返回后状态丢失
- *   - 弹框显示期间，绝对不可启动服务或隐藏图标
- *   - 所有自定义弹框必须走 safeShowDialog，严禁直接 new AlertDialog().show()
- *
- *  【流程概览】
- *   精确闹钟 → 运行时权限 → 后台定位 → 通知权限
- *   → 电池优化 → 悬浮窗 → 设备管理 → 无障碍弹框
- *   → （用户交互后）启动服务 → 隐藏图标 → finish
- *   详见 docs/main-activity-flow.md
+ *  【终极修复：彻底终结反复闪现】
+ *   - 引入 isRequestingPermission 挂起锁。
+ *   - 解决系统权限弹框（系统UI）关闭瞬间，提前触发 onResume，
+ *     导致自定义的“后台定位”弹框被误判并反复弹出的致命 Bug。
  * ============================================================
  */
 
@@ -68,6 +44,8 @@ public class MainActivity extends Activity {
     private boolean isAccessibilityDialogShowing = false; 
     // 记录全局是否有任何自定义弹框正在显示（防系统重绘导致的叠弹框）
     private boolean isAnyDialogShowing = false;
+    // ★ 核心挂起锁：是否正在等待系统权限弹框的回调
+    private boolean isRequestingPermission = false;
 
     private boolean waitingForAlarmSetting = false;
     private boolean waitingForBgLocSetting = false;
@@ -116,12 +94,15 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
 
-        // ★ 当用户从设置页返回（或系统重绘）时，强制重置全局弹框标志，
-        // 因为跳转设置页时，上一个自定义 Dialog 肯定已经被系统 dismiss 了。
-        isAnyDialogShowing = false;
+        // ★ 核心拦截：如果系统权限弹框刚刚关闭，结果还没回调（isRequestingPermission=true），
+        // 绝对不许往下走流程，防止强行弹出自定义的“后台定位”框。
+        if (isRequestingPermission) {
+            return;
+        }
 
         if (waitingForAlarmSetting) {
             waitingForAlarmSetting = false;
+            isAnyDialogShowing = false; // 从外部界面返回，强制重置弹框状态
             AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
             boolean ok = am != null && am.canScheduleExactAlarms();
             if (ok) {
@@ -135,6 +116,7 @@ public class MainActivity extends Activity {
 
         if (waitingForDeviceAdmin) {
             waitingForDeviceAdmin = false;
+            isAnyDialogShowing = false; // 强制重置
             android.app.admin.DevicePolicyManager dpm = (android.app.admin.DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
             ComponentName adminComponent = new ComponentName(this, MyDeviceAdminReceiver.class);
             if (dpm != null && dpm.isAdminActive(adminComponent)) {
@@ -148,6 +130,7 @@ public class MainActivity extends Activity {
 
         if (waitingForOverlaySetting) {
             waitingForOverlaySetting = false;
+            isAnyDialogShowing = false; // 强制重置
             if (Settings.canDrawOverlays(this)) {
                 Toast.makeText(this, "✅ 悬浮窗权限已开启", Toast.LENGTH_SHORT).show();
             }
@@ -157,6 +140,7 @@ public class MainActivity extends Activity {
 
         if (waitingForBatterySetting) {
             waitingForBatterySetting = false;
+            isAnyDialogShowing = false; // 强制重置
             if (isBatteryOptimizationIgnored()) {
                 Toast.makeText(this, "✅ 电池优化已关闭", Toast.LENGTH_SHORT).show();
                 checkOverlayPermission();
@@ -168,12 +152,14 @@ public class MainActivity extends Activity {
 
         if (waitingForBgLocSetting) {
             waitingForBgLocSetting = false;
+            isAnyDialogShowing = false; // 强制重置
             proceedAfterBackgroundLocation();
             return;
         }
 
         if (waitingForAccessibilitySetting) {
             waitingForAccessibilitySetting = false;
+            isAnyDialogShowing = false; // 强制重置
             if (isAccessibilityServiceEnabled()) {
                 FileLogger.log(this, "ACCESSIBILITY", "✅ 无障碍已开启（从设置返回）");
                 finishWithToast("✅ 设置完成，无障碍服务已开启", Toast.LENGTH_LONG);
@@ -192,7 +178,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // ★ 核心安检：如果当前已经有我们的弹框在显示，说明是系统重绘导致的二次 onResume，直接忽略
+        // ★ 如果当前已经有任何我们的弹框在显示（比如后台定位框），直接 return
         if (isAnyDialogShowing) {
             return;
         }
@@ -203,7 +189,7 @@ public class MainActivity extends Activity {
     // ★ 全局安全弹框，彻底杜绝重绘导致的叠框
     private void safeShowDialog(AlertDialog.Builder builder) {
         if (isAnyDialogShowing || isFinishing() || isDestroyed()) {
-            return; // 已经有弹框了，或者界面正在关闭，直接拦截
+            return;
         }
         isAnyDialogShowing = true;
         AlertDialog dialog = builder.create();
@@ -277,6 +263,9 @@ public class MainActivity extends Activity {
             if (needNearbyWifi) {
                 perms.add("android.permission.NEARBY_WIFI_DEVICES");
             }
+            
+            // ★ 上锁：告诉 onResume 我正在请求系统权限，不要乱动
+            isRequestingPermission = true; 
             requestPermissions(perms.toArray(new String[0]), REQ_PERMISSIONS);
         } else {
             checkBgLocThenProceed();
@@ -305,6 +294,8 @@ public class MainActivity extends Activity {
                             }
                         }));
             } else {
+                // ★ 上锁
+                isRequestingPermission = true; 
                 requestPermissions(
                         new String[]{Manifest.permission.ACCESS_BACKGROUND_LOCATION},
                         REQ_BG_LOCATION);
@@ -351,6 +342,8 @@ public class MainActivity extends Activity {
     private void checkNotifThenProceed() {
         if (Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            // ★ 上锁
+            isRequestingPermission = true; 
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATION);
         } else {
             proceedAfterPermissions();
@@ -360,6 +353,9 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        // ★ 解锁：系统权限结果终于回来了，可以继续走流程了
+        isRequestingPermission = false;
 
         if (requestCode == REQ_BG_LOCATION) {
             proceedAfterBackgroundLocation();
