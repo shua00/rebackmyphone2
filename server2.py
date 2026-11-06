@@ -7,15 +7,21 @@ import sqlite3
 import gzip
 import os
 import re
+import faulthandler
+import signal
 from urllib.parse import urlparse, parse_qs
 # ★ 新增ThreadPoolExecutor 补丁： 2026-11-05 13:50
 from concurrent.futures import ThreadPoolExecutor
 
 """
 ============================================================
-DeviceFinder server2.py — 全功能同步服务
+DeviceFinder server2.py — 全功能同步服务（终极稳健版）
 ============================================================
-【已实现功能】
+版本发布 : 2026-11-06
+核心架构 : 原生 Socket + 多线程 (ThreadPoolExecutor)
+============================================================
+
+【一、核心功能概览】
 - reports 表完整持久化（含扩展字段 ext_json、SIM 状态等）
 - HTTP 下行队列（pending_commands 双通道下发）
 - UDP 监听 + 聊天室去重
@@ -24,13 +30,59 @@ DeviceFinder server2.py — 全功能同步服务
 - 地图容器延迟初始化（解决手机端白屏）
 - 全前端 JS 已 ES5 化，完美兼容所有浏览器 / 微信 / WebView
 
-【安全性 / 健壮性修复】
+【二、历史安全 / 健壮性修复】
 - 修复 .get("key", {}).get() 链式调用遇到 null 崩溃的问题，统一改用 (get() or {}).get()
 - 修复 has_internet 等字段为 0 时被误判为 None 的 Bug，新增严格 _parse_bool_val 解析
 - GET / 增加 try-except 保护，防止个别设备脏数据导致全页面白屏
 - 修复 Python 字符串与 JS 换行符转义冲突导致的 SyntaxError
+
+【三、2026-11-06 假死抢救与极限加固】
+1. 独立健康检查端口 8081
+   - 不受 8080 业务线程池影响。即便 8080 被并发压满，8081 也能秒回进程状态。
+2. 有界队列 + 503 限流
+   - 业务线程池外挂 BoundedSemaphore(50)。超过 50 个请求排队时直接返回 503，彻底斩断“连接无限制挂起 -> CLOSE-WAIT 堆积 -> fd 耗尽”的雪崩链。
+3. UDP 8888 绑定重试
+   - 若 8888 被 rescue2.py 占用，旧版会 return 导致对讲机永久失聪。新版改为 10 秒死循环重试，直到成功抢占。
+4. faulthandler 信号抓栈
+   - 注册了 SIGUSR1 信号，用于诊断“进程活着但业务不响应”的假死情况，替代了极度危险的 gdb 操作。
+5. 内存全状态原子锁 (state_lock 升级为 RLock)
+   - 全面覆盖对讲机（收发）、失联检测、Web 控制台渲染。彻底杜绝 “RuntimeError: list iterator mutated during traversal” 崩溃与死锁。
+6. 字节流无损架构与 SQLite 防泄漏
+   - download_log 规范化单行字节流拼接；所有 SQLite 边缘分支套上 try...finally 强力自愈闭环，确保极端报错下 fd 100% 释放。
+7. 纵深防御沙箱 (XSS 切断)
+   - 对云端留言 (showServerMessages) 与日志预览 (showCloudLogs) 引入 escapeHtml 沙箱净化，斩断所有恶意报文注入通道。
+
+============================================================
+【四、🚀 日常运维与排错实战手册】
+============================================================
+
+▶ 1. 服务生死管理 (Systemd 接管)
+  - 启动/重启服务 : sudo systemctl restart devicefinder
+  - 查看服务状态 : sudo systemctl status devicefinder
+  - 开机自启管理 : sudo systemctl enable devicefinder
+  - 查看实时日志 : journalctl -u devicefinder -f -n 100
+
+▶ 2. 探活检测 (区分进程活与业务活)
+  - 独立探活 (最准，必秒回) : curl -s http://127.0.0.1:8081/health
+  - 业务探活 (可能排队)    : curl -s http://127.0.0.1:8080/health
+
+▶ 3. 假死现场抓取 (终极必杀技)
+  - 命令: kill -USR1 $(pgrep -f 'server2.py')
+  - 随后查看日志: tail -100 /root/server2.log  (或对应的日志重定向文件)
+  - 说明: 日志中会直接打印所有活动的 Python 线程调用栈，精准定位卡在哪一行。
+
+▶ 4. 网络连接与端口排查
+  - 查看端口占用: ss -tulnp | grep -E ':8080|:8081|:8888'
+  - 检查死连接  : ss -tnp | grep ':8080' | awk '{print $1}' | sort | uniq -c
+    (若 CLOSE-WAIT 数量持续 > 50 且不减少，说明客户端异常断开但 fd 未及时释放)
+
+▶ 5. 数据库紧急维护 (Python 一行流替代 sqlite3 命令行，注意对齐实际路径)
+  - 查询设备数 : python3 -c "import sqlite3; print(sqlite3.connect('track_history.db').execute('SELECT COUNT(DISTINCT device_id) FROM reports').fetchone()[0])"
+  - 清理并压缩: python3 -c "import sqlite3; c=sqlite3.connect('track_history.db'); c.execute(\"DELETE FROM reports WHERE device_id LIKE 'heavy_%'\"); c.commit(); c.execute('VACUUM'); print('VACUUM Done')"
+
 ============================================================
 """
+
 
 # ===== 上报数据保留策略 =====
 REPORTS_KEEP_RAW_DAYS = 30        # raw_json 保留天数
@@ -57,6 +109,7 @@ GLOBAL_DEFAULT_CONFIG = {
 ALL_DEVICES_STATUS = {}
 CHAT_MESSAGES = []
 print_lock = threading.Lock()
+state_lock = threading.RLock()  # ★ 升级：RLock 防止意外嵌套导致死锁
 
 # ★★★ 新增：数据库写锁，防止高并发写入时 SQLite 锁死 2026-11-05 14:30★★★
 db_write_lock = threading.Lock()
@@ -183,6 +236,8 @@ def init_db():
     conn.close()
 
 
+if hasattr(signal, 'SIGUSR1') and hasattr(faulthandler, 'register'):
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 init_db()
 
 
@@ -370,7 +425,7 @@ def cleanup_old_reports():
 def _state_lock_snapshot():
     class _Ctx:
         def __enter__(self_inner):
-            with print_lock:
+            with state_lock:
                 return {k: dict(v) for k, v in ALL_DEVICES_STATUS.items()}
         def __exit__(self_inner, *args):
             return False
@@ -521,7 +576,9 @@ def udp_listener():
                                 stale = [k for k, v in list(LAST_MSG_INFO.items()) if v < cutoff]
                                 for k in stale: LAST_MSG_INFO.pop(k, None)
                             now_ms = int(datetime.datetime.now().timestamp() * 1000)
-                            with print_lock:
+                            ts = datetime.datetime.now().strftime("%H:%M:%S")
+                            # ★ 合并为单个锁块，消除一切嵌套疑虑
+                            with state_lock:
                                 if sender not in ALL_DEVICES_STATUS:
                                     ALL_DEVICES_STATUS[sender] = {
                                         "device_id": sender, "received_at": now_ms,
@@ -533,16 +590,19 @@ def udp_listener():
                                 info["received_at"] = now_ms
                                 info.pop("offline_alerted", None)
                                 info["last_chat"] = now_ms
-                            ts = datetime.datetime.now().strftime("%H:%M:%S")
-                            with print_lock:
-                                print(f"\n🗣️ [对讲机] {sender} (来自IP: {source_ip}) 说: {content}")
+                                
                                 CHAT_MESSAGES.append({"time": ts, "sender": sender, "content": content})
                                 if len(CHAT_MESSAGES) > 100: CHAT_MESSAGES.pop(0)
+                                
+                            with print_lock:
+                                print(f"\n🗣️ [对讲机] {sender} (来自IP: {source_ip}) 说: {content}")
         except OSError as e:
             if e.errno in (98, 10048) or "Address already in use" in str(e):
-                print("❌ UDP 8888 被占用（可能 chat.py 正在运行）。")
-                print("   server2.py 的 Web 面板仍可用，但无法接收手机对讲机消息。")
-                return
+                print(f"❌ udp 8888 bind 失败: {e}，10s 后重试")
+                try: udp_sock.close()
+                except Exception: pass
+                time.sleep(10)
+                continue
             else:
                 print(f"❌ UDP 监听绑定失败: {e}")
                 time.sleep(5)
@@ -562,7 +622,9 @@ def offline_detector():
             time.sleep(300)
             now = int(datetime.datetime.now().timestamp() * 1000)
             with print_lock:
-                for dev_id, info in list(ALL_DEVICES_STATUS.items()):
+                with state_lock:
+                    devices_snapshot = [(k, dict(v)) for k, v in ALL_DEVICES_STATUS.items()]
+                for dev_id, info in devices_snapshot:
                     last_seen = info.get('received_at', 0)
                     gap_min = (now - last_seen) // 60000
                     already_alerted = info.get('offline_alerted', False)
@@ -588,12 +650,19 @@ def offline_detector():
 
 def save_history(dev_id, lat, lng, ts):
     if lat is None or lng is None: return
-    try:
-        conn = sqlite3.connect('track_history.db', timeout=10)
-        c = conn.cursor()
-        c.execute("INSERT INTO history VALUES (?, ?, ?, ?)", (dev_id, lat, lng, ts))
-        conn.commit(); conn.close()
-    except Exception: pass
+    with db_write_lock:
+        conn = None
+        try:
+            conn = sqlite3.connect('track_history.db', timeout=10)
+            c = conn.cursor()
+            c.execute("INSERT INTO history VALUES (?, ?, ?, ?)", (dev_id, lat, lng, ts))
+            conn.commit()
+        except Exception: 
+            pass
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
 
 
 def format_loc_time(ts_ms):
@@ -732,7 +801,7 @@ def handle_client(client_conn, client_addr):
                     process_executed_commands(dev_id, executed_ids)
                 data["received_at"] = int(datetime.datetime.now().timestamp() * 1000)
 
-                with print_lock:
+                with state_lock:
                     if dev_id not in ALL_DEVICES_STATUS:
                         ALL_DEVICES_STATUS[dev_id] = {}
                     prev_info = dict(ALL_DEVICES_STATUS[dev_id])
@@ -785,9 +854,12 @@ def handle_client(client_conn, client_addr):
                 msg = data.get("message", "")
                 ts = data.get("timestamp", 0)
                 conn = sqlite3.connect('track_history.db', timeout=10)
-                c = conn.cursor()
-                c.execute("INSERT INTO messages VALUES (?, ?, ?, ?)", (dev_id, msg_time, msg, ts))
-                conn.commit(); conn.close()
+                try:
+                    c = conn.cursor()
+                    c.execute("INSERT INTO messages VALUES (?, ?, ?, ?)", (dev_id, msg_time, msg, ts))
+                    conn.commit()
+                finally:
+                    conn.close()
                 client_conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             except Exception as e:
                 with print_lock: print(f"❌ POST /api/message 异常: {e}")
@@ -848,13 +920,25 @@ def handle_client(client_conn, client_addr):
                 params = parse_qs(urlparse(path_with_query).query)
                 name = params.get("name", [""])[0]
                 safe_name = os.path.basename(name)
+                if not safe_name.endswith(".log"):
+                    client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                    return
                 filepath = os.path.join(UPLOAD_LOG_DIR, safe_name)
                 if not os.path.isfile(filepath):
                     client_conn.sendall(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
                     return
-                with open(filepath, "rb") as f: content = f.read()
-                client_conn.sendall(
-                    f"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=\"{safe_name}\"\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(content)}\r\nConnection: close\r\n\r\n".encode() + content)
+                with open(filepath, "rb") as f: 
+                    content = f.read()
+                # ★ 使用最稳妥的单行拼接，彻底告别语法兼容问题
+                header = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/plain; charset=utf-8\r\n"
+                    f"Content-Disposition: attachment; filename=\"{safe_name}\"\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    f"Content-Length: {len(content)}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode('utf-8')
+                client_conn.sendall(header + content)
             except Exception as e:
                 with print_lock: print(f"❌ GET /api/download_log 异常: {e}")
                 try: client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -881,7 +965,7 @@ def handle_client(client_conn, client_addr):
         # ===== GET /api/cmd_status =====
         elif "GET /api/cmd_status" in header_text:
             try:
-                with print_lock:
+                with state_lock:
                     devices_snapshot = {k: dict(v) for k, v in ALL_DEVICES_STATUS.items()}
                 now = time.time()
                 result = {}
@@ -977,7 +1061,7 @@ def handle_client(client_conn, client_addr):
                     success = smart_send(f"FIND_ME_MSG:{RESCUE_SECRET}:Web_Console:{payload}")
                     if success:
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
-                        with print_lock:
+                        with state_lock:
                             CHAT_MESSAGES.append({"time": ts, "sender": "Web_Console", "content": payload})
                             if len(CHAT_MESSAGES) > 100: CHAT_MESSAGES.pop(0)
                 elif action == "change_server": success = smart_send(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}")
@@ -1079,14 +1163,15 @@ def handle_client(client_conn, client_addr):
         # ===== GET /api/chat_history =====
         elif "GET /api/chat_history" in header_text:
             try:
-                with print_lock:
+                with state_lock:
                     devices_snapshot = {k: dict(v) for k, v in ALL_DEVICES_STATUS.items()}
+                    messages_snapshot = list(CHAT_MESSAGES)
                 devices_list = []
                 for dev_id, info in devices_snapshot.items():
                     ip = (info.get("source_ip") or info.get("udp_source_ip") or (info.get("network") or {}).get("local_ip"))
                     if ip and ip != '0.0.0.0':
                         devices_list.append({"id": dev_id, "ip": ip})
-                data_to_send = {"messages": CHAT_MESSAGES, "devices": devices_list}
+                data_to_send = {"messages": messages_snapshot, "devices": devices_list}
                 with print_lock: resp = json.dumps(data_to_send)
                 resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
@@ -1265,7 +1350,9 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
             <th style="min-width: 180px;">操作</th>
         </tr>
 """
-                for dev_id, info in list(ALL_DEVICES_STATUS.items()):
+                with state_lock:
+                    devices_snapshot_html = [(k, dict(v)) for k, v in ALL_DEVICES_STATUS.items()]
+                for dev_id, info in devices_snapshot_html:
                     try:
                         network = info.get("network") or {}
                         battery = info.get("battery") or {}
@@ -1625,9 +1712,11 @@ function showCloudLogs(devId) {
         var logs = (info && info.cloud_logs) ? info.cloud_logs : "该设备尚未上传日志。\\n请先在【高级设置】中开启「云端日志」，并在手机端等待下一次上报。";
         var logTime = (info && info.cloud_logs_time) ? new Date(info.cloud_logs_time).toLocaleString() : "未知";
         document.getElementById('modalTitle').innerText = "📄 运行日志 - " + devId;
+        // ★ 修复 XSS 注入：对 logs 做实体转义
+        var safeLogs = String(logs).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         document.getElementById('msgList').innerHTML = 
             '<div style="color:#57606a; margin-bottom: 10px; font-size: 13px;">最近快照时间: ' + logTime + '</div>' +
-            '<pre style="background: #f6f8fa; padding: 12px; border-radius: 6px; font-size: 12px; white-space: pre-wrap; border: 1px solid #d0d7de; color: #24292f; max-height: 400px; overflow-y: auto;">' + logs + '</pre>';
+            '<pre style="background: #f6f8fa; padding: 12px; border-radius: 6px; font-size: 12px; white-space: pre-wrap; border: 1px solid #d0d7de; color: #24292f; max-height: 400px; overflow-y: auto;">' + safeLogs + '</pre>';
         document.getElementById('msgModal').style.display = 'block';
     }).catch(function(e) { showToast("拉取日志失败: " + e.message); });
 }
@@ -1712,7 +1801,7 @@ function showServerMessages() {
             data.forEach(function(item) {
                 html += '<div style="border-bottom:1px solid var(--color-border-muted); padding:12px 0;">' +
                             '<div style="color:var(--color-fg-muted); font-size:12px; margin-bottom:6px;">[' + item[1] + '] - ' + item[0] + '</div>' +
-                            '<div>' + item[2] + '</div>' +
+                            '<div>' + escapeHtml(item[2]) + '</div>' +
                          '</div>';
             });
             listDiv.innerHTML = html;
@@ -1848,7 +1937,42 @@ function escapeHtml(s) {
         except Exception: pass
 
 
+
+
+def health_server():
+    """独立端口 8081，不受业务线程池影响。"""
+    import socket as _s
+    hs = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    hs.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+    try:
+        hs.bind(('0.0.0.0', 8081))
+    except Exception as e:
+        with print_lock:
+            print(f"⚠️ health 端口 8081 绑定失败: {e}")
+        return
+    hs.listen(16)
+    with print_lock:
+        print("💚 health 独立端口已启动: http://0.0.0.0:8081/health")
+    while True:
+        conn = None
+        try:
+            conn, _ = hs.accept()
+            conn.settimeout(2.0)
+            try: conn.recv(2048)
+            except Exception: pass
+            body = b'{"status":"ok","port":8081}'
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
+                         + str(len(body)).encode() + b'\r\nConnection: close\r\n\r\n' + body)
+        except Exception:
+            pass
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
+
+
 def start_server():
+    threading.Thread(target=health_server, daemon=True).start()
     threading.Thread(target=udp_listener, daemon=True).start()
     threading.Thread(target=offline_detector, daemon=True).start()
     threading.Thread(target=cmd_cleaner, daemon=True).start()
@@ -1882,13 +2006,31 @@ def start_server():
 
     # ★★★ 核心补丁：创建最大 15 个工作线程的线程池 2026-11-05 13:50 ★★★ 
     # 当手机请求过来时，最多同时处理 15 个，超出的会排队，防止内存被瞬间榨干
+    # 有界队列：>50 排队就直接 503，防 fd 泄漏
+    global _BOUNDED_SEM
+    _BOUNDED_SEM = threading.BoundedSemaphore(50)
     executor = ThreadPoolExecutor(max_workers=15)
 
     while True:
         try:
             conn, addr = server.accept()
-            # 【新写法】：把任务丢进池子，不再无限新建线程
-            executor.submit(handle_client, conn, addr)
+            if not _BOUNDED_SEM.acquire(blocking=False):
+                try:
+                    conn.sendall(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+                except Exception: pass
+                try: conn.close()
+                except Exception: pass
+                continue
+            def _run(c, a):
+                try: handle_client(c, a)
+                finally: _BOUNDED_SEM.release()
+            try:
+                executor.submit(_run, conn, addr)
+            except Exception:
+                # 如果 submit 失败，必须把名额释放掉并关掉连接
+                _BOUNDED_SEM.release()
+                try: conn.close()
+                except Exception: pass
         except KeyboardInterrupt: 
             break
         except Exception as e:
