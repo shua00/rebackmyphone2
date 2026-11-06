@@ -3,15 +3,22 @@ package com.example.devicefinder;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.location.Location;
 import android.location.LocationManager;
 import android.net.Uri;
 import android.os.Build;
-import android.os.BatteryManager;
 import android.telephony.SmsManager;
 import android.telephony.SmsMessage;
 
+/**
+ * SmsReceiver — 短信指令接收器
+ * 构建版本 : 20261107-1200
+ *
+ * 2026-11-07 修改：
+ * 1. abortBroadcast() 包进 try-catch（非默认短信 App 调用部分 ROM 抛 SecurityException）
+ * 2. replyLocationViaSms 改读 TrackingService.GLOBAL_BATTERY_LEVEL，
+ *    废弃同步 registerReceiver(null) 电池查询（降低 onReceive 主线程 Binder 往返）
+ */
 public class SmsReceiver extends BroadcastReceiver {
     private static final String RESCUE_SECRET = "your_private_secret_key";
 
@@ -25,7 +32,6 @@ public class SmsReceiver extends BroadcastReceiver {
             String sender = null;
             long receivedTime = 0;
 
-            // [L0] 短信格式：API 23+ 推荐传 format，多部分短信/非 GSM 网络下更可靠
             String format = intent.getStringExtra("format");
             for (Object pdu : pdus) {
                 SmsMessage sms;
@@ -43,7 +49,6 @@ public class SmsReceiver extends BroadcastReceiver {
             String message = fullMessage.toString().trim();
             boolean isCommand = false;
 
-            // [L0] 短信指令日志：确认收到、发件人、body 前 40 字符
             FileLogger.log(context, "SMS", "📩 收到短信 from=" + sender
                     + ", body=" + (message.length() > 40 ? message.substring(0, 40) + "..." : message));
 
@@ -74,50 +79,36 @@ public class SmsReceiver extends BroadcastReceiver {
                     startService(context, "ACTION_PLAY_ALARM", null, null);
                     isCommand = true;
                 }
-            }
-            // 控制屏幕消息 (SHOW_MSG:密码:消息)
-            else if (message.startsWith("SHOW_MSG:")) {
+            } else if (message.startsWith("SHOW_MSG:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_SHOW_MSG", "message", parts[2].trim());
                     isCommand = true;
                 }
-            }
-            // 短信锁定聊天入口 (LOCK_CHAT:密码)
-            else if (message.startsWith("LOCK_CHAT:")) {
+            } else if (message.startsWith("LOCK_CHAT:")) {
                 String[] parts = message.split(":", 2);
                 if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_LOCK_CHAT", null, null);
                     isCommand = true;
                 }
-            }
-            // 短信解锁聊天入口 (UNLOCK_CHAT:密码)
-            else if (message.startsWith("UNLOCK_CHAT:")) {
+            } else if (message.startsWith("UNLOCK_CHAT:")) {
                 String[] parts = message.split(":", 2);
                 if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
                     startService(context, "ACTION_UNLOCK_CHAT", null, null);
                     isCommand = true;
                 }
-            }
-            // 通过短信设置紧急接收号码 (SET_SMS_NUM:密码:手机号)
-            else if (message.startsWith("SET_SMS_NUM:")) {
+            } else if (message.startsWith("SET_SMS_NUM:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                     context.getSharedPreferences("device_finder_prefs", Context.MODE_PRIVATE).edit()
                             .putString("emergency_sms_number", parts[2].trim()).apply();
-                    // 可以顺便回一条短信确认
                     SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? context.getSystemService(SmsManager.class) : SmsManager.getDefault();
                     if (smsManager != null && sender != null) {
                         smsManager.sendTextMessage(sender, null, "✅ 紧急报警号码已更新为: " + parts[2].trim(), null, null);
                     }
                     isCommand = true;
                 }
-            }
-            // 短信切换老人模式 (ELDER_MODE:密码) 或 (ELDER_MODE:密码:on/off/1/0/true/false)
-            //   不传第三段则走 TrackingService 里的"取反"逻辑，与拨号 *#*#5678#*#* 语义一致
-            // [注意] 边界：ELDER_MODE:secret:（末尾冒号，空串）当前会被当成 false=关闭老人模式，
-            //        与"取反"语义不符。实际使用没人会这么发，保持现状不改。
-            else if (message.startsWith("ELDER_MODE:")) {
+            } else if (message.startsWith("ELDER_MODE:")) {
                 String[] parts = message.split(":", 3);
                 if (parts.length >= 2 && RESCUE_SECRET.equals(parts[1])) {
                     String val = parts.length >= 3 ? parts[2].trim() : null;
@@ -129,21 +120,22 @@ public class SmsReceiver extends BroadcastReceiver {
 
             if (isCommand) {
                 FileLogger.log(context, "SMS", "✅ 指令已识别，执行中");
-                // [B8] 原 nm.cancelAll() 会清空本 App 所有通知（含老人模式留言、自检通知），
-                //      收到短信指令不代表用户需要清空通知栏，故删除此调用。
-                //      如果确实要取消某个特定通知，用 nm.cancel(NOTIF_ID_XXX) 指定 ID。
                 try {
                     Uri uri = Uri.parse("content://sms/inbox");
                     String where = "address=? AND date=?";
                     String[] args = new String[]{sender, String.valueOf(receivedTime)};
                     context.getContentResolver().delete(uri, where, args);
                 } catch (Exception e) {
-                    // [L1] 删除短信失败是预期的（非默认短信应用删不掉），记录便于区分
                     FileLogger.log(context, "SMS", "⚠️ 删除指令短信失败（非默认短信应用，预期行为）: " + e.getMessage());
                 }
-                abortBroadcast();
+                // ★ 2026-11-07 加固：非默认短信 App 下 abortBroadcast() 会被系统忽略，
+                //   部分定制 ROM 还可能抛 SecurityException，故必须包 try-catch
+                try {
+                    abortBroadcast();
+                } catch (Exception e) {
+                    FileLogger.log(context, "SMS", "⚠️ abortBroadcast 被系统拒绝（非默认短信 App，预期行为）: " + e.getMessage());
+                }
             } else {
-                // [L1] 非指令短信也记录一下，便于区分「没收到」vs「收到了但不是指令」
                 FileLogger.log(context, "SMS", "非指令短信，忽略");
             }
         } catch (Exception e) {
@@ -174,17 +166,11 @@ public class SmsReceiver extends BroadcastReceiver {
                 else if (netLoc != null) loc = netLoc;
                 else loc = gpsLoc;
             }
-            IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-            Intent batteryStatus = context.registerReceiver(null, ifilter);
-            int level = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) : -1;
-            int scale = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1) : -1;
-            // [新增防御] 原实现 scale=-1 时会算出 -5000% 这种诡异值；正常 scale 是 100，无行为变化
-            int batteryPct;
-            if (level < 0 || scale <= 0) {
-                batteryPct = -1;   // 未知
-            } else {
-                batteryPct = (int) ((level / (float) scale) * 100);
-            }
+
+            // ★ 2026-11-07 架构优化：废弃同步 context.registerReceiver(null) 电池查询，
+            //   改读 TrackingService 的静态内存变量，消除 onReceive 主线程上的 Binder 往返。
+            //   TrackingService 未启动时该值为 -1，下方会显示"未知"，属可接受降级。
+            int batteryPct = TrackingService.GLOBAL_BATTERY_LEVEL;
 
             StringBuilder sb = new StringBuilder("【设备回复】\n电量: ")
                     .append(batteryPct >= 0 ? batteryPct + "%" : "未知").append("\n");
