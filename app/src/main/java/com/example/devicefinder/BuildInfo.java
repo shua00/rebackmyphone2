@@ -16,7 +16,7 @@ public final class BuildInfo {
      * 构建版本：人读。每次构建改。
      * 【打包前修改这一行】例：20261105-1600
      */
-    public static final String BUILD_VERSION = "20261105-1600";
+    public static final String BUILD_VERSION = "20261107-2225";
 
     private BuildInfo() {}
 }
