@@ -91,7 +91,7 @@ REPORTS_RAW_MAX_BYTES = 8192      # raw_json 单条最大字节
 REPORTS_EXT_MAX_BYTES = 4096      # ext_json 单条最大字节
 
 # ===== 清理策略 =====
-CLEAN_OFFLINE_THRESHOLD_MS = 24 * 3600 * 1000   # "清理全部离线设备"阈值：24 小时
+CLEAN_OFFLINE_THRESHOLD_MS = 2 * 3600 * 1000    # "清理全部离线设备"阈值：2 小时
 MANAGE_OFFLINE_THRESHOLD_S = 30 * 60            # "管理离线设备"弹窗展示阈值：30 分钟
 
 PORT = 8080
@@ -1877,7 +1877,7 @@ function showOfflineManager() {
         }
 
         html += '<div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--color-border-muted);text-align:right;">' +
-            '<button class="btn-danger" onclick="confirmCleanAllOffline()" style="padding:6px 20px;">🗑️ 清理全部 >24h 离线设备</button>' +
+            '<button class="btn-danger" onclick="confirmCleanAllOffline()" style="padding:6px 20px;">🗑️ 清理全部 >2h 离线设备</button>' +
         '</div>';
 
         document.getElementById('modalTitle').innerText = '🗑️ 管理离线设备（' + offline.length + ' 台）';
@@ -1905,7 +1905,7 @@ function cleanSingleDeviceByIndex(idx) {
 }
 
 function confirmCleanAllOffline() {
-    if (!confirm("确认清理所有【超过 24 小时未活动】的设备？\\n\\n注意：\\n- 只从列表移除，历史数据完整保留\\n- 30 分钟~24 小时之间的离线设备不会被清理\\n- 如需清理较新的离线设备，请用单设备删除")) return;
+    if (!confirm("确认清理所有【超过 2 小时未活动】的设备？\\n\\n注意：\\n- 只从列表移除，历史数据完整保留\\n- 30 分钟~2 小时之间的离线设备不会被清理\\n- 如需清理较新的离线设备，请用单设备删除")) return;
     sendCmd('clean_offline');
 }
 
