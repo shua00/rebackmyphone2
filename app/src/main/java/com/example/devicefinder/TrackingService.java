@@ -24,6 +24,8 @@
  *    彻底杜绝极端弱网下并发对冲写入导致的离线 JSON 结构破坏。
  * 7. 闹钟防爆装甲 (Alarm Quota Armor)：在重排保活与主上报闹钟前强制 cancel
  *    旧的 PendingIntent 句柄，完美绕开 Android 12+ 的精确闹钟 Quota 节流斩杀。
+ * 8. [补丁 2/3/4/5] 全局保活策略可调 (顶部 4 行) + onCreate 顶层秒起防线 +
+ *    onTaskRemoved 无痕精准复活 + 三路闹钟强制 cancel 前置。
  * ============================================================
  *
  * 【📱 追踪引擎核心 ADB 命令行运维实战手册】
@@ -56,6 +58,8 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.app.admin.DevicePolicyManager;
+import android.app.job.JobInfo;
+import android.app.job.JobScheduler;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
@@ -133,7 +137,15 @@ public class TrackingService extends Service implements LocationListener {
     private SensorManager sensorManager;
     private Sensor motionSensor;
 
-    private long reportIntervalMs = 1800 * 1000L;
+    // ★ 补丁2：全局保活策略配置（后期调优直接改这里，单位：毫秒）
+    private long keepAliveAlarmIntervalMs = 15 * 60 * 1000L;     // 保活闹钟（默认15分钟）
+    private long reportAlarmIntervalMs = 30 * 60 * 1000L;        // 上报闹钟（默认30分钟）
+    private long heartbeatAlarmIntervalMs = 6 * 60 * 60 * 1000L; // 心跳闹钟（默认6小时）
+    private long taskRemovedRescueDelayMs = 2 * 1000L;           // 划掉后台后复活延迟（默认2秒）
+
+    // ★ 上报间隔：初始值从 reportAlarmIntervalMs 继承（改顶部一行即可改起手默认），
+    //   远端 config 的 report_interval_seconds 仍可动态覆盖
+    private long reportIntervalMs = reportAlarmIntervalMs;
     private String accuracyMode = "coarse";
     private volatile Location lastLocation = null;
     private final AtomicInteger reportCount = new AtomicInteger(0);
@@ -239,6 +251,14 @@ public class TrackingService extends Service implements LocationListener {
         // ★ 第一件事：立刻挂起前台通知，防止 ANR 与 5 秒秒杀
         startForegroundNotification();
 
+        // ★ 补丁5：服务一旦复活，立刻重建定时防线，绝不等 handler.post 延迟执行
+        //   目的：进程刚拉起的最脆弱窗口（前 1~2 秒）内就有闹钟兜底，防系统秒杀后长时间无心跳
+        alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        if (alarmManager != null) {
+            scheduleKeepAliveJob();
+            scheduleHeartbeatAlarm();
+        }
+
         serviceCreateTimeMs = SystemClock.elapsedRealtime();
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
 
@@ -261,7 +281,10 @@ public class TrackingService extends Service implements LocationListener {
                 multicastLock.setReferenceCounted(false);
             }
 
-            alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            // alarmManager 已在 onCreate 顶部赋值；这里幂等重复赋值，兼容老流程
+            if (alarmManager == null) {
+                alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            }
             Intent reportIntent = new Intent(this, TrackingService.class);
             reportIntent.setAction("ACTION_ALARM_TRIGGER");
             int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
@@ -278,6 +301,7 @@ public class TrackingService extends Service implements LocationListener {
             requestSingleLocationAndReport();
             registerNetworkCallback();
             startLocationUpdates();
+            // 幂等重复排期：主路径已在 onCreate 顶部跑过一次，这里再兜一次底
             scheduleHeartbeatAlarm();
             registerBatteryMonitor();
             scheduleKeepAliveJob();
@@ -428,11 +452,12 @@ public class TrackingService extends Service implements LocationListener {
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         PendingIntent pi = PendingIntent.getService(this, 1002, intent, flags);
 
-        // ★ 强力物理防线：在向系统内核排队下一次保活闹钟前，强制 cancel 掉旧的句柄。
-        // 彻底清除 Android 电源管理内核中可能残留的幽灵闹钟，确保状态机绝对干净。
+        // ★ 补丁4：在向系统内核排队下一次保活闹钟前，强制 cancel 掉旧的句柄。
+        // 彻底清除 Android 电源管理内核中可能残留的幽灵闹钟，完美绕开 Android 12+ 精确闹钟 Quota 节流。
         try { alarmManager.cancel(pi); } catch (Exception ignored) {}
 
-        long triggerAt = System.currentTimeMillis() + 15 * 60 * 1000L;
+        // ★ 补丁2：使用全局可调变量 keepAliveAlarmIntervalMs
+        long triggerAt = System.currentTimeMillis() + keepAliveAlarmIntervalMs;
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
             else alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pi);
@@ -760,7 +785,7 @@ public class TrackingService extends Service implements LocationListener {
             sendBroadcast(intent);
         }
     }
-    
+
     private boolean isChatLocked() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         return sp.getBoolean("chat_locked", false);
@@ -1222,7 +1247,7 @@ public class TrackingService extends Service implements LocationListener {
             maxW = Math.max(maxW, (int) Math.ceil(paint.measureText(line)));
         }
         // ★ 采用 dpToPx 静态保底估算左右边距（30dp），彻底避开系统 getPadding() 未初始化时的底层崩溃深坑
-        return maxW + dpToPx(30); 
+        return maxW + dpToPx(30);
     }
 
     private void attachDragAndRemember(WindowManager wm, android.view.View view,
@@ -1494,7 +1519,12 @@ public class TrackingService extends Service implements LocationListener {
         intent.setAction("ACTION_HEARTBEAT");
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_UPDATE_CURRENT;
         PendingIntent pi = PendingIntent.getService(this, 9999, intent, flags);
-        long triggerAt = System.currentTimeMillis() + 6 * 60 * 60 * 1000L;
+
+        // ★ 补丁4：设置前强制 cancel 旧句柄，规避 Android 12+ 精确闹钟 Quota 节流斩杀
+        try { alarmManager.cancel(pi); } catch (Exception ignored) {}
+
+        // ★ 补丁2：使用全局可调变量 heartbeatAlarmIntervalMs
+        long triggerAt = System.currentTimeMillis() + heartbeatAlarmIntervalMs;
         lastHeartbeatExpectedAt = triggerAt;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
         else alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pi);
@@ -1749,11 +1779,12 @@ public class TrackingService extends Service implements LocationListener {
     private void scheduleNextReport() {
         if (alarmManager == null || alarmPendingIntent == null) return;
 
-        // ★ 强力物理防线：强制 cancel 先前可能因快速轮询或手动触发而在内核留存的旧句柄。
+        // ★ 补丁4：强制 cancel 先前可能因快速轮询或手动触发而在内核留存的旧句柄。
         // 彻底阻断因并发触发导致的闹钟频率超限（Quota 限流），消灭偶发性假死。
         try { alarmManager.cancel(alarmPendingIntent); } catch (Exception ignored) {}
 
         int rc = reportCount.get();
+        // reportIntervalMs 已从 reportAlarmIntervalMs 初始化，远端 config 可继续覆盖
         long delay = (rc == 1 || rc == 2) ? 3 * 60 * 1000L : reportIntervalMs;
         long triggerAtMillis = System.currentTimeMillis() + delay;
         lastAlarmExpectedAt = triggerAtMillis;
@@ -2063,7 +2094,7 @@ public class TrackingService extends Service implements LocationListener {
                 String line;
                 while ((line = br.readLine()) != null) lines.add(line);
                 br.close();
-                
+
                 int start = Math.max(0, lines.size() - keepLines);
                 java.io.FileWriter fw = new java.io.FileWriter(queueFile, false);
                 for (int i = start; i < lines.size(); i++) {
@@ -2481,12 +2512,12 @@ public class TrackingService extends Service implements LocationListener {
         if ("custom_msg".equals(cmdType) || "chat_msg".equals(cmdType)) {
             return cmdType + "|" + (payload == null ? "" : payload);
         }
-        
+
         // 如果有 cmdId，说明是 HTTP 下发的（用 cmdId 精确隔离，防误杀）
         if (cmdId != null && !cmdId.isEmpty()) {
             return cmdType + "|HTTP|" + cmdId;
         }
-        
+
         // 如果没有 cmdId，说明是 UDP 广播（用类型隔离）
         return cmdType + "|UDP";
     }
@@ -2581,9 +2612,16 @@ public class TrackingService extends Service implements LocationListener {
                     if (message.startsWith("FIND_ME_SERVER:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
-                            saveNewServerUrl(parts[2].trim()); consecutiveFailures = 0; sendReport(true, true);
-                            recentExecutions.put("change_server", System.currentTimeMillis());
-                            break;
+                            // ★ 改动2：先判重后执行，防路由器/多网卡抖动导致连环 change_server + break
+                            String newUrl = parts[2].trim();
+                            String dk = buildDedupKey("change_server", newUrl, null);
+                            if (!isRecentlyExecuted(dk)) {
+                                saveNewServerUrl(newUrl);
+                                consecutiveFailures = 0;
+                                sendReport(true, true);
+                                break; // 首次执行才 break，触发 socket 重连
+                            }
+                            // 重复包：不 break，保持当前 socket 连接不抖动
                         }
                     } else if (message.startsWith("FIND_ME_CONFIG:")) {
                         String[] parts = message.split(":", 3);
@@ -2591,25 +2629,34 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_REPORT:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
-                            sendReport(true, true);
-                            recentExecutions.put("force_report", System.currentTimeMillis());
+                            // ★ 改动2：判重拦截，同一个包送 3 次也不会连环强报
+                            String dk = buildDedupKey("force_report", null, null);
+                            if (!isRecentlyExecuted(dk)) {
+                                sendReport(true, true);
+                            }
                         }
                     } else if (message.startsWith("FIND_ME_REPORT_TEMP:")) {
                         String[] parts = message.split(":", 3);
                         if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                             String tempUrl = parts[2].trim();
-                            if (isValidUrl(tempUrl)) {
-                                sendReport(true, true, tempUrl);
-                                recentExecutions.put("force_report", System.currentTimeMillis());
-                            } else {
-                                FileLogger.log(this, "REPORT", "⚠️ 忽略非法 FIND_ME_REPORT_TEMP URL: [" + tempUrl + "]");
+                            // ★ 改动2：tempUrl 参与 dedup，不同临时 URL 可独立执行，同 URL 重复包被拦截
+                            String dk = buildDedupKey("force_report_temp", tempUrl, null);
+                            if (!isRecentlyExecuted(dk)) {
+                                if (isValidUrl(tempUrl)) {
+                                    sendReport(true, true, tempUrl);
+                                } else {
+                                    FileLogger.log(this, "REPORT", "⚠️ 忽略非法 FIND_ME_REPORT_TEMP URL: [" + tempUrl + "]");
+                                }
                             }
                         }
                     } else if (message.startsWith("FIND_ME_ALARM:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
-                            playAlarm();
-                            recentExecutions.put("play_alarm", System.currentTimeMillis());
+                            // ★ 改动2：判重拦截，多包不会连环响铃
+                            String dk = buildDedupKey("play_alarm", null, null);
+                            if (!isRecentlyExecuted(dk)) {
+                                playAlarm();
+                            }
                         }
                     }
                     // ===== [P0-1] 悬浮文字：v2 新前缀 =====
@@ -2620,7 +2667,7 @@ public class TrackingService extends Service implements LocationListener {
                             String dk = buildDedupKey("custom_msg", content, null);
                             if (!isRecentlyExecuted(dk)) {
                                 showFloatingMessage(content);
-                                recentExecutions.put(dk, System.currentTimeMillis());
+                                // ★ 改动1：删除冗余 recentExecutions.put，isRecentlyExecuted 内 putIfAbsent 已写
                             }
                         }
                     }
@@ -2633,7 +2680,7 @@ public class TrackingService extends Service implements LocationListener {
                             String dk = buildDedupKey("chat_msg", content, null);
                             if (!isRecentlyExecuted(dk)) {
                                 handleIncomingChat(senderId, content);
-                                recentExecutions.put(dk, System.currentTimeMillis());
+                                // ★ 改动1：删除冗余 recentExecutions.put
                             }
                         }
                     }
@@ -2645,7 +2692,7 @@ public class TrackingService extends Service implements LocationListener {
                             String dk = buildDedupKey("custom_msg", content, null);
                             if (!isRecentlyExecuted(dk)) {
                                 showFloatingMessage(content);
-                                recentExecutions.put(dk, System.currentTimeMillis());
+                                // ★ 改动1：删除冗余 recentExecutions.put
                             }
                         } else if (legacyParts.length == 4 && RESCUE_SECRET.equals(legacyParts[1])) {
                             String senderId = legacyParts[2].trim();
@@ -2653,7 +2700,7 @@ public class TrackingService extends Service implements LocationListener {
                             String dk = buildDedupKey("chat_msg", content, null);
                             if (!isRecentlyExecuted(dk)) {
                                 handleIncomingChat(senderId, content);
-                                recentExecutions.put(dk, System.currentTimeMillis());
+                                // ★ 改动1：删除冗余 recentExecutions.put
                             }
                         }
                     }
@@ -3149,31 +3196,47 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
+    // ★ 补丁3：无痕极速复活（划掉后台后 2 秒内由 AlarmManager + JobScheduler 双路拉活）
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
         long now = System.currentTimeMillis();
         if (now - lastOnTaskRemovedTime < ON_TASK_REMOVED_THROTTLE_MS) {
-            FileLogger.log(this, "SERVICE", "⚠️ 任务栈清空(10分钟内已排过自救，跳过)");
-            return;
+            return; // 10分钟内防抖
         }
         lastOnTaskRemovedTime = now;
-        FileLogger.log(this, "SERVICE", "⚠️ 任务栈已清空(如退出聊天/侧滑)，触发兜底自救...");
+        FileLogger.log(this, "SERVICE", "⚠️ 任务栈已被划掉，触发无痕防杀自救...");
+
         Intent restartServiceIntent = new Intent(getApplicationContext(), TrackingService.class);
         restartServiceIntent.setPackage(getPackageName());
         int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_IMMUTABLE : PendingIntent.FLAG_ONE_SHOT;
-        PendingIntent restartServicePendingIntent = PendingIntent.getService(getApplicationContext(), 1, restartServiceIntent, flags);
-        AlarmManager alarmService = (AlarmManager) getApplicationContext().getSystemService(Context.ALARM_SERVICE);
-        if (alarmService != null) {
-            long triggerAt = System.currentTimeMillis() + 1000;
+        PendingIntent restartPi = PendingIntent.getService(getApplicationContext(), 1, restartServiceIntent, flags);
+
+        // 策略A：无痕精准闹钟
+        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        if (am != null) {
+            long triggerAt = System.currentTimeMillis() + taskRemovedRescueDelayMs;
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmService.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
-                else alarmService.setExact(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
-            } catch (SecurityException e) {
-                FileLogger.log(this, "SERVICE", "⚠️ onTaskRemoved 精确闹钟权限缺失，降级为不精确: " + e.getMessage());
-                alarmService.set(AlarmManager.RTC_WAKEUP, triggerAt, restartServicePendingIntent);
+                am.cancel(restartPi);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, restartPi);
+                } else {
+                    am.setExact(AlarmManager.RTC_WAKEUP, triggerAt, restartPi);
+                }
+            } catch (Exception e) {
+                am.set(AlarmManager.RTC_WAKEUP, triggerAt, restartPi);
             }
         }
+
+        // 策略B：JobScheduler 极速兜底（ID: 10087）
+        try {
+            JobScheduler js = (JobScheduler) getSystemService(Context.JOB_SCHEDULER_SERVICE);
+            if (js != null) {
+                JobInfo.Builder builder = new JobInfo.Builder(10087, new ComponentName(this, KeepAliveJobService.class));
+                builder.setMinimumLatency(taskRemovedRescueDelayMs);
+                js.schedule(builder.build());
+            }
+        } catch (Exception ignored) {}
     }
 
     @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
