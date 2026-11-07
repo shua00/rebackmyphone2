@@ -2,7 +2,7 @@
  * ============================================================
  *  TrackingService.java — 全内核高并发后台同步与常驻常活引擎
  * ------------------------------------------------------------
- *  构建版本 : 20261107-2225 (终极防爆无死角封板版)
+ *  构建版本 : 20261107-2311 (终极防爆无死角封板版)
  *  协议版本 : v2 (基于 BuildInfo.PROTOCOL_VERSION 标准)
  *  最后修改 : 2026-11-07
  *  运行功耗 : 极轻量级 (深度适配低内存设备)
@@ -224,6 +224,11 @@ public class TrackingService extends Service implements LocationListener {
 
     private final List<android.view.View> activeBubbles = new ArrayList<>();
 
+    // ★ H4 修复 2026-11-07：前台通知去重标记。onCreate 首次成功挂起后置 true，
+    //   后续 onStartCommand 普通 action 不再重发，避免 15 分钟保活导致通知图标闪烁。
+    //   仅在 onCreate 失败 / ACTION_RESET_NOTIFICATION / ACTION_SECRET_UNLOCK 时重置。
+    private volatile boolean isForegroundStarted = false;
+
     private long lastAlarmExpectedAt = 0;
     private long lastHeartbeatExpectedAt = 0;
     private long serviceCreateTimeMs = 0;
@@ -236,6 +241,12 @@ public class TrackingService extends Service implements LocationListener {
 
     // ★ 新增：防重试闭包堆积的消息 ID
     private static final int MSG_RETRY_RESCUE_LISTENER = 8888;
+
+    // ★ H1b 修复 2026-11-07：flush 之间串行化锁。
+    //   原 H1 拆锁后，onCreate 的 5s 延迟 flush 与 onAvailable 的 flush 可能并发，
+    //   两个线程都读到同一快照 → 都发送 → 服务器收到重复数据。
+    //   本锁只保护 flush 自己，不影响 queuePendingReport 入队（它用 FILE_LOCK）。
+    private static final Object FLUSH_LOCK = new Object();
 
     // ★ 核心替换：改造线程池，使用有界队列和抛弃最老任务策略，防止弱网卡死导致 OOM
     private final java.util.concurrent.ExecutorService reportExecutor =
@@ -458,13 +469,13 @@ public class TrackingService extends Service implements LocationListener {
 
         // ★ 补丁2：使用全局可调变量 keepAliveAlarmIntervalMs
         long triggerAt = System.currentTimeMillis() + keepAliveAlarmIntervalMs;
+        // ★ H2 修复 2026-11-07：15 分钟保活不需要秒级精度，改用 setAndAllowWhileIdle，
+        //   避免占用 Android 12+ 精确闹钟配额（72 次/天）。配额优先留给 onTaskRemoved 的 2 秒复活。
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
-            else alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pi);
-        } catch (SecurityException e) {
-            FileLogger.log(this, "ALARM", "⚠️ 保活闹钟精确权限缺失，降级: " + e.getMessage());
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi);
             else alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pi);
+        } catch (Exception e) {
+            FileLogger.log(this, "ALARM", "⚠️ 保活闹钟设置失败: " + e.getMessage());
         }
     }
 
@@ -513,7 +524,8 @@ public class TrackingService extends Service implements LocationListener {
 
             if ("ACTION_RESET_NOTIFICATION".equals(action)) {
                 notificationClickCount = 0;
-                startForegroundNotification();
+                // ★ H4 修复：点击重置需要刷新通知内容，强制重发
+                restartForegroundNotification();
             } else if ("ACTION_MANUAL_REPORT".equals(action) || "ACTION_FORCE_REPORT".equals(action)) {
                 sendReport(true, true);
             } else if ("ACTION_UPDATE_SERVER".equals(action) || "ACTION_ADB_UPDATE".equals(action)) {
@@ -554,10 +566,11 @@ public class TrackingService extends Service implements LocationListener {
                 if (now - lastNotificationClickTime > 3000) { notificationClickCount = 1; } else { notificationClickCount++; }
                 lastNotificationClickTime = now;
 
-                if (notificationClickCount == 2) { startForegroundNotification(); }
+                // ★ H4 修复：第 2 次点击刷新提示、第 3 次点击进入并重置，均需强制重发
+                if (notificationClickCount == 2) { restartForegroundNotification(); }
                 else if (notificationClickCount >= 3) {
                     notificationClickCount = 0;
-                    startForegroundNotification();
+                    restartForegroundNotification();
                     if (!isChatLocked()) {
                         Intent chatIntent = new Intent(this, ChatActivity.class);
                         chatIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -1456,6 +1469,11 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void startForegroundNotification() {
+        // ★ H4 修复 2026-11-07：已在前台则跳过，避免普通 onStartCommand 重发导致通知闪烁。
+        //   需要强制刷新的场景（点击重置 / 密钥解锁）调 restartForegroundNotification。
+        if (isForegroundStarted) {
+            return;
+        }
         String channelId = "device_guardian_channel";
         Notification.Builder builder;
 
@@ -1492,6 +1510,7 @@ public class TrackingService extends Service implements LocationListener {
             } else {
                 startForeground(1001, notification);
             }
+            isForegroundStarted = true;  // ★ H4 修复：标记已挂起前台
         } catch (Exception e) {
             FileLogger.log(this, "SERVICE", "❌ 带 location type 的 startForeground 失败: " + e.getMessage());
             // 降级尝试：使用 dataSync 类型
@@ -1501,6 +1520,7 @@ public class TrackingService extends Service implements LocationListener {
                 } else {
                     startForeground(1001, notification);
                 }
+                isForegroundStarted = true;  // ★ H4 修复：降级成功也标记
                 FileLogger.log(this, "SERVICE", "✅ 已降级为 dataSync 类型前台服务");
             } catch (Exception e2) {
                 FileLogger.log(this, "SERVICE", "❌❌ 所有类型均失败，服务可能被系统清理: " + e2.getMessage());
@@ -1511,6 +1531,15 @@ public class TrackingService extends Service implements LocationListener {
                 } catch (Exception ignored) {}
             }
         }
+    }
+
+    /**
+     * ★ H4 修复 2026-11-07：强制重发前台通知。
+     * 只在 onCreate 首次 / ACTION_RESET_NOTIFICATION / ACTION_SECRET_UNLOCK 需要重发时调用。
+     */
+    private void restartForegroundNotification() {
+        isForegroundStarted = false;
+        startForegroundNotification();
     }
 
     private void scheduleHeartbeatAlarm() {
@@ -1788,13 +1817,13 @@ public class TrackingService extends Service implements LocationListener {
         long delay = (rc == 1 || rc == 2) ? 3 * 60 * 1000L : reportIntervalMs;
         long triggerAtMillis = System.currentTimeMillis() + delay;
         lastAlarmExpectedAt = triggerAtMillis;
+        // ★ H2 修复 2026-11-07：30 分钟上报不需要秒级精度，改用 setAndAllowWhileIdle，
+        //   避免占用 Android 12+ 精确闹钟配额（72 次/天）。
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent);
-            else alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent);
-        } catch (SecurityException e) {
-            FileLogger.log(this, "ALARM", "⚠️ 主上报闹钟精确权限缺失，降级: " + e.getMessage());
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent);
             else alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmPendingIntent);
+        } catch (Exception e) {
+            FileLogger.log(this, "ALARM", "⚠️ 主上报闹钟设置失败: " + e.getMessage());
         }
     }
 
@@ -1819,8 +1848,12 @@ public class TrackingService extends Service implements LocationListener {
                 try { wifiLock.acquire(); } catch (Exception e) { FileLogger.log(TrackingService.this, "REPORT", "⚠️ WifiLock acquire 失败: " + e.getMessage()); }
             }
             try {
+                // ★ H3 修复 2026-11-07：wakeLock 从 10s 延长到 60s。
+                //   上报内部最坏耗时：acquireFreshLocation(10s) + WiFi 扫描(3s) + HTTP 读写(8s) ≈ 21s，
+                //   10s 会在定位阶段就到期，导致后续 CPU 休眠，表现为偶发上报超时/被系统打断。
+                //   60s 只是上限，finally 里 release 会提前释放。
                 if (wakeLock != null) {
-                    try { wakeLock.acquire(10000); } catch (Exception e) {
+                    try { wakeLock.acquire(60_000); } catch (Exception e) {
                         FileLogger.log(TrackingService.this, "REPORT", "⚠️ WakeLock acquire 失败: " + e.getMessage());
                     }
                 }
@@ -2107,10 +2140,16 @@ public class TrackingService extends Service implements LocationListener {
 
     private void flushPendingReports() {
         new Thread(() -> {
-            // ★ [修复] 2026-11-04 整个读取-发送-重写流程统一使用文件锁保护，
-            //   避免 queuePendingReport 并发写入导致文件内容错乱或截断。
-            //   锁粒度可以接受：文件通常 <1MB，网络请求在 reportExecutor 之外，
-            //   即使持锁 15 秒（超时最长），也只是让零星的新追加写入稍等，不影响 UI。
+          // ★ H1b 修复 2026-11-07：flush 之间串行化，防止两个触发点并发重复发送。
+          //   注意缩进：synchronized 内保留原三段锁逻辑，结束前关闭大括号。
+          synchronized (FLUSH_LOCK) {
+            // ★ H1 修复 2026-11-07：拆三段锁，网络发送移到锁外。
+            //   原问题：synchronized (FILE_LOCK) 内做 HTTP 请求，最坏持锁 8 秒（超时），
+            //   期间 queuePendingReport 无法写入，弱网时 reportExecutor 有界队列满会触发
+            //   DiscardOldestPolicy 丢弃离线新上报。改为：锁内读快照 → 锁外发送 → 锁内重写。
+            java.util.List<String> snapshotLines = null;
+
+            // ===== 阶段 1：持锁读快照 =====
             synchronized (FILE_LOCK) {
                 java.io.BufferedReader br = null;
                 try {
@@ -2119,53 +2158,91 @@ public class TrackingService extends Service implements LocationListener {
                     java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
                     if (!queueFile.exists() || queueFile.length() == 0) return;
 
-                    java.util.List<String> lines = new java.util.ArrayList<>();
+                    snapshotLines = new java.util.ArrayList<>();
                     br = new java.io.BufferedReader(new java.io.FileReader(queueFile));
                     String line;
-                    while ((line = br.readLine()) != null) lines.add(line);
+                    while ((line = br.readLine()) != null) snapshotLines.add(line);
                     br.close();
                     br = null;
 
-                    if (lines.isEmpty()) {
+                    if (snapshotLines.isEmpty()) {
                         queueFile.delete();
                         return;
                     }
-
-                    String serverUrl = getCurrentServerUrl();
-                    int sent = 0;
-                    for (String l : lines) {
-                        try {
-                            JSONObject json = new JSONObject(l);
-                            if (postReportDirectly(json, serverUrl)) {
-                                sent++;
-                            } else {
-                                break;
-                            }
-                        } catch (Exception parseEx) {
-                            sent++;
-                        }
-                    }
-
-                    if (sent >= lines.size()) {
-                        queueFile.delete();
-                    } else if (sent > 0) {
-                        java.io.FileWriter fw = new java.io.FileWriter(queueFile, false);
-                        for (int i = sent; i < lines.size(); i++) {
-                            fw.write(lines.get(i) + "\n");
-                        }
-                        fw.close();
-                    }
-
-                    int remain = lines.size() - sent;
-                    if (sent > 0 || remain > 0) {
-                        FileLogger.log(this, "REPORT", "📤 离线队列补发: 成功 " + sent + " 条，剩余 " + remain + " 条");
-                    }
                 } catch (Exception e) {
-                    FileLogger.log(this, "REPORT", "⚠️ 离线队列补发异常: " + e.getMessage());
+                    FileLogger.log(this, "REPORT", "⚠️ 离线队列读取异常: " + e.getMessage());
+                    return;
                 } finally {
                     if (br != null) { try { br.close(); } catch (Exception ignored) {} }
                 }
             }
+
+            final java.util.List<String> lines = snapshotLines;
+
+            // ===== 阶段 2：锁外发送（不持 FILE_LOCK，queuePendingReport 可正常入队） =====
+            String serverUrl = getCurrentServerUrl();
+            int sent = 0;
+            for (String l : lines) {
+                try {
+                    JSONObject json = new JSONObject(l);
+                    if (postReportDirectly(json, serverUrl)) {
+                        sent++;
+                    } else {
+                        break;
+                    }
+                } catch (Exception parseEx) {
+                    sent++;  // 解析失败：丢弃这一条
+                }
+            }
+
+            // ===== 阶段 3：持锁重写（保留未发送的 + 发送期间新追加的） =====
+            final int sentFinal = sent;
+            synchronized (FILE_LOCK) {
+                java.io.BufferedReader br = null;
+                try {
+                    java.io.File dir = getExternalFilesDir(null);
+                    if (dir == null) return;
+                    java.io.File queueFile = new java.io.File(dir, PENDING_REPORTS_FILE);
+                    if (!queueFile.exists()) return;
+
+                    java.util.List<String> currentLines = new java.util.ArrayList<>();
+                    br = new java.io.BufferedReader(new java.io.FileReader(queueFile));
+                    String line;
+                    while ((line = br.readLine()) != null) currentLines.add(line);
+                    br.close();
+                    br = null;
+
+                    // 正常：currentLines.size() >= lines.size()（发送期间可能有新追加）。
+                    // 前 lines.size() 行对应快照，删除已发送的 sentFinal 行，其余全部保留。
+                    if (currentLines.size() < lines.size()) {
+                        // 罕见：文件被外部截断（truncateQueueFile 并发），保守放弃重写，避免丢数据。
+                        FileLogger.log(this, "REPORT", "⚠️ 补发期间队列被异常修改，本次不重写 (current="
+                                + currentLines.size() + ", snapshot=" + lines.size() + ")");
+                        return;
+                    }
+
+                    int keepFrom = sentFinal;
+                    if (keepFrom >= currentLines.size()) {
+                        queueFile.delete();
+                    } else {
+                        java.io.FileWriter fw = new java.io.FileWriter(queueFile, false);
+                        for (int i = keepFrom; i < currentLines.size(); i++) {
+                            fw.write(currentLines.get(i) + "\n");
+                        }
+                        fw.close();
+                    }
+
+                    int remain = currentLines.size() - keepFrom;
+                    if (sentFinal > 0 || remain > 0) {
+                        FileLogger.log(this, "REPORT", "📤 离线队列补发: 成功 " + sentFinal + " 条，剩余 " + remain + " 条");
+                    }
+                } catch (Exception e) {
+                    FileLogger.log(this, "REPORT", "⚠️ 离线队列重写异常: " + e.getMessage());
+                } finally {
+                    if (br != null) { try { br.close(); } catch (Exception ignored) {} }
+                }
+            }
+          }  // ★ H1b: synchronized (FLUSH_LOCK) 结束
         }).start();
     }
 
