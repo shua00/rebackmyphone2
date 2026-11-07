@@ -2,42 +2,37 @@
 # -*- coding: utf-8 -*-
 """
 DeviceFinder 局域网救援/调试终端
-支持环境：Windows / Linux(Armbian) / Termux(Android)
+============================================================
+版本：见 BUILD_VERSION 常量（YYYYMMDD-HHMM 构建时间戳）
+核心架构：原生 Socket + ThreadingHTTPServer + ThreadPool 探测
+============================================================
 
-【历史修复 R1~R14】
-R1  udp_listener split(":",3)      — 聊天内容含冒号不再被丢弃
-R2  _handle_report 用 update()      — 上报不再覆盖 last_chat / last_log
-R3  ThreadingHTTPServer             — 并发上报不再排队超时（扫描命中率提升的关键）
-R4  send_udp 子网广播也发 3 次      — 与 server2.py 行为一致
-R5  send_udp 单播也发 2 次          — 拉日志丢包率下降
-R6  _handle_report 不再下发 config  — 不覆盖手机端自定义配置
-R7  get_local_ip 多目标 + fib_trie  — 无外网 / Termux 不再返回 127.0.0.1
-R8  主菜单"强制上报"指向 PC 接收端   — 不再白等 15 秒超时
-R9  计数器读写统一加锁              — 消除隐式竞态
-R10 _probe_ips 探测节奏             — ARP 探测与全网段探测间隔 ≥3s，避免节流
-R11 _probe_ips 去掉无效 settimeout  — UDP sendto 是立即返回的
-R12 LogReceiver 增加 do_GET         — 浏览器访问 9090 可直接健康检查
-R13 pull_logs_multi 批量发送        — 从串行 30s/台改为并发+统一等待
-R14 choose_target 空列表明确提示    — 不再静默 fallback 到广播
+【一、核心功能】
+- 内置接收端 9090：HTTP 上报/日志接收，浏览器访问 / 可健康检查
+- 局域网扫描：ARP 表优先 + 全网段探测，多网卡场景遍历所有本机网段
+- 多设备定向：单播 / 子网广播 / 全局广播 三档，按 IP 或设备编号选择
+- 拉日志：并发下发 + 统一等待 30s，结果汇总缺失清单
+- 对讲机：FLOAT/CHAT 双前缀发送与接收，PC 自身消息不记入设备列表
+- UDP 8888 监听：断线自愈，指数退避重试，避免端口被占用后永久失聪
 
-【本次修复 R15~R19 (2026-11-05)】
-R15 升级 send_udp 支持 IP 列表      — 实现多台设备精准单播批量发送
-R16 合并 choose_target/select_targets — 统一为 choose_targets_multi，支持 1,2 多选，回车默认全选已知设备
-R17 拦截拉日志传入广播地址          — 防止传入 255.255.255.255 导致白等 30 秒
-R18 UDP 监听加入外层自愈死循环      — 端口被占用/断开后 10 秒自动重试抢回 8888
-R19 警报/对讲/低电量移除 no_retry   — 利用默认多次发送机制，降低 UDP 局域网丢包率
+【二、协议兼容 v1/v2 双发】
+- custom_msg：发 FIND_ME_FLOAT（v2）+ FIND_ME_MSG（v1，内容不含冒号才发）
+              含冒号时只发 FLOAT，避免 v1 手机的 legacy 4 段被误判为 chat
+- chat_msg  ：同时发 FIND_ME_CHAT（v2）+ FIND_ME_MSG（v1）
+- 接收侧    ：认 FIND_ME_CHAT / FIND_ME_MSG 双前缀，5 秒去重
+- 版本上报  ：_handle_report 记录 build_version / protocol_version 到 DISCOVERED_DEVICES
+- 设备列表  ：show_devices / 选择目标列表 显示 build_version，便于分辨新旧 APK
 
-【配套手机端修改】
-AndroidManifest.xml 需加：
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-TrackingService.java 的 playAlarm() 需配合修改，才能让静音/震动模式下警报响。
-
-【Termux 加速提示】
+【三、Termux 加速】
     pkg install iproute2 net-tools
-扫描从 15s 降到 3s。
+扫描从 15s 降到 3s（ip neigh / arp 表可用，无需全网段盲扫）。
 
 【重要提醒】
-测试扫描/拉日志/悬浮窗时，手机必须保持亮屏（锁屏时 HTTP 上报和悬浮窗被系统限制）。
+- 测试扫描/拉日志/悬浮窗时，手机必须保持亮屏（锁屏时 HTTP 上报和悬浮窗被系统限制）
+- 端口 8888 被 server2.py/chat.py 占用时，监听会 10 秒自愈重试，不会永久失聪
+- 拉日志不能用广播地址（代码会拦截并提示），必须选具体设备编号或 all
+- 手机切 4G 后 source_ip 会变公网 IP，但 source_ip_lan 保留最后局域网 IP，
+  显示与单播目标优先 source_ip_lan，能正常控制回局域网
 """
 
 import socket
