@@ -33,9 +33,12 @@ public class SmsReceiver extends BroadcastReceiver {
 
         // ★ 核心加固 2：抢 WakeLock，防止 CPU 在子线程处理时打盹
         PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-        PowerManager.WakeLock wakeLock = null;
-        if (pm != null) {
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DeviceFinder::SmsReceiver");
+        // ★ 核心修复：使用三元运算符直接赋值，使其成为 effectively final，以便 Lambda 线程能够安全引用
+        final PowerManager.WakeLock wakeLock = (pm != null) 
+                ? pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DeviceFinder::SmsReceiver") 
+                : null;
+                
+        if (wakeLock != null) {
             wakeLock.acquire(30000); 
         }
 
