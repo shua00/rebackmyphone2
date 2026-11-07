@@ -15,8 +15,8 @@ import java.util.concurrent.Executors;
 public class FileLogger {
     private static final String TAG = "FileLogger";
     private static final long MAX_FILE_SIZE = 5 * 1024 * 1024;
-    private static final int MAX_MEMORY_LOGS = 50;   // [L1] 原 20→50，加日志后需更多快照
-    private static final int KEEP_DAYS = 7;          // [L1] 历史日志保留 7 天
+    private static final int MAX_MEMORY_LOGS = 50;   // 原 20→50，加日志后需更多快照
+    private static final int KEEP_DAYS = 7;          // 历史日志保留 7 天
     private static final String LOG_FILE_NAME = "device_log.txt";
     private static final String LOG_FILE_PREFIX = "device_log_";
 
@@ -25,10 +25,10 @@ public class FileLogger {
 
     private static final LinkedList<String> memoryLogs = new LinkedList<>();
 
-    // [L1] 单线程写文件，避免每次 new Thread（原实现线程爆炸）
+    // 单线程写文件，避免每次 new Thread（原实现线程爆炸）
     private static final ExecutorService fileExecutor = Executors.newSingleThreadExecutor();
 
-    // [L1] 记录当前文件日期，跨天时轮转
+    // 记录当前文件日期，跨天时轮转
     private static String currentFileDate = null;
 
     /**
@@ -60,6 +60,7 @@ public class FileLogger {
     }
 
     private static void writeToFile(Context context, String line) {
+        // ★ 补丁6：防弹衣，保证底层 IO 被系统沙盒拦截时绝不崩溃
         try {
             File dir = context.getExternalFilesDir(null);
             if (dir == null) return;
@@ -90,7 +91,8 @@ public class FileLogger {
             writer.flush();
             writer.close();
         } catch (Exception e) {
-            Log.e(TAG, "写入日志失败", e);
+            // ★ 补丁6核心：捕获所有异常（含 SecurityException），防止进程崩溃
+            Log.e(TAG, "写入日志失败(已被系统拦截): " + e.getMessage());
         }
     }
 
@@ -103,7 +105,9 @@ public class FileLogger {
             for (File f : files) {
                 if (now - f.lastModified() > maxAge) f.delete();
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+            // ★ 补丁6：同样兜底
+        }
     }
 
     public static String getMemoryLogs() {
