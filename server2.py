@@ -7,6 +7,7 @@ import sqlite3
 import gzip
 import os
 import re
+import html as html_lib  # ★ 2026-11-07 [P4.7 XSS]
 import faulthandler
 import signal
 from urllib.parse import urlparse, parse_qs
@@ -17,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 ============================================================
 DeviceFinder server2.py — 全功能同步服务（终极稳健版）
 ============================================================
-版本发布 : 2026-11-06
+版本发布 : 2026-11-07
 核心架构 : 原生 Socket + 多线程 (ThreadPoolExecutor)
 ============================================================
 
@@ -25,7 +26,7 @@ DeviceFinder server2.py — 全功能同步服务（终极稳健版）
 - reports 表完整持久化（含扩展字段 ext_json、SIM 状态等）
 - HTTP 下行队列（pending_commands 双通道下发）
 - UDP 监听 + 聊天室去重
-- 离线设备管理（单设备删除、批量清理 >24h 设备）
+- 离线设备管理（单设备删除、批量清理 >2h 设备）
 - 地图三图层（天地图无偏移 + 高德自动坐标转换 + 谷歌国际版备用）
 - 地图容器延迟初始化（解决手机端白屏）
 - 全前端 JS 已 ES5 化，完美兼容所有浏览器 / 微信 / WebView
@@ -98,6 +99,10 @@ PORT = 8080
 AUTH_TOKEN = "your_private_secret_key"
 RESCUE_SECRET = "your_private_secret_key"
 
+# ===== 版本 =====
+BUILD_VERSION = "20261107-2225"
+PROTOCOL_VERSION = 2
+
 GLOBAL_DEFAULT_CONFIG = {
     "report_interval_seconds": 1800,
     "accuracy_mode": "coarse",
@@ -130,9 +135,11 @@ _cmd_lock = threading.Lock()
 
 HTTP_SUPPORTED_ACTIONS = {
     "force_report", "play_alarm", "custom_msg", "chat_msg",
-    "change_server", "clear_history", "clear_chat",
+    "change_server", "change_config", "clear_history", "clear_chat",
     "lock_chat", "unlock_chat", "set_sms_num", "set_cloud_log",
-    "upload_log", "locate_once", "scan_wifi", "restart_udp", "test_low_battery"
+    "upload_log", "locate_once", "scan_wifi", "restart_udp", "test_low_battery",
+    # ★ 2026-11-07 [P1-3/P2]
+    "elder_mode"
 }
 
 # ===== reports 表字段声明 =====
@@ -179,6 +186,9 @@ REPORTS_COLUMNS = [
     ("nearby_wifi_json",       "TEXT"),
     ("raw_json",               "TEXT"),
     ("ext_json",               "TEXT"),
+    # ★ 2026-11-07 [P4.2]
+    ("build_version",          "TEXT"),
+    ("protocol_version",       "INTEGER"),
 ]
 
 REPORTS_INDEXES = [
@@ -365,8 +375,9 @@ def save_report(dev_id, data, source_ip):
                      chat_locked, elder_mode, os_version, uptime_ms,
                      lat, lng, accuracy, location_provider, location_time, location_age_s,
                      recent_locations_json,
-                     nearby_wifi_count, nearby_wifi_json, raw_json, ext_json)
-                    VALUES (?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?, ?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?, ?,?,?,?)""", (
+                     nearby_wifi_count, nearby_wifi_json, raw_json, ext_json,
+                     build_version, protocol_version)  # ★ 2026-11-07 [P4.3]
+                    VALUES (?,?,?,?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?, ?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?, ?,?,?,?, ?,?)""", (
                     dev_id, ts, received_at, dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday(),
                     batt_level, is_charging, batt_temp, batt_volt,
                     wifi_ssid or None, wifi_bssid, wifi_rssi, local_ip, source_ip,
@@ -382,7 +393,9 @@ def save_report(dev_id, data, source_ip):
                     (loc.get("provider") or None) if isinstance(loc.get("provider"), str) else None,
                     loc_time, loc_age_s,
                     recent_locs_json,
-                    len(nearby), nearby_json, raw_json, ext_json
+                    len(nearby), nearby_json, raw_json, ext_json,
+                    data.get("build_version"),
+                    data.get("protocol_version"),
                 ))
                 conn.commit()
             finally:
@@ -461,6 +474,40 @@ def resolve_target_devices(target_ip):
             if target_ip in candidates:
                 result.append(dev_id)
         return result
+
+
+# ★ 2026-11-07 [P4.1]: 版本感知前缀生成
+def get_target_protocol(dev_id):
+    """查设备协议版本，旧设备默认 v1"""
+    with state_lock:
+        info = ALL_DEVICES_STATUS.get(dev_id, {})
+        v = info.get("protocol_version")
+        return int(v) if isinstance(v, (int, str)) and str(v).isdigit() else 1
+
+
+def _build_version_aware_commands(target_devs, action_name, payload):
+    """
+    版本感知前缀（2026-11-07 [P4.1]）:
+    - custom_msg: 全 v2→FLOAT; 全 v1→MSG(不含冒号); 混合/广播→FLOAT(含冒号只FLOAT)
+    - chat_msg:   CHAT + MSG 双发
+    """
+    if action_name == "custom_msg":
+        versions = set(get_target_protocol(d) for d in target_devs) if target_devs else set()
+        has_colon = ":" in payload
+        if versions == {2}:
+            return [f"FIND_ME_FLOAT:{RESCUE_SECRET}:{payload}"]
+        if versions == {1}:
+            if has_colon:
+                return []
+            return [f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}"]
+        cmds = [f"FIND_ME_FLOAT:{RESCUE_SECRET}:{payload}"]
+        if not has_colon:
+            cmds.append(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}")
+        return cmds
+    if action_name == "chat_msg":
+        return [f"FIND_ME_CHAT:{RESCUE_SECRET}:Web_Console:{payload}",
+                f"FIND_ME_MSG:{RESCUE_SECRET}:Web_Console:{payload}"]
+    return []
 
 
 # ==================== HTTP 下行队列 ====================
@@ -560,7 +607,8 @@ def udp_listener():
                     continue
                 msg = data.decode('utf-8', errors='ignore')
                 source_ip = addr[0]
-                if msg.startswith("FIND_ME_MSG:"):
+                # ★ 2026-11-07 [P4.6 修正]: v2 CHAT + legacy MSG
+                if msg.startswith("FIND_ME_CHAT:") or msg.startswith("FIND_ME_MSG:"):
                     parts = msg.split(":", 3)
                     if len(parts) == 4 and parts[1] == RESCUE_SECRET:
                         sender = parts[2]
@@ -617,35 +665,49 @@ def udp_listener():
 
 
 def offline_detector():
+    """
+    失联检测：每 5 分钟扫描一次，>2h 未上报告警并排队兜底指令。
+
+    ★ 2026-11-07 修复：
+      1) 死锁：原代码在持有 print_lock 时调用 enqueue_command，后者内部再拿 print_lock，
+         threading.Lock 不可重入 -> 检测线程永久卡死。
+      2) 重复告警：原代码 info 是 dict 快照，info['offline_alerted'] = True 未写回
+         ALL_DEVICES_STATUS，导致每轮扫描重复告警、重复排队。
+      现改为：先在 state_lock 下做快照并释放，处理时单独加锁，并把 offline_alerted 写回全局。
+    """
     while True:
         try:
             time.sleep(300)
             now = int(datetime.datetime.now().timestamp() * 1000)
-            with print_lock:
-                with state_lock:
-                    devices_snapshot = [(k, dict(v)) for k, v in ALL_DEVICES_STATUS.items()]
-                for dev_id, info in devices_snapshot:
-                    last_seen = info.get('received_at', 0)
-                    gap_min = (now - last_seen) // 60000
-                    already_alerted = info.get('offline_alerted', False)
-                    
-                    if gap_min > 120 and not already_alerted:
-                        info['offline_alerted'] = True
+            with state_lock:
+                devices_snapshot = [(k, dict(v)) for k, v in ALL_DEVICES_STATUS.items()]
+            for dev_id, info in devices_snapshot:
+                last_seen = info.get('received_at', 0)
+                gap_min = (now - last_seen) // 60000
+                already_alerted = info.get('offline_alerted', False)
+
+                if gap_min > 120 and not already_alerted:
+                    with state_lock:
+                        if dev_id in ALL_DEVICES_STATUS:
+                            ALL_DEVICES_STATUS[dev_id]['offline_alerted'] = True
+                    with print_lock:
                         print(f"\n🚨 【失联告警】{dev_id} 已 {gap_min // 60} 小时 {gap_min % 60} 分钟未上报！")
-                        
-                        # ★ 新增：给失联设备排队强制唤醒指令 2026-11-04 13:42
-                        # 这样只要它哪怕只有 1 秒钟的清醒并发了 HTTP 请求，就会立刻拿到指令去重置 UDP
-                        if dev_id in HTTP_SUPPORTED_ACTIONS: pass # 避免误判
-                        enqueue_command(dev_id, "force_report", "")
-                        enqueue_command(dev_id, "restart_udp", "")
+                    # 给失联设备排队兜底指令：只要它有一次 HTTP 上报，就能拿到并重启 UDP
+                    enqueue_command(dev_id, "force_report", "")
+                    enqueue_command(dev_id, "restart_udp", "")
+                    with print_lock:
                         print(f"📋 [兜底] 已为 {dev_id} 排队 force_report 和 restart_udp 指令")
-                        
-                    elif gap_min <= 120 and already_alerted:
-                        info['offline_alerted'] = False
+
+                elif gap_min <= 120 and already_alerted:
+                    with state_lock:
+                        if dev_id in ALL_DEVICES_STATUS:
+                            ALL_DEVICES_STATUS[dev_id]['offline_alerted'] = False
+                    with print_lock:
                         print(f"\n✅ 【恢复】{dev_id} 已恢复上报")
         except Exception as e:
             with print_lock:
                 print(f"⚠️ 失联检测异常: {e}")
+
 
 
 def save_history(dev_id, lat, lng, ts):
@@ -814,6 +876,9 @@ def handle_client(client_conn, client_addr):
                         data["cloud_logs_time"] = prev_info.get("cloud_logs_time", 0)
                     data["source_ip"] = client_addr[0]
                     data["local_ip"] = (data.get("network") or {}).get("local_ip", "")
+                    # ★ 2026-11-07 [P4.4]
+                    data["build_version"] = data.get("build_version") or "旧版"
+                    data["protocol_version"] = data.get("protocol_version") or 1
                     if prev_udp_ip:
                         data["udp_source_ip"] = prev_udp_ip
                     if prev_info.get("last_chat"):
@@ -951,9 +1016,9 @@ def handle_client(client_conn, client_addr):
                 path_with_query = req_line.split(" ")[1] if len(req_line.split(" ")) > 1 else ""
                 params = parse_qs(urlparse(path_with_query).query)
                 dev_id = params.get("device_id", [""])[0]
-                with print_lock:
-                    info = ALL_DEVICES_STATUS.get(dev_id, {})
-                    resp = json.dumps({"cloud_logs": info.get("cloud_logs", ""), "cloud_logs_time": info.get("cloud_logs_time", 0)})
+                with state_lock:
+                    info = dict(ALL_DEVICES_STATUS.get(dev_id, {}))
+                resp = json.dumps({"cloud_logs": info.get("cloud_logs", ""), "cloud_logs_time": info.get("cloud_logs_time", 0)})
                 resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp_bytes)
@@ -1002,6 +1067,9 @@ def handle_client(client_conn, client_addr):
                         "network_type": net_type,
                         "location": loc_obj,
                         "commands": [{"id": c["id"], "type": c["type"], "age_s": max(0, int(now - c["ts"]))} for c in queue[:10]],
+                        # ★ 2026-11-07 [P4.8]
+                        "build_version": info.get("build_version", "旧版"),
+                        "protocol_version": info.get("protocol_version", 1),
                     }
                 resp = json.dumps(result); resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
@@ -1038,7 +1106,8 @@ def handle_client(client_conn, client_addr):
                             if ip and ip != '0.0.0.0':
                                 send_udp_broadcast(cmd_prefix, ip); sent_any = True
                     elif target_ip == "all" or target_ip == "255.255.255.255":
-                        with print_lock:
+                        # ★ 2026-11-07 修复：改用 state_lock，与 /api/report、clean_device 等写方互斥
+                        with state_lock:
                             devices_snapshot = {k: dict(v) for k, v in ALL_DEVICES_STATUS.items()}
                         for dev_id, info in devices_snapshot.items():
                             ip = (info.get("source_ip") or info.get("udp_source_ip") or (info.get("network") or {}).get("local_ip"))
@@ -1056,15 +1125,29 @@ def handle_client(client_conn, client_addr):
 
                 if action == "force_report": success = smart_send(f"FIND_ME_REPORT:{RESCUE_SECRET}")
                 elif action == "play_alarm": success = smart_send(f"FIND_ME_ALARM:{RESCUE_SECRET}")
-                elif action == "custom_msg": success = smart_send(f"FIND_ME_MSG:{RESCUE_SECRET}:{payload}")
+                elif action == "custom_msg":
+                    # ★ 2026-11-07 [P4.5]: 版本感知双发
+                    success = False
+                    cmds = _build_version_aware_commands(target_devs, "custom_msg", payload)
+                    for cmd_prefix in cmds:
+                        if smart_send(cmd_prefix):
+                            success = True
+                    if not cmds:
+                        extra_msg = "目标设备均为 v1，不支持含冒号的悬浮提示，请改用对讲机"
                 elif action == "chat_msg":
-                    success = smart_send(f"FIND_ME_MSG:{RESCUE_SECRET}:Web_Console:{payload}")
+                    # ★ 2026-11-07 [P4.5]: CHAT + MSG 双发
+                    success = False
+                    for cmd_prefix in _build_version_aware_commands(target_devs, "chat_msg", payload):
+                        if smart_send(cmd_prefix):
+                            success = True
                     if success:
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         with state_lock:
                             CHAT_MESSAGES.append({"time": ts, "sender": "Web_Console", "content": payload})
                             if len(CHAT_MESSAGES) > 100: CHAT_MESSAGES.pop(0)
                 elif action == "change_server": success = smart_send(f"FIND_ME_SERVER:{RESCUE_SECRET}:{payload}")
+                # ★ 2026-11-07 [P1-3]
+                elif action == "change_config": success = smart_send(f"FIND_ME_CONFIG:{RESCUE_SECRET}:{payload}")
                 elif action == "clear_history": success = smart_send(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}")
                 elif action == "clear_chat": success = smart_send(f"FIND_ME_CLEAR_CHAT:{RESCUE_SECRET}")
                 elif action == "lock_chat": success = smart_send(f"FIND_ME_CHAT_LOCK:{RESCUE_SECRET}")
@@ -1076,6 +1159,8 @@ def handle_client(client_conn, client_addr):
                 elif action == "scan_wifi": success = smart_send(f"FIND_ME_SCAN_WIFI:{RESCUE_SECRET}")
                 elif action == "restart_udp": success = smart_send(f"FIND_ME_RESTART_UDP:{RESCUE_SECRET}")
                 elif action == "test_low_battery": success = smart_send(f"FIND_ME_TEST_LOW_BATTERY:{RESCUE_SECRET}")
+                # ★ 2026-11-07 [P2]
+                elif action == "elder_mode": success = smart_send(f"FIND_ME_ELDER_MODE:{RESCUE_SECRET}:{payload}")
 
                 elif action == "clean_device":
                     target_dev_id = payload
@@ -1083,7 +1168,7 @@ def handle_client(client_conn, client_addr):
                         success = False; extra_msg = "无效的设备 ID"
                     else:
                         target_dev_id = target_dev_id.strip()
-                        with print_lock:
+                        with state_lock:
                             existed = target_dev_id in ALL_DEVICES_STATUS
                             ALL_DEVICES_STATUS.pop(target_dev_id, None)
                         with _cmd_lock:
@@ -1095,7 +1180,7 @@ def handle_client(client_conn, client_addr):
                     try:
                         now_ts = int(datetime.datetime.now().timestamp() * 1000)
                         to_delete = []
-                        with print_lock:
+                        with state_lock:
                             for k, v in list(ALL_DEVICES_STATUS.items()):
                                 if now_ts - v.get('received_at', 0) > CLEAN_OFFLINE_THRESHOLD_MS:
                                     to_delete.append(k)
@@ -1134,9 +1219,13 @@ def handle_client(client_conn, client_addr):
                 params = parse_qs(urlparse(path_with_query).query)
                 dev_id = params.get("device_id", [""])[0]
                 conn = sqlite3.connect('track_history.db', timeout=10)
-                c = conn.cursor()
-                c.execute("SELECT lat, lng, timestamp FROM history WHERE device_id=? ORDER BY timestamp DESC LIMIT 50", (dev_id,))
-                rows = c.fetchall(); conn.close()
+                # ★ 2026-11-07 修复：异常时也保证 conn.close()，防 fd 泄漏
+                try:
+                    c = conn.cursor()
+                    c.execute("SELECT lat, lng, timestamp FROM history WHERE device_id=? ORDER BY timestamp DESC LIMIT 50", (dev_id,))
+                    rows = c.fetchall()
+                finally:
+                    conn.close()
                 resp = json.dumps(rows); resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp_bytes)
@@ -1149,9 +1238,13 @@ def handle_client(client_conn, client_addr):
         elif "GET /api/messages" in header_text:
             try:
                 conn = sqlite3.connect('track_history.db', timeout=10)
-                c = conn.cursor()
-                c.execute("SELECT device_id, msg_time, message FROM messages ORDER BY timestamp DESC LIMIT 50")
-                rows = c.fetchall(); conn.close()
+                # ★ 2026-11-07 修复：异常时也保证 conn.close()，防 fd 泄漏
+                try:
+                    c = conn.cursor()
+                    c.execute("SELECT device_id, msg_time, message FROM messages ORDER BY timestamp DESC LIMIT 50")
+                    rows = c.fetchall()
+                finally:
+                    conn.close()
                 resp = json.dumps(rows); resp_bytes = resp.encode('utf-8')
                 client_conn.sendall(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n".encode('utf-8') + resp_bytes)
@@ -1417,7 +1510,12 @@ td button.btn-sm:nth-child(3n) { margin-right: 0; }
                         else:
                             ap_list_html = "<span style='color:var(--color-fg-muted);'>0 个</span>"
 
-                        html += f"<tr><td><b>{dev_id}</b></td>"
+                        _bv_raw = str(info.get("build_version", "") or "旧版")
+                        _pv_raw = str(info.get("protocol_version", 1) or 1)
+                        _bv = html_lib.escape(_bv_raw[:32], quote=True)
+                        _pv = html_lib.escape(_pv_raw[:4], quote=True)
+                        # ★ 2026-11-07 [P4.7] 版本 + 转义
+                        html += f"<tr><td><b>{dev_id}</b><br><span style='font-size:11px;color:#8c959f'>{_bv} · v{_pv}</span></td>"
                         html += f"<td>{sys_status}</td>"
                         html += f"<td>{battery.get('level', '?')}%</td>"
                         html += f"<td>{wifi_info}</td>"
@@ -1642,9 +1740,9 @@ function fetchChatHistory() {
         data.messages.forEach(function(item) {
             var senderColor = item.sender.indexOf("Web_Console") !== -1 ? "#cf222e" : "#0969da";
             html += '<div class="chat-msg">' +
-                '<span class="chat-time">' + item.time + '</span>' +
-                '<span class="chat-sender" style="color:' + senderColor + '">[' + item.sender + ']</span>' +
-                '<span class="chat-content">' + item.content + '</span>' +
+                '<span class="chat-time">' + escapeHtml(item.time) + '</span>' +
+                '<span class="chat-sender" style="color:' + senderColor + '">[' + escapeHtml(item.sender) + ']</span>' +
+                '<span class="chat-content">' + escapeHtml(item.content) + '</span>' +
             '</div>';
         });
         if (chatDiv.innerHTML !== html) {
@@ -1659,7 +1757,7 @@ function fetchChatHistory() {
         var tagHtml = '<label class="device-tag"><input type="checkbox" class="target-cb" value="all" ' + (currentChecked.indexOf('all') !== -1 || currentChecked.length === 0 ? 'checked' : '') + '><span>所有人 (群发)</span></label>';
         data.devices.forEach(function(dev) {
             var isChecked = currentChecked.indexOf(dev.ip) !== -1 ? 'checked' : '';
-            tagHtml += '<label class="device-tag"><input type="checkbox" class="target-cb" value="' + dev.ip + '" ' + isChecked + '><span>' + dev.id + '</span></label>';
+            tagHtml += '<label class="device-tag"><input type="checkbox" class="target-cb" value="' + escapeHtml(dev.ip) + '" ' + isChecked + '><span>' + escapeHtml(dev.id) + '</span></label>';
         });
         if (selectorDiv.innerHTML !== tagHtml) { selectorDiv.innerHTML = tagHtml; }
     }).catch(function(e) {});
@@ -1987,6 +2085,7 @@ def start_server():
     server.listen(50)
     with print_lock:
         print("=" * 50)
+        print(f"[SV] server2.py {BUILD_VERSION} (协议 v{PROTOCOL_VERSION})")
         print(f"🚀 设备同步服务已启动: http://{get_local_ip()}:{PORT}")
         print(f"📁 日志上传目录: {os.path.abspath(UPLOAD_LOG_DIR)}")
         print(f"🚨 失联检测: 每 5 分钟扫描一次，>2 小时未上报告警")
