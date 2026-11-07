@@ -2,7 +2,7 @@
  * ============================================================
  *  TrackingService.java — 全内核高并发后台同步与常驻常活引擎
  * ------------------------------------------------------------
- *  构建版本 : 20261107-1200 (终极防爆无死角封板版)
+ *  构建版本 : 20261107-2225 (终极防爆无死角封板版)
  *  协议版本 : v2 (基于 BuildInfo.PROTOCOL_VERSION 标准)
  *  最后修改 : 2026-11-07
  *  运行功耗 : 极轻量级 (深度适配低内存设备)
@@ -2512,6 +2512,10 @@ public class TrackingService extends Service implements LocationListener {
         if ("custom_msg".equals(cmdType) || "chat_msg".equals(cmdType)) {
             return cmdType + "|" + (payload == null ? "" : payload);
         }
+        // ★ 2026-11-07 [P1-2]
+        if ("force_report_temp".equals(cmdType)) {
+            return cmdType + "|" + (payload == null ? "" : payload);
+        }
 
         // 如果有 cmdId，说明是 HTTP 下发的（用 cmdId 精确隔离，防误杀）
         if (cmdId != null && !cmdId.isEmpty()) {
@@ -2785,23 +2789,33 @@ public class TrackingService extends Service implements LocationListener {
                                 if (isValidUrl(urlPart)) tempUrl = urlPart;
                                 else FileLogger.log(this, "UPLOAD_LOG", "⚠️ 忽略非法 tempUrl: [" + urlPart + "]（不含 :// 或过短），使用主服务器");
                             }
-                            uploadLog(tempUrl, clearAfter);
-                            recentExecutions.put("upload_log", System.currentTimeMillis());
+                            // ★ 2026-11-07 [P1-1]
+                            String dkUp = buildDedupKey("upload_log",
+                                    (tempUrl == null ? "" : tempUrl) + (clearAfter ? ":clear" : ""), null);
+                            if (!isRecentlyExecuted(dkUp)) {
+                                uploadLog(tempUrl, clearAfter);
+                            }
                         }
                     } else if (message.startsWith("FIND_ME_LOCATE_ONCE:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
-                            requestSingleLocationAndReport();
-                            recentExecutions.put("locate_once", System.currentTimeMillis());
+                            // ★ 2026-11-07 [P1-1]
+                            String dkLoc = buildDedupKey("locate_once", null, null);
+                            if (!isRecentlyExecuted(dkLoc)) {
+                                requestSingleLocationAndReport();
+                            }
                         }
                     } else if (message.startsWith("FIND_ME_SCAN_WIFI:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
-                            new Thread(() -> {
-                                List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(this);
-                                FileLogger.log(this, "WIFI", "📡 UDP 触发扫描: " + nearby.size() + " 个热点");
-                            }).start();
-                            recentExecutions.put("scan_wifi", System.currentTimeMillis());
+                            // ★ 2026-11-07 [P1-1]
+                            String dkScan = buildDedupKey("scan_wifi", null, null);
+                            if (!isRecentlyExecuted(dkScan)) {
+                                new Thread(() -> {
+                                    List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(this);
+                                    FileLogger.log(this, "WIFI", "📡 UDP 触发扫描: " + nearby.size() + " 个热点");
+                                }).start();
+                            }
                         }
                     } else if (message.startsWith("FIND_ME_RESTART_UDP:")) {
                         String[] parts = message.split(":", 2);
@@ -2812,10 +2826,13 @@ public class TrackingService extends Service implements LocationListener {
                     } else if (message.startsWith("FIND_ME_TEST_LOW_BATTERY:")) {
                         String[] parts = message.split(":", 2);
                         if (parts.length == 2 && RESCUE_SECRET.equals(parts[1])) {
-                            FileLogger.log(this, "BATTERY", "🧪 UDP 触发模拟低电量告警");
-                            sendReport(true, true);
-                            sendLowBatterySms(15);
-                            recentExecutions.put("test_low_battery", System.currentTimeMillis());
+                            // ★ 2026-11-07 [P0-1]
+                            String dkLow = buildDedupKey("test_low_battery", null, null);
+                            if (!isRecentlyExecuted(dkLow)) {
+                                FileLogger.log(this, "BATTERY", "🧪 UDP 触发模拟低电量告警");
+                                sendReport(true, true);
+                                sendLowBatterySms(15);
+                            }
                         }
                     }
                 }
@@ -3000,6 +3017,10 @@ public class TrackingService extends Service implements LocationListener {
                         sendReport(true, true);
                     }
                     break;
+                // ★ 2026-11-07 [P1-3]
+                case "change_config":
+                    if (isValidUrl(payload)) handleUpdateConfigUrl(payload);
+                    break;
                 case "clear_history":
                     clearMessageHistory();
                     break;
@@ -3048,6 +3069,11 @@ public class TrackingService extends Service implements LocationListener {
                 case "test_low_battery":
                     sendReport(true, true);
                     sendLowBatterySms(15);
+                    break;
+                // ★ 2026-11-07 [P2]
+                case "elder_mode":
+                    if ("1".equals(payload) || "true".equalsIgnoreCase(payload)) setElderMode(true);
+                    else setElderMode(false);
                     break;
                 default:
                     FileLogger.log(this, "HTTP_CMD", "⚠️ 未知 HTTP 指令: " + type);
