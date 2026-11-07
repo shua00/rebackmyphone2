@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 
 ======================================================================
-  AndroidManifest.xml 修改记录 (2026-11-06)
+  AndroidManifest.xml 修改记录 (2026-11-07)
   1. 修正无障碍 Action 和 Meta-data 名称，使其能被系统正确识别。
   2. MainActivity 增加 launchMode="singleTask" 和 configChanges，防止多实例和状态丢失。
-  3. 移除 manifest 标签中的 package 属性，以适配最新版 AGP。
+  3. 补丁1：增加存储权限，防止国产 ROM 拦截导致文件写入崩溃。
+  4. 补丁1：强化 TrackingService 前台声明。
 ======================================================================
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -38,6 +39,7 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     
     <!-- 运动传感器、短信、响铃 -->
     <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
@@ -47,12 +49,16 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- ★ 补丁1：防止中兴等系统“隐私沙盒”拦截专属目录读写导致崩溃 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
     <application
         android:label="系统安全服务"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
-        <!-- 核心追踪服务 -->
+        <!-- ★ 补丁1：核心追踪服务免死金牌，防秒杀 -->
         <service
             android:name=".TrackingService"
             android:enabled="true"
@@ -66,7 +72,7 @@
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="false" />
       
-        <!-- ★ [修复] 2026-11-06 修正无障碍 Action 和 Meta-data 名称，使其能被系统正确识别 -->
+        <!-- 修正无障碍 Action 和 Meta-data 名称，使其能被系统正确识别 -->
         <service
             android:name=".MyAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
@@ -159,12 +165,7 @@
             android:excludeFromRecents="true" 
             android:taskAffinity="com.example.devicefinder.chat" />
 
-        <!--
-            权限引导主界面
-            ⚠️ configChanges 与 launchMode 说明（禁止随意删除）：
-            1. configChanges：防止旋转屏幕触发 Activity 重建导致流程重走。
-            2. launchMode="singleTask"：防止多入口重复拉起导致多实例叠弹框。
-        -->
+        <!-- 权限引导主界面 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
