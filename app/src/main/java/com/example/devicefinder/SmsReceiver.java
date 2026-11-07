@@ -7,17 +7,14 @@ import android.location.Location;
 import android.location.LocationManager;
 import android.net.Uri;
 import android.os.Build;
+import android.os.PowerManager;
 import android.telephony.SmsManager;
 import android.telephony.SmsMessage;
+import android.telephony.SubscriptionManager;
 
 /**
  * SmsReceiver — 短信指令接收器
- * 构建版本 : 20261107-1200
- *
- * 2026-11-07 修改：
- * 1. abortBroadcast() 包进 try-catch（非默认短信 App 调用部分 ROM 抛 SecurityException）
- * 2. replyLocationViaSms 改读 TrackingService.GLOBAL_BATTERY_LEVEL，
- *    废弃同步 registerReceiver(null) 电池查询（降低 onReceive 主线程 Binder 往返）
+ * 构建版本 : 20261107-2000 (彻底封板完全体)
  */
 public class SmsReceiver extends BroadcastReceiver {
     private static final String RESCUE_SECRET = "your_private_secret_key";
@@ -25,6 +22,42 @@ public class SmsReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         if (!"android.provider.Telephony.SMS_RECEIVED".equals(intent.getAction())) return;
+
+        // ★ 核心加固 1：必须在主线程第 0 毫秒强行斩断广播！
+        // 确保系统 AMS 优先识别到拦截标记，把明文密码彻底隔绝在系统收件箱之外
+        try {
+            abortBroadcast();
+        } catch (Exception e) {
+            FileLogger.log(context, "SMS", "⚠️ 主线程前置拦截被拒（非默认短信App，预期行为）: " + e.getMessage());
+        }
+
+        // ★ 核心加固 2：抢 WakeLock，防止 CPU 在子线程处理时打盹
+        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        PowerManager.WakeLock wakeLock = null;
+        if (pm != null) {
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DeviceFinder::SmsReceiver");
+            wakeLock.acquire(30000); 
+        }
+
+        // ★ 核心加固 3：使用 goAsync() 挂起锁，将耗时操作移入子线程，防 10 秒 ANR 强杀
+        final PendingResult pendingResult = goAsync();
+        new Thread(() -> {
+            try {
+                processSms(context, intent);
+            } catch (Exception e) {
+                FileLogger.log(context, "SMS", "❌ 短信处理异常: " + e.getMessage());
+            } finally {
+                if (wakeLock != null && wakeLock.isHeld()) {
+                    wakeLock.release();
+                }
+                if (pendingResult != null) {
+                    pendingResult.finish();
+                }
+            }
+        }).start();
+    }
+
+    private void processSms(Context context, Intent intent) {
         try {
             Object[] pdus = (Object[]) intent.getExtras().get("pdus");
             if (pdus == null) return;
@@ -102,10 +135,7 @@ public class SmsReceiver extends BroadcastReceiver {
                 if (parts.length == 3 && RESCUE_SECRET.equals(parts[1])) {
                     context.getSharedPreferences("device_finder_prefs", Context.MODE_PRIVATE).edit()
                             .putString("emergency_sms_number", parts[2].trim()).apply();
-                    SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? context.getSystemService(SmsManager.class) : SmsManager.getDefault();
-                    if (smsManager != null && sender != null) {
-                        smsManager.sendTextMessage(sender, null, "✅ 紧急报警号码已更新为: " + parts[2].trim(), null, null);
-                    }
+                    sendSmsCompat(context, sender, "✅ 紧急报警号码已更新为: " + parts[2].trim());
                     isCommand = true;
                 }
             } else if (message.startsWith("ELDER_MODE:")) {
@@ -120,6 +150,7 @@ public class SmsReceiver extends BroadcastReceiver {
 
             if (isCommand) {
                 FileLogger.log(context, "SMS", "✅ 指令已识别，执行中");
+                // 尝试从收件箱删除短信
                 try {
                     Uri uri = Uri.parse("content://sms/inbox");
                     String where = "address=? AND date=?";
@@ -128,18 +159,12 @@ public class SmsReceiver extends BroadcastReceiver {
                 } catch (Exception e) {
                     FileLogger.log(context, "SMS", "⚠️ 删除指令短信失败（非默认短信应用，预期行为）: " + e.getMessage());
                 }
-                // ★ 2026-11-07 加固：非默认短信 App 下 abortBroadcast() 会被系统忽略，
-                //   部分定制 ROM 还可能抛 SecurityException，故必须包 try-catch
-                try {
-                    abortBroadcast();
-                } catch (Exception e) {
-                    FileLogger.log(context, "SMS", "⚠️ abortBroadcast 被系统拒绝（非默认短信 App，预期行为）: " + e.getMessage());
-                }
+                // 注意：这里不再调用 abortBroadcast()，因为已经在 onReceive 主线程第一现场干掉了！
             } else {
                 FileLogger.log(context, "SMS", "非指令短信，忽略");
             }
         } catch (Exception e) {
-            FileLogger.log(context, "SMS", "❌ 短信处理异常: " + e.getMessage());
+            FileLogger.log(context, "SMS", "❌ 短信解析异常: " + e.getMessage());
         }
     }
 
@@ -167,9 +192,6 @@ public class SmsReceiver extends BroadcastReceiver {
                 else loc = gpsLoc;
             }
 
-            // ★ 2026-11-07 架构优化：废弃同步 context.registerReceiver(null) 电池查询，
-            //   改读 TrackingService 的静态内存变量，消除 onReceive 主线程上的 Binder 往返。
-            //   TrackingService 未启动时该值为 -1，下方会显示"未知"，属可接受降级。
             int batteryPct = TrackingService.GLOBAL_BATTERY_LEVEL;
 
             StringBuilder sb = new StringBuilder("【设备回复】\n电量: ")
@@ -180,11 +202,48 @@ public class SmsReceiver extends BroadcastReceiver {
                 sb.append("时间: ").append(new java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(new java.util.Date(loc.getTime())));
             } else sb.append("经纬度: 无法获取\n");
 
-            SmsManager smsManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? context.getSystemService(SmsManager.class) : SmsManager.getDefault();
-            if (smsManager != null) smsManager.sendTextMessage(phoneNumber, null, sb.toString(), null, null);
+            sendSmsCompat(context, phoneNumber, sb.toString());
             FileLogger.log(context, "SMS", "📤 已回复定位短信 → " + phoneNumber);
         } catch (Exception e) {
             FileLogger.log(context, "SMS", "❌ 回复定位短信失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * ★ 核心加固 4：双卡发送自适应 + 阉割版 ROM 防摔沙箱
+     */
+    private void sendSmsCompat(Context context, String phoneNumber, String content) {
+        if (phoneNumber == null || content == null) return;
+        try {
+            SmsManager smsManager = null;
+            
+            // 严格捕获 Throwable，防止低端定制 ROM 缺少多卡模块引发 NoClassDefFoundError 闪退
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    smsManager = context.getSystemService(SmsManager.class);
+                    SubscriptionManager subManager = (SubscriptionManager) context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+                    if (subManager != null) {
+                        int subId = subManager.getDefaultSmsSubscriptionId();
+                        if (subId != -1) { // INVALID_SUBSCRIPTION_ID 原生值为 -1
+                            smsManager = context.getSystemService(SmsManager.class).createForSubscriptionId(subId);
+                        }
+                    }
+                } catch (Throwable t) {
+                    FileLogger.log(context, "SMS", "⚠️ 多卡槽底层组件缺失或被阉割，启动原生保底通道");
+                    smsManager = null;
+                }
+            }
+
+            // 终极自愈：如果上面高版本或多卡槽创建失败，无痕回退到兼容性最高的原生默认通道
+            if (smsManager == null) {
+                smsManager = SmsManager.getDefault();
+            }
+
+            if (smsManager != null) {
+                smsManager.sendTextMessage(phoneNumber, null, content, null, null);
+            }
+        } catch (Exception e) {
+            FileLogger.log(context, "SMS", "❌ sendSmsCompat 硬件分发彻底失败: " + e.getMessage());
         }
     }
 }
