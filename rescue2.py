@@ -73,6 +73,10 @@ DEFAULT_CONFIG_URL = "https://your-config-url.com/config.txt"
 LOG_PORT = 9090
 LOG_DIR = "received_logs"
 
+# ===== 版本 =====
+BUILD_VERSION = "20261107-2124"
+PROTOCOL_VERSION = 2
+
 # ===== 全局状态 =====
 DISCOVERED_DEVICES = {}
 _state_lock = threading.Lock()
@@ -211,10 +215,93 @@ def get_network_prefix(ip):
     return "192.168.1"
 
 
+# ★ 2026-11-07 修复 [F3]：多网卡场景下返回所有非回环 IPv4，供 scan_lan_devices 遍历
+def get_all_local_ips():
+    """返回本机所有非回环 IPv4 地址（多网卡支持）"""
+    ips = []
+    seen = set()
+
+    def _add(ip):
+        if (is_valid_ip(ip) and not ip.startswith("127.")
+                and not ip.startswith("169.254.")
+                and not ip.endswith(".0")
+                and ip not in seen):
+            seen.add(ip)
+            ips.append(ip)
+
+    try:
+        with open("/proc/net/fib_trie", "r") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if "LOCAL" in line and i > 0:
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+)", lines[i - 1])
+                if m:
+                    _add(m.group(1))
+    except Exception:
+        pass
+
+    if not ips:
+        try:
+            result = subprocess.run(["ip", "-4", "addr"], capture_output=True,
+                                    text=True, timeout=3, errors='ignore')
+            for line in result.stdout.split("\n"):
+                line = line.strip()
+                if line.startswith("inet ") and "127.0.0.1" not in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        _add(parts[1].split("/")[0])
+        except Exception:
+            pass
+
+    if not ips:
+        try:
+            result = subprocess.run(["ifconfig"], capture_output=True,
+                                    text=True, timeout=3, errors='ignore')
+            for line in result.stdout.split("\n"):
+                if "inet " in line and "127.0.0.1" not in line:
+                    parts = line.split()
+                    for i, p in enumerate(parts):
+                        if p == "inet" and i + 1 < len(parts):
+                            _add(parts[i + 1])
+        except Exception:
+            pass
+
+    if os.name == "nt" and not ips:
+        try:
+            result = subprocess.run(["ipconfig"], capture_output=True,
+                                    text=True, timeout=3, errors='ignore')
+            for match in re.finditer(r"IPv4.*?[:：]\s*(\d+\.\d+\.\d+\.\d+)", result.stdout):
+                _add(match.group(1))
+        except Exception:
+            pass
+
+    return ips
+
+
+# ★ 2026-11-07 修复 [F4]：判断 IP 是否为 RFC1918 私有地址（用于保留局域网 IP）
+def _is_private_ip(ip):
+    """判断 IPv4 是否为 RFC1918 私有地址 / 局域网地址"""
+    if not is_valid_ip(ip):
+        return False
+    parts = [int(p) for p in ip.split(".")]
+    if parts[0] == 10:
+        return True
+    if parts[0] == 172 and 16 <= parts[1] <= 31:
+        return True
+    if parts[0] == 192 and parts[1] == 168:
+        return True
+    return False
+
+
 # ===== UDP 发送 =====
 # [R15] 升级：支持传入 IP 列表实现批量单播
 def send_udp(command_str, target_ip="255.255.255.255", quiet=False, no_retry=False):
     if isinstance(target_ip, (list, tuple)):
+        # ★ 2026-11-07 修复 [F2]：目标列表为空时给出提示，避免"静默什么都不发"
+        if not target_ip:
+            if not quiet:
+                print("⚠️ 无有效目标，未发送（请重新选择目标）")
+            return
         for ip in target_ip:
             send_udp(command_str, ip, quiet=quiet, no_retry=no_retry)
         return
@@ -274,13 +361,16 @@ def send_udp_and_wait(command_str, target_ip="255.255.255.255", wait_sec=15, wai
 
     # 兼容列表、具体IP单播
     is_broadcast = isinstance(target_ip, str) and (target_ip == "255.255.255.255" or target_ip.endswith(".255"))
+    # ★ 2026-11-07 修复 [F5]：列表模式给出"多台单播"标签，便于排错
+    is_multi = isinstance(target_ip, (list, tuple))
+    mode_desc = "广播" if is_broadcast else (f"{len(target_ip)}台单播" if is_multi else "单播")
     
     if not is_broadcast:
         elapsed = wait_for_response(before, wait_sec, wait_type)
         if elapsed is not None:
-            print(f"✅ 收到响应（{elapsed:.1f}s）")
+            print(f"✅ {mode_desc}收到响应（{elapsed:.1f}s）")
         else:
-            print(f"⚠️ 超时未响应")
+            print(f"⚠️ {mode_desc}超时未响应")
         return
 
     elapsed = wait_for_response(before, 5, wait_type)
@@ -289,9 +379,9 @@ def send_udp_and_wait(command_str, target_ip="255.255.255.255", wait_sec=15, wai
         return
 
     with _state_lock:
-        known = [(dev_id, info.get("source_ip") or info.get("ip"))
+        known = [(dev_id, info.get("source_ip_lan") or info.get("source_ip") or info.get("ip"))
                  for dev_id, info in DISCOVERED_DEVICES.items()
-                 if (info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
+                 if (info.get("source_ip_lan") or info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
 
     if not known:
         print(f"⚠️ 广播 5 秒无响应，且无已知设备可单播")
@@ -323,7 +413,7 @@ def choose_targets_multi(prompt="🎯 选择目标 (编号/逗号分隔/all/回�
         dev_list = list(devices.items())
         now = time.time()
         for i, (dev_id, info) in enumerate(dev_list, 1):
-            ip = info.get("source_ip") or info.get("ip", "?")
+            ip = info.get("source_ip_lan") or info.get("source_ip") or info.get("ip", "?")
             batt_raw = info.get("battery")
             batt = f"{batt_raw}%" if batt_raw is not None else "未上报"
             wifi_raw = info.get("wifi")
@@ -356,9 +446,9 @@ def choose_targets_multi(prompt="🎯 选择目标 (编号/逗号分隔/all/回�
             print("💡 无已知设备，回退到全局广播")
             return ["255.255.255.255"]
         print("💡 未输入编号，默认对当前已知的所有设备操作 (all)")
-        return [(info.get("source_ip") or info.get("ip"))
+        return [(info.get("source_ip_lan") or info.get("source_ip") or info.get("ip"))
                 for info in devices.values()
-                if (info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
+                if (info.get("source_ip_lan") or info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
 
     if choice.lower() == "scan":
         scan_lan_devices()
@@ -367,9 +457,9 @@ def choose_targets_multi(prompt="🎯 选择目标 (编号/逗号分隔/all/回�
     if choice.lower() == "all":
         if not devices:
             return ["255.255.255.255"]
-        return [(info.get("source_ip") or info.get("ip"))
+        return [(info.get("source_ip_lan") or info.get("source_ip") or info.get("ip"))
                 for info in devices.values()
-                if (info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
+                if (info.get("source_ip_lan") or info.get("source_ip") or info.get("ip")) not in (None, "", "0.0.0.0")]
                 
     if is_valid_ip(choice):
         return [choice]
@@ -379,7 +469,9 @@ def choose_targets_multi(prompt="🎯 选择目标 (编号/逗号分隔/all/回�
         result = []
         for i in idxs:
             if 0 < i <= len(dev_list):
-                ip = dev_list[i - 1][1].get("source_ip") or dev_list[i - 1][1].get("ip")
+                ip = (dev_list[i - 1][1].get("source_ip_lan")
+                      or dev_list[i - 1][1].get("source_ip")
+                      or dev_list[i - 1][1].get("ip"))
                 if ip:
                     result.append(ip)
         return result
@@ -461,7 +553,11 @@ class LogReceiver(BaseHTTPRequestHandler):
         with _state_lock:
             RECEIVED_LOGS += 1
             info = DISCOVERED_DEVICES.setdefault(device_id, {})
-            info["source_ip"] = self.client_address[0]
+            client_ip = self.client_address[0]
+            info["source_ip"] = client_ip
+            # ★ 2026-11-07 修复 [F4]：上传日志同样保留局域网 IP
+            if _is_private_ip(client_ip):
+                info["source_ip_lan"] = client_ip
             info["last_log"] = time.time()
 
         print(f"\n📥 收到日志: {filename} ({len(data)} bytes) → {os.path.abspath(filepath)}")
@@ -510,13 +606,19 @@ class LogReceiver(BaseHTTPRequestHandler):
             with _state_lock:
                 RECEIVED_REPORTS += 1
                 info = DISCOVERED_DEVICES.setdefault(dev_id, {})
+                client_ip = self.client_address[0]
                 info.update({
-                    "ip": local_ip if local_ip and local_ip != "0.0.0.0" else self.client_address[0],
-                    "source_ip": self.client_address[0],
+                    "ip": local_ip if local_ip and local_ip != "0.0.0.0" else client_ip,
+                    "source_ip": client_ip,
                     "last_seen": time.time(),
                     "battery": batt,
                     "wifi": wifi,
                 })
+                # ★ 2026-11-07 修复 [F4]：保留最近一次局域网 IP，切 4G 后 source_ip 被公网 IP 覆盖也能回溯
+                if _is_private_ip(client_ip):
+                    info["source_ip_lan"] = client_ip
+                elif "source_ip_lan" not in info and _is_private_ip(local_ip):
+                    info["source_ip_lan"] = local_ip
         except Exception as e:
             print(f"⚠️ 解析上报失败: {e}")
 
@@ -573,6 +675,9 @@ def udp_listener():
                         if len(parts) == 4 and parts[1] == RESCUE_SECRET:
                             sender = parts[2]
                             content = parts[3]
+                            # 过滤 PC 自己发的包（PC_Terminal 是本机自己广播的，不应作为设备记录）
+                            if sender in ("PC_Terminal", "Web_Console", "Guest_"):
+                                continue
 
                             # [新增] 5 秒去重：手机发子网+全局共 2 包，只显示 1 条
                             dedup_key = (sender, content)
@@ -633,7 +738,7 @@ def show_devices():
                        f"{ago // 3600}小时前" if ago < 86400 else "很久前")
         else:
             ago_str = "从未"
-        ip = info.get("source_ip") or info.get("ip", "?")
+        ip = info.get("source_ip_lan") or info.get("source_ip") or info.get("ip", "?")
         batt_raw = info.get("battery")
         batt = f"{batt_raw}%" if batt_raw is not None else "未上报"
         wifi_raw = info.get("wifi")
@@ -735,11 +840,27 @@ def _probe_ips(ips, local_ip):
 
 
 def scan_lan_devices():
-    local_ip = get_local_ip()
-    prefix = get_network_prefix(local_ip)
+    # ★ 2026-11-07 修复 [F3]：多网卡场景下遍历所有本机网段
+    real_local_ips = [ip for ip in get_all_local_ips() if not ip.startswith("127.")]
+    if not real_local_ips:
+        real_local_ips = ["127.0.0.1"]
 
-    print(f"\n🔍 正在扫描局域网 {prefix}.1-254 ...")
-    print(f"   本机 IP: {local_ip}")
+    # 按网段去重，每个网段只扫一次（避免 VPN 与 WiFi 同网段时重复发送）
+    seen_prefix = set()
+    targets = []
+    for ip in real_local_ips:
+        p = get_network_prefix(ip)
+        if p in seen_prefix:
+            continue
+        seen_prefix.add(p)
+        targets.append((p, ip))
+
+    print(f"\n🔍 正在扫描局域网 ...")
+    print(f"   本机 IP: {', '.join(real_local_ips)}")
+    if len(targets) > 1:
+        print(f"   网段: {', '.join(p + '.x' for p, _ in targets)}（多网卡）")
+    else:
+        print(f"   网段: {targets[0][0]}.1-254")
     print(f"   环境: {env_name()}")
     print(f"   ⚠️ 手机必须亮屏，否则 HTTP 上报到 PC 会被系统限制")
 
@@ -748,22 +869,30 @@ def scan_lan_devices():
 
     scan_start = time.time()
 
-    arp_ips = [ip for ip in get_arp_ips(prefix) if ip != local_ip]
-    if arp_ips:
-        print(f"📋 ARP 表里找到 {len(arp_ips)} 个 IP，先探测...")
+    # 阶段 1：ARP 表探测（每个网段分别探测，temp_url 用本网段 IP）
+    arp_hit = False
+    for prefix, local_ip in targets:
+        arp_ips = [ip for ip in get_arp_ips(prefix) if ip != local_ip]
+        if not arp_ips:
+            continue
+        arp_hit = True
+        print(f"📋 [{prefix}.x] ARP 表里找到 {len(arp_ips)} 个 IP，先探测...")
         _probe_ips(arp_ips, local_ip)
         # [R10] 明确间隔，避免手机端 2 秒节流丢弃第二次探测
         time.sleep(3)
-    else:
+
+    if not arp_hit:
         print(f"⚠️ ARP 表为空")
 
     with _state_lock:
         found = len([d for d in DISCOVERED_DEVICES.values() if d.get("last_seen", 0) >= scan_start])
 
+    # 阶段 2：全网段扫描（每个网段用各自 local_ip 作为上报目标）
     if found == 0:
-        print(f"⚠️ ARP 未命中，开始全网段扫描（约 10-15 秒）...")
-        all_ips = [f"{prefix}.{i}" for i in range(1, 255) if f"{prefix}.{i}" != local_ip]
-        _probe_ips(all_ips, local_ip)
+        print(f"⚠️ ARP 未命中，开始全网段扫描 ...")
+        for prefix, local_ip in targets:
+            all_ips = [f"{prefix}.{i}" for i in range(1, 255) if f"{prefix}.{i}" != local_ip]
+            _probe_ips(all_ips, local_ip)
 
     print("⏳ 等待手机响应（10 秒）...")
     time.sleep(10)
@@ -787,13 +916,12 @@ def scan_lan_devices():
     print(f"{'设备ID':<28} {'IP':<16} {'电量':<6} {'WiFi':<20}")
     print("-" * 80)
     for dev_id, info in new_devices.items():
-        ip = info.get("source_ip") or info.get("ip", "?")
+        ip = info.get("source_ip_lan") or info.get("source_ip") or info.get("ip", "?")
         batt = str(info.get("battery", "?")) + "%"
         wifi = str(info.get("wifi", "?"))[:18]
         print(f"{dev_id:<28} {ip:<16} {batt:<6} {wifi:<20}")
 
 
-# ===== 定时探测 =====
 def periodic_probe(target_ip):
     s = input("探测间隔秒数（回车默认 60）: ").strip()
     interval = int(s) if s.isdigit() and int(s) > 0 else 60
@@ -877,7 +1005,7 @@ def pull_logs_multi(target_ips, temp_url, clear_after):
         time.sleep(0.5)
         with _state_lock:
             for dev_id, info in DISCOVERED_DEVICES.items():
-                src_ip = info.get("source_ip")
+                src_ip = info.get("source_ip_lan") or info.get("source_ip")
                 if src_ip in target_ips and src_ip not in received_ips:
                     if info.get("last_log", 0) >= send_time:
                         received_ips.add(src_ip)
@@ -1117,9 +1245,13 @@ def main():
             if chat:
                 # ★★★ [R19] 移除 no_retry=True
                 send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:PC_Terminal:{chat}", choose_targets_multi())
+        # ★ 2026-11-07 修复 [F1]：无效输入不再静默回主菜单，给出明确提示
+        else:
+            print(f"❌ 无效输入: {choice!r}，请输入 0-6 / A-D / X")
 
 
 if __name__ == "__main__":
+    print(f"[RS] rescue2.py {BUILD_VERSION} (协议 v{PROTOCOL_VERSION})")
     print("\n🚀 正在启动内置服务...")
     print(f"   环境: {env_name()}")
     print(f"   本机 IP: {get_local_ip()}")
