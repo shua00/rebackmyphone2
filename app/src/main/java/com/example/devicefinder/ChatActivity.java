@@ -188,16 +188,21 @@ public class ChatActivity extends Activity {
         refreshHistory(false);
     }
 
-    @Override
-    protected void onPause() {
-        super.onPause();
-        isForeground = false;
-    }
+@Override
+public void onBackPressed() {
+    // 按返回键时，关闭界面并从任务列表抹除
+    finishAndRemoveTask();
+}
 
-    @Override
-    public void onBackPressed() {
-        moveTaskToBack(true);
+@Override
+protected void onPause() {
+    super.onPause();
+    // ★ 2026-11-07 测试补丁：当用户按 Home 键切走，或打开其他应用时
+    // 如果界面没有被主动 finish（isFinishing 为 false），强制抹除任务栈卡片
+    if (!isFinishing()) {
+        finishAndRemoveTask();
     }
+}
 
     @Override
     protected void onDestroy() {
