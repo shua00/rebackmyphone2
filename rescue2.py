@@ -74,7 +74,7 @@ LOG_PORT = 9090
 LOG_DIR = "received_logs"
 
 # ===== 版本 =====
-BUILD_VERSION = "20261107-2124"
+BUILD_VERSION = "20261107-2225"
 PROTOCOL_VERSION = 2
 
 # ===== 全局状态 =====
@@ -613,6 +613,9 @@ class LogReceiver(BaseHTTPRequestHandler):
                     "last_seen": time.time(),
                     "battery": batt,
                     "wifi": wifi,
+                    # ★ 2026-11-07 [P4 对齐]
+                    "build_version": data.get("build_version") or "旧版",
+                    "protocol_version": data.get("protocol_version") or 1,
                 })
                 # ★ 2026-11-07 修复 [F4]：保留最近一次局域网 IP，切 4G 后 source_ip 被公网 IP 覆盖也能回溯
                 if _is_private_ip(client_ip):
@@ -744,7 +747,8 @@ def show_devices():
         wifi_raw = info.get("wifi")
         wifi = str(wifi_raw)[:18] if wifi_raw else "未上报"
         tag = "" if info.get("last_seen", 0) > 0 else " [仅UDP]"
-        print(f"{dev_id:<28} {ip:<16}{tag:<10} {batt:<8} {wifi:<20} {ago_str:<10}")
+        _bv = str(info.get("build_version", "旧版"))[:20]
+        print(f"{dev_id:<28} {ip:<16}{tag:<10} {batt:<8} {wifi:<20} {ago_str:<10} {_bv}")
     print()
 
 
@@ -1105,7 +1109,11 @@ def menu_c_message_cleanup(local_ip):
         if c == '1':
             msg = input("悬浮文字内容: ").strip()
             if msg:
-                send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:{msg}", choose_targets_multi())
+                # ★ 2026-11-07 [P4.5 对齐]: FLOAT + MSG 双发
+                has_colon = ":" in msg
+                send_udp(f"FIND_ME_FLOAT:{RESCUE_SECRET}:{msg}", choose_targets_multi())
+                if not has_colon:
+                    send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:{msg}", choose_targets_multi())
         elif c == '2':
             send_udp(f"FIND_ME_CLEAR_HISTORY:{RESCUE_SECRET}", choose_targets_multi())
         elif c == '3':
@@ -1243,7 +1251,8 @@ def main():
         elif choice == '6':
             chat = input("对讲消息内容: ").strip()
             if chat:
-                # ★★★ [R19] 移除 no_retry=True
+                # ★ 2026-11-07 [P4.5 对齐]: CHAT + MSG 双发
+                send_udp(f"FIND_ME_CHAT:{RESCUE_SECRET}:PC_Terminal:{chat}", choose_targets_multi())
                 send_udp(f"FIND_ME_MSG:{RESCUE_SECRET}:PC_Terminal:{chat}", choose_targets_multi())
         # ★ 2026-11-07 修复 [F1]：无效输入不再静默回主菜单，给出明确提示
         else:
