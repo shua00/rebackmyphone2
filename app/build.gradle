@@ -12,6 +12,10 @@ android {
         targetSdk 34
         versionCode 1
         versionName "1.0"
+
+        // ★ 自动生成格式为 YYYYMMDD-HHmm 的版本号（例如 20261110-1930）
+        def buildTime = new java.text.SimpleDateFormat("yyyyMMdd-HHmm").format(new java.util.Date())
+        buildConfigField "String", "AUTO_BUILD_VERSION", "\"${buildTime}\""
     }
 
     buildTypes {
@@ -24,6 +28,11 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // ★ 必须开启这个选项，否则无法生成 BuildConfig.java 文件
+    buildFeatures {
+        buildConfig true
     }
 }
 
